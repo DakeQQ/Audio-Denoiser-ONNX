@@ -17,3 +17,4 @@ Utilizes ONNX Runtime for audio denoising.
 | OS | Device | Backend | Model | Real-Time Factor<br>( Chunk_Size: 4000 or 250ms ) |
 |:-------:|:-------:|:-------:|:-------:|:-------:|
 | Ubuntu-24.04 | Desktop | CPU<br>i3-12300 | ZipEnhancer<br>f32 | 0.33 |
+| macOS 15  | MacBook Air | CPU<br>M3 | ZipEnhancer<br>f32 | 0.26 |

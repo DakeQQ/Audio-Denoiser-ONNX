@@ -6,9 +6,9 @@ import onnxruntime
 import soundfile as sf
 from pydub import AudioSegment
 
-onnx_model_A = "/home/DakeQQ/Downloads/ZipEnhancer_Quanted/ZipEnhancer.onnx"                                                        # The exported onnx model path.
+onnx_model_A = "/home/DakeQQ/Downloads/ZipEnhancer_Optimized/ZipEnhancer.ort"                                                         # The exported onnx model path.
 test_noisy_audio = "/home/DakeQQ/Downloads/speech_zipenhancer_ans_multiloss_16k_base/examples/speech_with_noise1.wav"                 # The noisy audio path.
-save_denoised_audio = "/home/DakeQQ/Downloads/speech_zipenhancer_ans_multiloss_16k_base/examples/speech_with_noise1_denoised.wav"          # The output denoised audio path.
+save_denoised_audio = "/home/DakeQQ/Downloads/speech_zipenhancer_ans_multiloss_16k_base/examples/speech_with_noise1_denoised.wav"     # The output denoised audio path.
 
 
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']

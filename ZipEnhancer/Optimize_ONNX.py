@@ -18,14 +18,12 @@ target_platform = "amd64"                                                       
 
 
 # Check model
-session_opts = onnxruntime.SessionOptions()
 ort_session = onnxruntime.InferenceSession(model_path)
 if isinstance(ort_session._inputs_meta[0].shape[2], str):
     DYNAMIC_AXES = True
 else:
     DYNAMIC_AXES = False
 del ort_session
-del session_opts
 
 
 # ONNX Model Optimizer

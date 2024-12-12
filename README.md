@@ -14,6 +14,6 @@ Utilizes ONNX Runtime for audio denoising.
 5. See more -> https://dakeqq.github.io/overview/
 
 # 性能 Performance
-| OS | Device | Backend | Model | Real-Time Factor<br>( Chunk_Size: 4000 ) |
+| OS | Device | Backend | Model | Real-Time Factor<br>( Chunk_Size: 4000 or 250ms ) |
 |:-------:|:-------:|:-------:|:-------:|:-------:|
 | Ubuntu-24.04 | Desktop | CPU<br>i3-12300 | ZipEnhancer<br>f32 | 0.33 |

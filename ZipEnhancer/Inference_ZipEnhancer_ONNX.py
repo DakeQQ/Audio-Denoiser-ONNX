@@ -52,14 +52,15 @@ shape_value = ort_session_A._inputs_meta[0].shape[2]
 if isinstance(shape_value, str):
     INPUT_AUDIO_LENGTH = min(64000, audio_len)  # 36000 for (8 threads + 32GB RAM), 64000 for (4 threads + 32GB RAM), Max <= 99999 for model limit.
 else:
-    INPUT_AUDIO_LENGTH = int(shape_value)
-    if audio_len < INPUT_AUDIO_LENGTH:
-        white_noise = (np.sqrt(np.mean(audio * audio)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
-        audio = np.concatenate((audio, white_noise), axis=-1)
+    INPUT_AUDIO_LENGTH = shape_value
 if audio_len > INPUT_AUDIO_LENGTH:
-    aligned_len = audio_len // INPUT_AUDIO_LENGTH * INPUT_AUDIO_LENGTH
-else:
-    aligned_len = INPUT_AUDIO_LENGTH
+    final_slice = audio[:, :, audio_len // INPUT_AUDIO_LENGTH * INPUT_AUDIO_LENGTH:]
+    white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - final_slice.shape[-1]))).astype(audio.dtype)
+    audio = np.concatenate((audio, white_noise), axis=-1)
+elif audio_len < INPUT_AUDIO_LENGTH:
+    white_noise = (np.sqrt(np.mean(audio * audio)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
+    audio = np.concatenate((audio, white_noise), axis=-1)
+aligned_len = audio.shape[-1]
 
 
 def process_segment(_inv_audio_len, _slice_start, step, _audio, _ort_session_A, _in_name_A0, _out_name_A0):
@@ -79,10 +80,6 @@ with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denois
         print(f"Complete: {results[-1][0]:.2f}%")
 results.sort(key=lambda x: x[0])
 saved = [result[1] for result in results]
-if audio_len > INPUT_AUDIO_LENGTH:
-    final_slice = audio[:, :, aligned_len:]
-    white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - final_slice.shape[-1]))).astype(audio.dtype)
-    saved.append(ort_session_A.run([out_name_A0], {in_name_A0: np.concatenate((final_slice, white_noise), axis=-1)})[0])
 denoised_wav = (np.concatenate(saved, axis=-1)[0, 0, :audio_len]).astype(np.float32)
 end_time = time.time()
 print(f"Complete: 100.00%")

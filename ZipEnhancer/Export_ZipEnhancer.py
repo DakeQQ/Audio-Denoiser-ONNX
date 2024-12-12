@@ -127,7 +127,7 @@ shape_value = ort_session_A._inputs_meta[0].shape[2]
 if isinstance(shape_value, str):
     INPUT_AUDIO_LENGTH = min(64000, audio_len)  # 36000 for (8 threads + 32GB RAM), 64000 for (4 threads + 32GB RAM), Max <= 99999 for model limit.
 else:
-    INPUT_AUDIO_LENGTH = int(ort_session_A._inputs_meta[0].shape[2])
+    INPUT_AUDIO_LENGTH = int(shape_value)
     if audio_len < INPUT_AUDIO_LENGTH:
         white_noise = (np.sqrt(np.mean(audio * audio)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
         audio = np.concatenate((audio, white_noise), axis=-1)

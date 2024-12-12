@@ -1,0 +1,167 @@
+import gc
+import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import onnxruntime
+import soundfile as sf
+import torch
+from modelscope.models.base import Model
+from pydub import AudioSegment
+
+from STFT_Process import STFT_Process  # The custom STFT/ISTFT can be exported in ONNX format.
+
+model_path = "/home/DakeQQ/Downloads/speech_zipenhancer_ans_multiloss_16k_base"                                                      # The ZipEnhancer download path.
+onnx_model_A = "/home/DakeQQ/Downloads/ZipEnhancer_ONNX/ZipEnhancer.onnx"                                                            # The exported onnx model path.
+python_modelscope_package_path = '/home/DakeQQ/anaconda3/envs/python_312/lib/python3.12/site-packages/modelscope/models/audio/ans/'  # The Python package path.
+modified_path = './modeling_modified/'
+test_noisy_audio = model_path + "/examples/speech_with_noise1.wav"                      # The noisy audio path.
+save_denoised_audio = model_path + "/examples/speech_with_noise1_denoised.wav"          # The output denoised audio path.
+
+ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
+                                        # else keep empty.
+DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
+USE_PCM_INT16 = False                   # Enable it, if the audio input is PCM wav data with dtype int16 (short).
+MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else 256  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
+INPUT_AUDIO_LENGTH = 4000               # Set for static axis export: the length of the audio input signal (in samples) is recommended to be greater than 4000 and less than 16000.
+WINDOW_TYPE = 'kaiser'                  # Type of window function used in the STFT
+N_MELS = 100                            # Number of Mel bands to generate in the Mel-spectrogram
+NFFT = 400                              # Number of FFT components for the STFT process
+HOP_LENGTH = 100                        # Number of samples between successive frames in the STFT
+SAMPLE_RATE = 16000                     # The ZipEnhancer parameter, do not edit the value.
+MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
+
+
+shutil.copyfile(modified_path + "zipenhancer.py", python_modelscope_package_path + "zipenhancer.py")
+shutil.copyfile(modified_path + "generator.py", python_modelscope_package_path + "zipenhancer_layers/generator.py")
+shutil.copyfile(modified_path + "scaling.py", python_modelscope_package_path + "zipenhancer_layers/scaling.py")
+shutil.copyfile(modified_path + "zipenhancer_layer.py", python_modelscope_package_path + "zipenhancer_layers/zipenhancer_layer.py")
+shutil.copyfile(modified_path + "zipformer.py", python_modelscope_package_path + "zipenhancer_layers/zipformer.py")
+
+
+class ZipEnhancer(torch.nn.Module):
+    def __init__(self, zip_enhancer, stft_model, istft_model, use_pcm_int16):
+        super(ZipEnhancer, self).__init__()
+        self.zip_enhancer = zip_enhancer
+        self.stft_model = stft_model
+        self.istft_model = istft_model
+        self.compress_factor = 0.3
+        self.compress_factor_inv = 1.0 / self.compress_factor
+        self.use_pcm_int16 = use_pcm_int16
+        self.inv_int16 = 1.0 / 32768.0
+
+    def forward(self, audio: torch.ShortTensor):
+        if self.use_pcm_int16:
+            audio = self.inv_int16 * audio.float()
+        norm_factor = torch.sqrt(audio.shape[-1] / torch.sum(audio * audio))
+        real_part, imag_part = self.stft_model(audio * norm_factor, 'constant')
+        magnitude = torch.pow(torch.sqrt(real_part * real_part + imag_part * imag_part), self.compress_factor)
+        phase = torch.atan2(imag_part, real_part)
+        magnitude, phase = self.zip_enhancer.forward(magnitude, phase)
+        audio = self.istft_model(torch.pow(magnitude, self.compress_factor_inv), phase) / norm_factor
+        if self.use_pcm_int16:
+            audio = (audio * 32768).to(torch.int16)
+        return audio
+
+
+print('Export start ...')
+with torch.inference_mode():
+    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, n_mels=N_MELS, hop_len=HOP_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
+    custom_istft = STFT_Process(model_type='istft_A', n_fft=NFFT, n_mels=N_MELS, hop_len=HOP_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
+    zip_enhancer = ZipEnhancer(Model.from_pretrained(model_name_or_path=model_path, device='cpu').model.eval(), custom_stft, custom_istft, USE_PCM_INT16)
+    audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16 if USE_PCM_INT16 else torch.float32)
+    torch.onnx.export(
+        zip_enhancer,
+        (audio,),
+        onnx_model_A,
+        input_names=['noisy_audio'],
+        output_names=['denoised_audio'],
+        do_constant_folding=True,
+        dynamic_axes={
+            'noisy_audio': {2: 'audio_len'},
+            'denoised_audio': {2: 'audio_len'}
+        } if DYNAMIC_AXES else None,
+        opset_version=17
+    )
+    del zip_enhancer
+    del audio
+    del custom_stft
+    del custom_istft
+    gc.collect()
+print('\nExport done!\n\nStart to run ZipEnhancer by ONNX Runtime.\n\nNow, loading the model...')
+
+
+# ONNX Runtime settings
+session_opts = onnxruntime.SessionOptions()
+session_opts.log_severity_level = 3         # error level, it an adjustable value.
+session_opts.inter_op_num_threads = 0       # Run different nodes with num_threads. Set 0 for auto.
+session_opts.intra_op_num_threads = 0       # Under the node, execute the operators with num_threads. Set 0 for auto.
+session_opts.enable_cpu_mem_arena = True    # True for execute speed; False for less memory usage.
+session_opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+session_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+session_opts.add_session_config_entry("session.intra_op.allow_spinning", "1")
+session_opts.add_session_config_entry("session.inter_op.allow_spinning", "1")
+
+
+ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=ORT_Accelerate_Providers)
+print(f"\nUsable Providers: {ort_session_A.get_providers()}")
+model_type = ort_session_A._inputs_meta[0].type
+in_name_A = ort_session_A.get_inputs()
+out_name_A = ort_session_A.get_outputs()
+in_name_A0 = in_name_A[0].name
+out_name_A0 = out_name_A[0].name
+
+
+# Load the input audio
+print(f"\nTest Input Audio: {test_noisy_audio}")
+audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples())
+audio_len = len(audio)
+if "int16" not in model_type:
+    audio = audio.astype(np.float32) / 32768.0
+    if "float16" in model_type:
+        audio = audio.astype(np.float16)
+audio = audio.reshape(1, 1, -1)
+shape_value = ort_session_A._inputs_meta[0].shape[2]
+if isinstance(shape_value, str):
+    INPUT_AUDIO_LENGTH = min(64000, audio_len)  # 36000 for (8 threads + 32GB RAM), 64000 for (4 threads + 32GB RAM), Max <= 99999 for model limit.
+else:
+    INPUT_AUDIO_LENGTH = int(ort_session_A._inputs_meta[0].shape[2])
+    if audio_len < INPUT_AUDIO_LENGTH:
+        white_noise = (np.sqrt(np.mean(audio * audio)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
+        audio = np.concatenate((audio, white_noise), axis=-1)
+if audio_len > INPUT_AUDIO_LENGTH:
+    aligned_len = audio_len // INPUT_AUDIO_LENGTH * INPUT_AUDIO_LENGTH
+else:
+    aligned_len = INPUT_AUDIO_LENGTH
+
+
+def process_segment(_slice_start, step, _audio, _ort_session_A, _in_name_A0, _out_name_A0):
+    return _slice_start, _ort_session_A.run([_out_name_A0], {_in_name_A0: _audio[:, :, _slice_start: _slice_start + step]})[0]
+
+
+# Start to run ZipEnhancer
+print("\nRunning the ZipEnhancer by ONNX Runtime.")
+results = []
+start_time = time.time()
+with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denoised the audio.
+    futures = []
+    for slice_start in range(0, aligned_len, INPUT_AUDIO_LENGTH):
+        futures.append(executor.submit(process_segment, slice_start, INPUT_AUDIO_LENGTH, audio, ort_session_A, in_name_A0, out_name_A0))
+    for future in futures:
+        results.append(future.result())
+results.sort(key=lambda x: x[0])
+saved = [result[1] for result in results]
+if audio_len > INPUT_AUDIO_LENGTH:
+    final_slice = audio[:, :, aligned_len:]
+    white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - final_slice.shape[-1]))).astype(audio.dtype)
+    saved.append(ort_session_A.run([out_name_A0], {in_name_A0: np.concatenate((final_slice, white_noise), axis=-1)})[0])
+denoised_wav = (np.concatenate(saved, axis=-1)[0, 0, :audio_len]).astype(np.float32)
+end_time = time.time()
+
+
+# Save the denoised wav.
+if "int16" in model_type:
+    denoised_wav /= 32768.0
+sf.write(save_denoised_audio, denoised_wav, SAMPLE_RATE, format='FLAC')
+print(f"\nDenoise Process Complete.\n\nSaving to: {save_denoised_audio}.\n\nTime Cost: {end_time - start_time:.3f} Seconds")

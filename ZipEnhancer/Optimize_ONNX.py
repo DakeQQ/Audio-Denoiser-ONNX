@@ -18,7 +18,7 @@ target_platform = "amd64"                                                       
 
 
 # Check model
-if isinstance(onnxruntime.InferenceSession(model_path)._inputs_meta[0].shape[2], str):
+if isinstance(onnxruntime.InferenceSession(model_path)._inputs_meta[0].shape[-1], str):
     DYNAMIC_AXES = True
 else:
     DYNAMIC_AXES = False

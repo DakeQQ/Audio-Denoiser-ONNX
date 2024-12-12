@@ -42,6 +42,7 @@ out_name_A0 = out_name_A[0].name
 print(f"\nTest Input Audio: {test_noisy_audio}")
 audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples())
 audio_len = len(audio)
+inv_audio_len = float(100.0 / audio_len)
 if "int16" not in model_type:
     audio = audio.astype(np.float32) / 32768.0
     if "float16" in model_type:
@@ -61,8 +62,8 @@ else:
     aligned_len = INPUT_AUDIO_LENGTH
 
 
-def process_segment(_slice_start, step, _audio, _ort_session_A, _in_name_A0, _out_name_A0):
-    return _slice_start, _ort_session_A.run([_out_name_A0], {_in_name_A0: _audio[:, :, _slice_start: _slice_start + step]})[0]
+def process_segment(_inv_audio_len, _slice_start, step, _audio, _ort_session_A, _in_name_A0, _out_name_A0):
+    return _slice_start * _inv_audio_len, _ort_session_A.run([_out_name_A0], {_in_name_A0: _audio[:, :, _slice_start: _slice_start + step]})[0]
 
 
 # Start to run ZipEnhancer
@@ -72,9 +73,10 @@ start_time = time.time()
 with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denoised the audio.
     futures = []
     for slice_start in range(0, aligned_len, INPUT_AUDIO_LENGTH):
-        futures.append(executor.submit(process_segment, slice_start, INPUT_AUDIO_LENGTH, audio, ort_session_A, in_name_A0, out_name_A0))
+        futures.append(executor.submit(process_segment, inv_audio_len, slice_start, INPUT_AUDIO_LENGTH, audio, ort_session_A, in_name_A0, out_name_A0))
     for future in futures:
         results.append(future.result())
+        print(f"Complete: {results[-1][0]:.2f}%")
 results.sort(key=lambda x: x[0])
 saved = [result[1] for result in results]
 if audio_len > INPUT_AUDIO_LENGTH:
@@ -83,6 +85,7 @@ if audio_len > INPUT_AUDIO_LENGTH:
     saved.append(ort_session_A.run([out_name_A0], {in_name_A0: np.concatenate((final_slice, white_noise), axis=-1)})[0])
 denoised_wav = (np.concatenate(saved, axis=-1)[0, 0, :audio_len]).astype(np.float32)
 end_time = time.time()
+print(f"Complete: 100.00%")
 
 
 # Save the denoised wav.

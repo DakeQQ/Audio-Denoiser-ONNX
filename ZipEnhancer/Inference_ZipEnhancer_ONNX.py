@@ -88,5 +88,5 @@ print(f"Complete: 100.00%")
 # Save the denoised wav.
 if "int16" in model_type:
     denoised_wav /= 32768.0
-sf.write(save_denoised_audio, denoised_wav, SAMPLE_RATE, format='FLAC')
+sf.write(save_denoised_audio, denoised_wav, SAMPLE_RATE, format='WAVEX')
 print(f"\nDenoise Process Complete.\n\nSaving to: {save_denoised_audio}.\n\nTime Cost: {end_time - start_time:.3f} Seconds")

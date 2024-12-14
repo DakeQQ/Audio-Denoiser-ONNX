@@ -28,7 +28,7 @@ N_MELS = 100                            # Number of Mel bands to generate in the
 NFFT = 512                              # Number of FFT components for the STFT process
 HOP_LENGTH = 256                        # Number of samples between successive frames in the STFT
 SAMPLE_RATE = 16000                     # The GTCRN parameter, do not edit the value.
-MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
+MAX_THREADS = 8                         # Number of parallel threads for test audio denoising.
 
 
 class GTCRN_CUSTOM(torch.nn.Module):
@@ -85,8 +85,8 @@ print('\nExport done!\n\nStart to run GTCRN by ONNX Runtime.\n\nNow, loading the
 # ONNX Runtime settings
 session_opts = onnxruntime.SessionOptions()
 session_opts.log_severity_level = 3         # error level, it an adjustable value.
-session_opts.inter_op_num_threads = 0       # Run different nodes with num_threads. Set 0 for auto.
-session_opts.intra_op_num_threads = 0       # Under the node, execute the operators with num_threads. Set 0 for auto.
+session_opts.inter_op_num_threads = 1       # Run different nodes with num_threads. Set 0 for auto.
+session_opts.intra_op_num_threads = 1       # Under the node, execute the operators with num_threads. Set 0 for auto.
 session_opts.enable_cpu_mem_arena = True    # True for execute speed; False for less memory usage.
 session_opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
 session_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL

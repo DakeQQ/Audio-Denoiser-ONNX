@@ -51,7 +51,7 @@ class ZipEnhancer(torch.nn.Module):
         self.use_pcm_int16 = use_pcm_int16
         self.inv_int16 = 1.0 / 32768.0
 
-    def forward(self, audio: torch.ShortTensor):
+    def forward(self, audio):
         if self.use_pcm_int16:
             audio = self.inv_int16 * audio.float()
         norm_factor = torch.sqrt(audio.shape[-1] / torch.sum(audio * audio))

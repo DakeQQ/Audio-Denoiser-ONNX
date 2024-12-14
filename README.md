@@ -23,4 +23,4 @@ Utilizes ONNX Runtime for audio denoising.
 | Ubuntu-24.04 | Desktop | CPU<br>i3-12300 | ZipEnhancer<br>f32 | 0.32 |
 | macOS 15  | MacBook Air | CPU<br>M3 | ZipEnhancer<br>f32 | 0.25 |
 | Ubuntu-24.04 | Desktop | CPU<br>i3-12300 | GTCRN<br>f32 | 0.0036 |
-| macOS 15  | MacBook Air | CPU<br>M3 | ZipEnhancer<br>f32 | 0.0019 |
+| macOS 15  | MacBook Air | CPU<br>M3 | ZipEnhancer<br>f32 | 0.0013 ~<br>0.0019 |

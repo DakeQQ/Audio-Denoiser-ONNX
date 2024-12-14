@@ -290,21 +290,21 @@ class GTCRN(nn.Module):
         spec: (B, F, T, 2)
         """
 
-        feat = torch.stack([magnitude, real_part, imag_part], dim=1).transpose(-1, -2)  # (B,3,T,257)
+        feat = torch.stack([magnitude, real_part, imag_part], dim=1).transpose(-1, -2)  # (1,3,T,257)
 
-        feat = self.erb.bm(feat)  # (B,3,T,129)
-        feat = self.sfe(feat)     # (B,9,T,129)
+        feat = self.erb.bm(feat)  # (1,3,T,129)
+        feat = self.sfe(feat)     # (1,9,T,129)
 
         feat, en_outs = self.encoder(feat)
 
-        feat = self.dpgrnn1(feat) # (B,16,T,33)
-        feat = self.dpgrnn2(feat) # (B,16,T,33)
+        feat = self.dpgrnn1(feat) # (1,16,T,33)
+        feat = self.dpgrnn2(feat) # (1,16,T,33)
 
         m_feat = self.decoder(feat, en_outs)
 
-        m = self.erb.bs(m_feat).squeeze(0).transpose(-1, -2)
+        m = self.erb.bs(m_feat).squeeze(0).transpose(-1, -2)  # Only support for batch size = 1. 
 
-        s_real, s_imag = self.mask(m, real_part, imag_part) # (B,2,T,F)
+        s_real, s_imag = self.mask(m, real_part, imag_part) # (1,T,F)
 
         return torch.sqrt(s_real * s_real + s_imag * s_imag), s_real, s_imag
 

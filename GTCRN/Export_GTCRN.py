@@ -40,7 +40,7 @@ class GTCRN_CUSTOM(torch.nn.Module):
         self.use_pcm_int16 = use_pcm_int16
         self.inv_int16 = 1.0 / 32768.0
 
-    def forward(self, audio: torch.ShortTensor):
+    def forward(self, audio):
         if self.use_pcm_int16:
             audio = self.inv_int16 * audio.float()
         real_part, imag_part = self.stft_model(audio, 'constant')

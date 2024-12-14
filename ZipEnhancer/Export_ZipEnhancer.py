@@ -158,7 +158,7 @@ start_time = time.time()
 with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denoised the audio.
     futures = []
     slice_start = 0
-    while slice_start + stride_step < aligned_len:
+    while slice_start + stride_step <= aligned_len:
         futures.append(executor.submit(process_segment, inv_audio_len, slice_start, INPUT_AUDIO_LENGTH, audio, ort_session_A, in_name_A0, out_name_A0))
         slice_start += stride_step
     for future in futures:

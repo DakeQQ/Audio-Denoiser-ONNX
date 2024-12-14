@@ -49,23 +49,31 @@ if "int16" not in model_type:
     if "float16" in model_type:
         audio = audio.astype(np.float16)
 audio = audio.reshape(1, 1, -1)
-shape_value = ort_session_A._inputs_meta[0].shape[2]
-if isinstance(shape_value, str):
+shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
+shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
+if isinstance(shape_value_in, str):
     INPUT_AUDIO_LENGTH = min(64000, audio_len)  # 36000 for (8 threads + 32GB RAM), 64000 for (4 threads + 32GB RAM), Max <= 99999 for model limit.
 else:
-    INPUT_AUDIO_LENGTH = shape_value
+    INPUT_AUDIO_LENGTH = shape_value_in
+stride_step = INPUT_AUDIO_LENGTH
 if audio_len > INPUT_AUDIO_LENGTH:
-    final_slice = audio[:, :, audio_len // INPUT_AUDIO_LENGTH * INPUT_AUDIO_LENGTH:]
-    white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - final_slice.shape[-1]))).astype(audio.dtype)
-    audio = np.concatenate((audio, white_noise), axis=-1)
+    if shape_value_in != shape_value_out:
+        stride_step = shape_value_out
+        final_slice = audio[:, :, :(audio_len // stride_step) * stride_step]
+        white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH))).astype(audio.dtype)
+        audio = np.concatenate((final_slice, white_noise), axis=-1)
+    else:
+        final_slice = audio[:, :, audio_len // stride_step * stride_step:]
+        white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, stride_step - final_slice.shape[-1]))).astype(audio.dtype)
+        audio = np.concatenate((audio, white_noise), axis=-1)
 elif audio_len < INPUT_AUDIO_LENGTH:
     white_noise = (np.sqrt(np.mean(audio * audio)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
     audio = np.concatenate((audio, white_noise), axis=-1)
 aligned_len = audio.shape[-1]
 
 
-def process_segment(_inv_audio_len, _slice_start, step, _audio, _ort_session_A, _in_name_A0, _out_name_A0):
-    return _slice_start * _inv_audio_len, _ort_session_A.run([_out_name_A0], {_in_name_A0: _audio[:, :, _slice_start: _slice_start + step]})[0]
+def process_segment(_inv_audio_len, _slice_start, input_len, _audio, _ort_session_A, _in_name_A0, _out_name_A0):
+    return _slice_start * _inv_audio_len, _ort_session_A.run([_out_name_A0], {_in_name_A0: _audio[:, :, _slice_start: _slice_start + input_len]})[0]
 
 
 # Start to run ZipEnhancer
@@ -74,8 +82,10 @@ results = []
 start_time = time.time()
 with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denoised the audio.
     futures = []
-    for slice_start in range(0, aligned_len, INPUT_AUDIO_LENGTH):
+    slice_start = 0
+    while slice_start + stride_step < aligned_len:
         futures.append(executor.submit(process_segment, inv_audio_len, slice_start, INPUT_AUDIO_LENGTH, audio, ort_session_A, in_name_A0, out_name_A0))
+        slice_start += stride_step
     for future in futures:
         results.append(future.result())
         print(f"Complete: {results[-1][0]:.2f}%")

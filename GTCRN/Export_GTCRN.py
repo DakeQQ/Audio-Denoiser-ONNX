@@ -54,7 +54,7 @@ class GTCRN_CUSTOM(torch.nn.Module):
 
 print('Export start ...')
 with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, n_mels=N_MELS, hop_len=HOP_LENGTH, max_frames=1, window_type=WINDOW_TYPE).eval()
+    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, n_mels=N_MELS, hop_len=HOP_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
     custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, n_mels=N_MELS, hop_len=HOP_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
     gtcrn = GTCRN().eval()
     ckpt = torch.load(model_path + "/checkpoints/model_trained_on_dns3.tar", map_location='cpu')

@@ -121,18 +121,17 @@ if isinstance(shape_value_in, str):
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
-if audio_len > stride_step:
+if audio_len > INPUT_AUDIO_LENGTH:
     if shape_value_in != shape_value_out:
         stride_step = shape_value_out
-        final_slice = audio[:, :, :(audio_len // stride_step) * stride_step]
-        white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, stride_step))).astype(audio.dtype)
-        audio = np.concatenate((final_slice, white_noise), axis=-1)
-    else:
-        final_slice = audio[:, :, audio_len // stride_step * stride_step:]
-        white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, stride_step - final_slice.shape[-1]))).astype(audio.dtype)
-        audio = np.concatenate((audio, white_noise), axis=-1)
-elif audio_len < stride_step:
-    white_noise = (np.sqrt(np.mean(audio * audio)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, stride_step - audio_len))).astype(audio.dtype)
+    num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
+    total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
+    pad_amount = total_length_needed - audio_len
+    final_slice = audio[:, :, -pad_amount:]
+    white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, pad_amount))).astype(audio.dtype)
+    audio = np.concatenate((audio, white_noise), axis=-1)
+elif audio_len < INPUT_AUDIO_LENGTH:
+    white_noise = (np.sqrt(np.mean(audio * audio)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
     audio = np.concatenate((audio, white_noise), axis=-1)
 aligned_len = audio.shape[-1]
 
@@ -148,8 +147,8 @@ start_time = time.time()
 with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denoised the audio.
     futures = []
     slice_start = 0
-    while slice_start + stride_step <= aligned_len:
-        futures.append(executor.submit(process_segment, inv_audio_len, slice_start, stride_step, audio, ort_session_A, in_name_A0, out_name_A0))
+    while slice_start + INPUT_AUDIO_LENGTH <= aligned_len:
+        futures.append(executor.submit(process_segment, inv_audio_len, slice_start, INPUT_AUDIO_LENGTH, audio, ort_session_A, in_name_A0, out_name_A0))
         slice_start += stride_step
     for future in futures:
         results.append(future.result())

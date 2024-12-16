@@ -121,18 +121,18 @@ if isinstance(shape_value_in, str):
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
-if audio_len > INPUT_AUDIO_LENGTH:
+if audio_len > stride_step:
     if shape_value_in != shape_value_out:
         stride_step = shape_value_out
         final_slice = audio[:, :, :(audio_len // stride_step) * stride_step]
-        white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH))).astype(audio.dtype)
+        white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, stride_step))).astype(audio.dtype)
         audio = np.concatenate((final_slice, white_noise), axis=-1)
     else:
         final_slice = audio[:, :, audio_len // stride_step * stride_step:]
         white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, stride_step - final_slice.shape[-1]))).astype(audio.dtype)
         audio = np.concatenate((audio, white_noise), axis=-1)
-elif audio_len < INPUT_AUDIO_LENGTH:
-    white_noise = (np.sqrt(np.mean(audio * audio)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
+elif audio_len < stride_step:
+    white_noise = (np.sqrt(np.mean(audio * audio)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, stride_step - audio_len))).astype(audio.dtype)
     audio = np.concatenate((audio, white_noise), axis=-1)
 aligned_len = audio.shape[-1]
 
@@ -149,7 +149,7 @@ with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denois
     futures = []
     slice_start = 0
     while slice_start + stride_step <= aligned_len:
-        futures.append(executor.submit(process_segment, inv_audio_len, slice_start, INPUT_AUDIO_LENGTH, audio, ort_session_A, in_name_A0, out_name_A0))
+        futures.append(executor.submit(process_segment, inv_audio_len, slice_start, stride_step, audio, ort_session_A, in_name_A0, out_name_A0))
         slice_start += stride_step
     for future in futures:
         results.append(future.result())

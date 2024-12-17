@@ -146,8 +146,8 @@ elif audio_len < INPUT_AUDIO_LENGTH:
 aligned_len = audio.shape[-1]
 
 
-def process_segment(_inv_audio_len, _slice_start, input_len, _audio, _ort_session_A, _in_name_A0, _out_name_A0):
-    return _slice_start * _inv_audio_len, _ort_session_A.run([_out_name_A0], {_in_name_A0: _audio[:, :, _slice_start: _slice_start + input_len]})[0]
+def process_segment(_inv_audio_len, _slice_start, _slice_end, _audio, _ort_session_A, _in_name_A0, _out_name_A0):
+    return _slice_start * _inv_audio_len, _ort_session_A.run([_out_name_A0], {_in_name_A0: _audio[:, :, _slice_start: _slice_end]})[0]
 
 
 # Start to run ZipEnhancer
@@ -157,9 +157,11 @@ start_time = time.time()
 with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denoised the audio.
     futures = []
     slice_start = 0
-    while slice_start + INPUT_AUDIO_LENGTH <= aligned_len:
-        futures.append(executor.submit(process_segment, inv_audio_len, slice_start, INPUT_AUDIO_LENGTH, audio, ort_session_A, in_name_A0, out_name_A0))
+    slice_end = INPUT_AUDIO_LENGTH
+    while slice_end <= aligned_len:
+        futures.append(executor.submit(process_segment, inv_audio_len, slice_start, slice_end, audio, ort_session_A, in_name_A0, out_name_A0))
         slice_start += stride_step
+        slice_end = slice_start + INPUT_AUDIO_LENGTH
     for future in futures:
         results.append(future.result())
         print(f"Complete: {results[-1][0]:.2f}%")

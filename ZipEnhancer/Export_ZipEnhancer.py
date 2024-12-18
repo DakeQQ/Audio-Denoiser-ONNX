@@ -48,6 +48,7 @@ class ZipEnhancer(torch.nn.Module):
         self.istft_model = istft_model
         self.compress_factor = 0.3
         self.compress_factor_inv = 1.0 / self.compress_factor
+        self.compress_factor_sqrt = self.compress_factor * 0.5
         self.use_pcm_int16 = use_pcm_int16
         self.inv_int16 = 1.0 / 32768.0
 
@@ -56,7 +57,7 @@ class ZipEnhancer(torch.nn.Module):
             audio = self.inv_int16 * audio.float()
         norm_factor = torch.sqrt(audio.shape[-1] / torch.sum(audio * audio))
         real_part, imag_part = self.stft_model(audio * norm_factor, 'constant')
-        magnitude = torch.pow(torch.sqrt(real_part * real_part + imag_part * imag_part), self.compress_factor)
+        magnitude = torch.pow(real_part * real_part + imag_part * imag_part, self.compress_factor_sqrt)
         phase = torch.atan2(imag_part, real_part)
         magnitude, phase = self.zip_enhancer.forward(magnitude, phase)
         audio = self.istft_model(torch.pow(magnitude, self.compress_factor_inv), phase) / norm_factor

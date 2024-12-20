@@ -17,7 +17,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - Output: Crystal-clear denoised audio  
 
 4. **Resources**:  
-   - [Download Pre-trained Models](https://drive.google.com/drive/folders/1L13BJRqdBrPX8jQj3wwCiI67xC5QIT3S?usp=drive_link)  
+   - [Download Models](https://drive.google.com/drive/folders/1L13BJRqdBrPX8jQj3wwCiI67xC5QIT3S?usp=drive_link)  
    - [Explore More Projects](https://dakeqq.github.io/overview/)  
 
 ---
@@ -54,7 +54,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - 输出：清晰无噪音的音频  
 
 4. **资源**：  
-   - [下载预训练模型](https://drive.google.com/drive/folders/1L13BJRqdBrPX8jQj3wwCiI67xC5QIT3S?usp=drive_link)  
+   - [下载模型](https://drive.google.com/drive/folders/1L13BJRqdBrPX8jQj3wwCiI67xC5QIT3S?usp=drive_link)  
    - [探索更多项目](https://dakeqq.github.io/overview/)  
 
 ---

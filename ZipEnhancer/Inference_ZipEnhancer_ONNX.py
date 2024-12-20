@@ -89,7 +89,7 @@ with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denois
         slice_end = slice_start + INPUT_AUDIO_LENGTH
     for future in futures:
         results.append(future.result())
-        print(f"Complete: {results[-1][0]:.2f}%")
+        print(f"Complete: {results[-1][0]:.3f}%")
 results.sort(key=lambda x: x[0])
 saved = [result[1] for result in results]
 denoised_wav = (np.concatenate(saved, axis=-1)[0, 0, :audio_len]).astype(np.float32)

@@ -24,11 +24,11 @@ ORT_Accelerate_Providers = []           # If you have accelerate devices for : [
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
 USE_PCM_INT16 = False                   # Enable it, if the audio input is PCM wav data with dtype int16 (short).
 MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else 384  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
-INPUT_AUDIO_LENGTH = 4000               # Set for static axis export: the length of the audio input signal (in samples) is recommended to be greater than 4000 and less than 32000. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
+INPUT_AUDIO_LENGTH = 5120               # Set for static axis export: the length of the audio input signal (in samples) is recommended to be greater than 5120 and less than 40960. Higher values yield better quality but time consume. It is better to set an integer multiple of the NFFT value.
 WINDOW_TYPE = 'kaiser'                  # Type of window function used in the STFT
 N_MELS = 100                            # Number of Mel bands to generate in the Mel-spectrogram
-NFFT = 400                              # Number of FFT components for the STFT process
-HOP_LENGTH = 100                        # Number of samples between successive frames in the STFT
+NFFT = 512                              # Number of FFT components for the STFT process
+HOP_LENGTH = 128                        # Number of samples between successive frames in the STFT
 SAMPLE_RATE = 16000                     # The ZipEnhancer parameter, do not edit the value.
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
 

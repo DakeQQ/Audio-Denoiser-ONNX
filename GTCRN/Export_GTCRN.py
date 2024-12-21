@@ -159,7 +159,7 @@ results.sort(key=lambda x: x[0])
 saved = [result[1] for result in results]
 denoised_wav = (np.concatenate(saved, axis=-1)[0, 0, :audio_len]).astype(np.float32)
 end_time = time.time()
-print(f"Complete: 100.000%")
+print(f"Complete: 100.00%")
 
 
 # Save the denoised wav.

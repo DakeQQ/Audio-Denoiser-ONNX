@@ -57,8 +57,8 @@ class ZipEnhancer(torch.nn.Module):
         magnitude = torch.pow(real_part * real_part + imag_part * imag_part, self.compress_factor_sqrt)
         phase = torch.atan2(imag_part, real_part)
         magnitude, phase = self.zip_enhancer.forward(magnitude, phase)
-        audio = self.istft_model(torch.pow(magnitude, self.compress_factor_inv), phase) / norm_factor
-        return audio
+        audio = 32768.0 * self.istft_model(torch.pow(magnitude, self.compress_factor_inv), phase) / norm_factor
+        return audio.to(torch.int16)
 
 
 print('Export start ...')
@@ -158,7 +158,7 @@ with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denois
         print(f"Complete: {results[-1][0]:.3f}%")
 results.sort(key=lambda x: x[0])
 saved = [result[1] for result in results]
-denoised_wav = (np.concatenate(saved, axis=-1)[0, 0, :audio_len]).astype(np.float32)
+denoised_wav = np.concatenate(saved, axis=-1)[0, 0, :audio_len]
 end_time = time.time()
 print(f"Complete: 100.00%")
 

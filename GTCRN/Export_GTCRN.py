@@ -44,8 +44,8 @@ class GTCRN_CUSTOM(torch.nn.Module):
         real_part, imag_part = self.stft_model(audio, 'constant')
         magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part)
         magnitude, s_real, s_imag = self.gtcrn.forward(magnitude, real_part, imag_part)
-        audio = self.istft_model(magnitude, s_real, s_imag)
-        return audio
+        audio = 32768.0 * self.istft_model(magnitude, s_real, s_imag)
+        return audio.to(torch.int16)
 
 
 print('Export start ...')
@@ -148,7 +148,7 @@ with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denois
         print(f"Complete: {results[-1][0]:.3f}%")
 results.sort(key=lambda x: x[0])
 saved = [result[1] for result in results]
-denoised_wav = (np.concatenate(saved, axis=-1)[0, 0, :audio_len]).astype(np.float32)
+denoised_wav = np.concatenate(saved, axis=-1)[0, 0, :audio_len]
 end_time = time.time()
 print(f"Complete: 100.00%")
 

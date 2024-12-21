@@ -22,7 +22,6 @@ save_denoised_audio = model_path + "/examples/speech_with_noise1_denoised.wav"  
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-USE_PCM_INT16 = False                   # Enable it, if the audio input is PCM wav data with dtype int16 (short).
 MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else 384  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
 INPUT_AUDIO_LENGTH = 5120               # Set for static axis export: the length of the audio input signal (in samples) is recommended to be greater than 5120 and less than 40960. Higher values yield better quality but time consume. It is better to set an integer multiple of the NFFT value.
 WINDOW_TYPE = 'kaiser'                  # Type of window function used in the STFT
@@ -41,7 +40,7 @@ shutil.copyfile(modified_path + "zipformer.py", python_modelscope_package_path +
 
 
 class ZipEnhancer(torch.nn.Module):
-    def __init__(self, zip_enhancer, stft_model, istft_model, use_pcm_int16):
+    def __init__(self, zip_enhancer, stft_model, istft_model):
         super(ZipEnhancer, self).__init__()
         self.zip_enhancer = zip_enhancer
         self.stft_model = stft_model
@@ -49,20 +48,16 @@ class ZipEnhancer(torch.nn.Module):
         self.compress_factor = 0.3
         self.compress_factor_inv = 1.0 / self.compress_factor
         self.compress_factor_sqrt = self.compress_factor * 0.5
-        self.use_pcm_int16 = use_pcm_int16
-        self.inv_int16 = 1.0 / 32768.0
+        self.inv_int16 = 1.0 / 32678.0
 
     def forward(self, audio):
-        if self.use_pcm_int16:
-            audio = self.inv_int16 * audio.float()
+        audio = audio.float() * self.inv_int16
         norm_factor = torch.sqrt(audio.shape[-1] / torch.sum(audio * audio))
         real_part, imag_part = self.stft_model(audio * norm_factor, 'constant')
         magnitude = torch.pow(real_part * real_part + imag_part * imag_part, self.compress_factor_sqrt)
         phase = torch.atan2(imag_part, real_part)
         magnitude, phase = self.zip_enhancer.forward(magnitude, phase)
         audio = self.istft_model(torch.pow(magnitude, self.compress_factor_inv), phase) / norm_factor
-        if self.use_pcm_int16:
-            audio = (audio * 32768).to(torch.int16)
         return audio
 
 
@@ -70,8 +65,8 @@ print('Export start ...')
 with torch.inference_mode():
     custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, n_mels=N_MELS, hop_len=HOP_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
     custom_istft = STFT_Process(model_type='istft_A', n_fft=NFFT, n_mels=N_MELS, hop_len=HOP_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
-    zip_enhancer = ZipEnhancer(Model.from_pretrained(model_name_or_path=model_path, device='cpu').model.eval(), custom_stft, custom_istft, USE_PCM_INT16)
-    audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16 if USE_PCM_INT16 else torch.float32)
+    zip_enhancer = ZipEnhancer(Model.from_pretrained(model_name_or_path=model_path, device='cpu').model.eval(), custom_stft, custom_istft)
+    audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16)
     torch.onnx.export(
         zip_enhancer,
         (audio,),
@@ -108,7 +103,6 @@ session_opts.add_session_config_entry("session.set_denormal_as_zero", "1")
 
 ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=ORT_Accelerate_Providers)
 print(f"\nUsable Providers: {ort_session_A.get_providers()}")
-model_type = ort_session_A._inputs_meta[0].type
 in_name_A = ort_session_A.get_inputs()
 out_name_A = ort_session_A.get_outputs()
 in_name_A0 = in_name_A[0].name
@@ -120,10 +114,6 @@ print(f"\nTest Input Audio: {test_noisy_audio}")
 audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples())
 audio_len = len(audio)
 inv_audio_len = float(100.0 / audio_len)
-if "int16" not in model_type:
-    audio = audio.astype(np.float32) / 32768.0
-    if "float16" in model_type:
-        audio = audio.astype(np.float16)
 audio = audio.reshape(1, 1, -1)
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
@@ -174,7 +164,5 @@ print(f"Complete: 100.00%")
 
 
 # Save the denoised wav.
-if "int16" in model_type:
-    denoised_wav /= 32768.0
 sf.write(save_denoised_audio, denoised_wav, SAMPLE_RATE, format='WAVEX')
 print(f"\nDenoise Process Complete.\n\nSaving to: {save_denoised_audio}.\n\nTime Cost: {end_time - start_time:.3f} Seconds")

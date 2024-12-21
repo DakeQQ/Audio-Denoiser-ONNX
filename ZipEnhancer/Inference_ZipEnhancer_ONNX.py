@@ -32,7 +32,6 @@ session_opts.add_session_config_entry("session.set_denormal_as_zero", "1")
 
 ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=ORT_Accelerate_Providers)
 print(f"\nUsable Providers: {ort_session_A.get_providers()}")
-model_type = ort_session_A._inputs_meta[0].type
 in_name_A = ort_session_A.get_inputs()
 out_name_A = ort_session_A.get_outputs()
 in_name_A0 = in_name_A[0].name
@@ -44,10 +43,6 @@ print(f"\nTest Input Audio: {test_noisy_audio}")
 audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples())
 audio_len = len(audio)
 inv_audio_len = float(100.0 / audio_len)
-if "int16" not in model_type:
-    audio = audio.astype(np.float32) / 32768.0
-    if "float16" in model_type:
-        audio = audio.astype(np.float16)
 audio = audio.reshape(1, 1, -1)
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
@@ -98,7 +93,5 @@ print(f"Complete: 100.00%")
 
 
 # Save the denoised wav.
-if "int16" in model_type:
-    denoised_wav /= 32768.0
 sf.write(save_denoised_audio, denoised_wav, SAMPLE_RATE, format='WAVEX')
 print(f"\nDenoise Process Complete.\n\nSaving to: {save_denoised_audio}.\n\nTime Cost: {end_time - start_time:.3f} Seconds")

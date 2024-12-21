@@ -6,7 +6,8 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 ### Features  
 1. **Supported Models**:  
    - [ZipEnhancer](https://modelscope.cn/models/iic/speech_zipenhancer_ans_multiloss_16k_base)  
-   - [GTCRN](https://github.com/Xiaobin-Rong/gtcrn)  
+   - [GTCRN](https://github.com/Xiaobin-Rong/gtcrn)
+   - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
 
 2. **Dynamic Quantization**:  
    - Dynamic quantization is **not recommended** for ZipEnhancer as it significantly reduces performance due to increased computational overhead.  
@@ -29,11 +30,10 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 | macOS 15     | MacBook Air  | CPU <br> M3       | ZipEnhancer <br> f32 | 0.25                                              |
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | GTCRN <br> f32       | 0.0036                                            |
 | macOS 15     | MacBook Air  | CPU <br> M3       | GTCRN <br> f32       | 0.0013 ~<br> 0.0019                              |  
-
+| Ubuntu-24.04 | Laptop       | CPU <br> i5-7600HQ | DFSMN <br> f32       | 0.012                                            |
 ---
 
 ### To-Do List  
-- [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)  
 
 ---
 
@@ -42,11 +42,12 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 
 ### 功能  
 1. **支持的模型**：  
-   - [ZipEnhancer](https://modelscope.cn/models/iic/speech_zipenhancer_ans_multiloss_16k_base)  
-   - [GTCRN](https://github.com/Xiaobin-Rong/gtcrn)  
+   - [ZipEnhancer](https://modelscope.cn/models/iic/speech_zipenhancer_ans_multiloss_16k_base)
+   - [GTCRN](https://github.com/Xiaobin-Rong/gtcrn)
+   - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
 
 2. **动态量化**：  
-   - **不建议**对 ZipEnhancer 应用动态量化，因为这会由于计算负载增加而显著降低性能。  
+   - **不建议**对 ZipEnhancer 应用动态量化，因为这会由于计算负载增加而显著降低性能。
 
 3. **端到端处理**：  
    - 解决方案内置 `STFT/ISTFT` 处理。  

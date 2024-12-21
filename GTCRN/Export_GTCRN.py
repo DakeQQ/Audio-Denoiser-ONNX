@@ -17,12 +17,12 @@ onnx_model_A = "/home/DakeQQ/Downloads/GTCRN_ONNX/GTCRN.onnx"             # The 
 test_noisy_audio =  model_path + "/test_wavs/mix.wav"                     # The noisy audio path.
 save_denoised_audio = model_path + "/test_wavs/denoised.wav"              # The output denoised audio path.
 
+
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-USE_PCM_INT16 = False                   # Enable it, if the audio input is PCM wav data with dtype int16 (short).
 MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else 384  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
-INPUT_AUDIO_LENGTH = 15360               # Set for static axis export: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
+INPUT_AUDIO_LENGTH = 15360              # Set for static axis export: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
 WINDOW_TYPE = 'kaiser'                  # Type of window function used in the STFT
 N_MELS = 100                            # Number of Mel bands to generate in the Mel-spectrogram
 NFFT = 512                              # Number of FFT components for the STFT process
@@ -32,23 +32,19 @@ MAX_THREADS = 8                         # Number of parallel threads for test au
 
 
 class GTCRN_CUSTOM(torch.nn.Module):
-    def __init__(self, gtcrn, stft_model, istft_model, use_pcm_int16):
+    def __init__(self, gtcrn, stft_model, istft_model):
         super(GTCRN_CUSTOM, self).__init__()
         self.gtcrn = gtcrn
         self.stft_model = stft_model
         self.istft_model = istft_model
-        self.use_pcm_int16 = use_pcm_int16
         self.inv_int16 = 1.0 / 32768.0
 
     def forward(self, audio):
-        if self.use_pcm_int16:
-            audio = self.inv_int16 * audio.float()
+        audio = audio.float() * self.inv_int16
         real_part, imag_part = self.stft_model(audio, 'constant')
         magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part)
         magnitude, s_real, s_imag = self.gtcrn.forward(magnitude, real_part, imag_part)
         audio = self.istft_model(magnitude, s_real, s_imag)
-        if self.use_pcm_int16:
-            audio = (audio * 32768).to(torch.int16)
         return audio
 
 
@@ -59,8 +55,8 @@ with torch.inference_mode():
     gtcrn = GTCRN().eval()
     ckpt = torch.load(model_path + "/checkpoints/model_trained_on_dns3.tar", map_location='cpu')
     gtcrn.load_state_dict(ckpt['model'])
-    gtcrn = GTCRN_CUSTOM(gtcrn, custom_stft, custom_istft, USE_PCM_INT16)
-    audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16 if USE_PCM_INT16 else torch.float32)
+    gtcrn = GTCRN_CUSTOM(gtcrn, custom_stft, custom_istft)
+    audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16)
     torch.onnx.export(
         gtcrn,
         (audio,),
@@ -97,7 +93,6 @@ session_opts.add_session_config_entry("session.set_denormal_as_zero", "1")
 
 ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=ORT_Accelerate_Providers)
 print(f"\nUsable Providers: {ort_session_A.get_providers()}")
-model_type = ort_session_A._inputs_meta[0].type
 in_name_A = ort_session_A.get_inputs()
 out_name_A = ort_session_A.get_outputs()
 in_name_A0 = in_name_A[0].name
@@ -109,10 +104,6 @@ print(f"\nTest Input Audio: {test_noisy_audio}")
 audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples())
 audio_len = len(audio)
 inv_audio_len = float(100.0 / audio_len)
-if "int16" not in model_type:
-    audio = audio.astype(np.float32) / 32768.0
-    if "float16" in model_type:
-        audio = audio.astype(np.float16)
 audio = audio.reshape(1, 1, -1)
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
@@ -161,9 +152,6 @@ denoised_wav = (np.concatenate(saved, axis=-1)[0, 0, :audio_len]).astype(np.floa
 end_time = time.time()
 print(f"Complete: 100.00%")
 
-
 # Save the denoised wav.
-if "int16" in model_type:
-    denoised_wav /= 32768.0
 sf.write(save_denoised_audio, denoised_wav, SAMPLE_RATE, format='WAVEX')
 print(f"\nDenoise Process Complete.\n\nSaving to: {save_denoised_audio}.\n\nTime Cost: {end_time - start_time:.3f} Seconds")

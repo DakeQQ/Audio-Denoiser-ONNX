@@ -3,6 +3,7 @@ import os
 import subprocess
 
 import onnx.version_converter
+import onnxruntime
 from onnxruntime.transformers.optimizer import optimize_model
 from onnxslim import slim
 

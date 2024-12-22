@@ -6,7 +6,7 @@ import onnxruntime
 import soundfile as sf
 from pydub import AudioSegment
 
-onnx_model_A = "/home/DakeQQ/Downloads/DFSMN_Optimized/DFSMN.onnx"                                                              # The exported onnx model path.
+onnx_model_A = "/home/DakeQQ/Downloads/DFSMN_Optimized/DFSMN.ort"                                                              # The exported onnx model path.
 test_noisy_audio = "/home/DakeQQ/Downloads/speech_dfsmn_ans_psm_48k_causal/examples/speech_with_noise_48k.wav"                  # The noisy audio path.
 save_denoised_audio = "/home/DakeQQ/Downloads/speech_dfsmn_ans_psm_48k_causal/examples/speech_with_noise_48k_denoised.wav"      # The output denoised audio path.
 

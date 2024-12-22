@@ -16,11 +16,18 @@ provider = 'CPUExecutionProvider'                                               
 target_platform = "amd64"                                                       # ['arm', 'amd64']; The 'amd64' means x86_64 desktop, not means the AMD chip.
 
 
+# Check model
+if isinstance(onnxruntime.InferenceSession(model_path)._inputs_meta[0].shape[-1], str):
+    DYNAMIC_AXES = True
+else:
+    DYNAMIC_AXES = False
+
+
 # ONNX Model Optimizer
 slim(
     model=model_path,
     output_model=optimized_model_path,
-    no_shape_infer=True,   # True for more optimize but may get errors.
+    no_shape_infer=True if DYNAMIC_AXES else False,   # True for more optimize but may get errors.
     skip_fusion_patterns=False,
     no_constant_folding=False,
     save_as_external_data=False,
@@ -41,7 +48,7 @@ if use_gpu_fp16:
     model.convert_float_to_float16(
         keep_io_types=False,
         force_fp16_initializers=True,
-        use_symbolic_shape_infer=False,  # True for more optimize but may get errors.
+        use_symbolic_shape_infer=False if DYNAMIC_AXES else True,  # True for more optimize but may get errors.
         op_block_list=['DynamicQuantizeLinear', 'DequantizeLinear', 'DynamicQuantizeMatMul', 'Range', 'MatMulIntegerToFloat']
     )
 model.save_model_to_file(optimized_model_path, use_external_data_format=False)
@@ -53,7 +60,7 @@ gc.collect()
 slim(
     model=optimized_model_path,
     output_model=optimized_model_path,
-    no_shape_infer=True,   # True for more optimize but may get errors.
+    no_shape_infer=True if DYNAMIC_AXES else False,   # True for more optimize but may get errors.
     skip_fusion_patterns=False,
     no_constant_folding=False,
     save_as_external_data=False,

@@ -58,7 +58,7 @@ class ZipEnhancer(torch.nn.Module):
         phase = torch.atan2(imag_part, real_part)
         magnitude, phase = self.zip_enhancer.forward(magnitude, phase)
         audio = 32768.0 * self.istft_model(torch.pow(magnitude, self.compress_factor_inv), phase) / norm_factor
-        return audio.to(torch.int16)
+        return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 
 print('Export start ...')
@@ -123,7 +123,7 @@ else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
 if audio_len > INPUT_AUDIO_LENGTH:
-    if shape_value_in != shape_value_out:
+    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int):
         stride_step = shape_value_out
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH

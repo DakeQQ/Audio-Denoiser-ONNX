@@ -51,7 +51,7 @@ else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
 if audio_len > INPUT_AUDIO_LENGTH:
-    if shape_value_in != shape_value_out:
+    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int):
         stride_step = shape_value_out
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH

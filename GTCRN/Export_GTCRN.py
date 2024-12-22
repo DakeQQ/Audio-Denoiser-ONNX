@@ -45,7 +45,7 @@ class GTCRN_CUSTOM(torch.nn.Module):
         magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part)
         magnitude, s_real, s_imag = self.gtcrn.forward(magnitude, real_part, imag_part)
         audio = 32768.0 * self.istft_model(magnitude, s_real, s_imag)
-        return audio.to(torch.int16)
+        return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 
 print('Export start ...')
@@ -113,7 +113,7 @@ else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
 if audio_len > INPUT_AUDIO_LENGTH:
-    if shape_value_in != shape_value_out:
+    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int):
         stride_step = shape_value_out
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH

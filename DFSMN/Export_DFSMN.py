@@ -24,7 +24,7 @@ save_denoised_audio = model_path + "/examples/speech_with_noise_48k_denoised.wav
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else 384  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
+MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else 64  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
 INPUT_AUDIO_LENGTH = 48000              # Set for static axis export: the length of the audio input signal (in samples) is recommended to be greater than 3840 and less than 96000. Higher values yield better quality but time consume. It is better to set an integer multiple of the NFFT value.
 WINDOW_TYPE = 'kaiser'                  # Type of window function used in the STFT
 N_MELS = 120                            # Number of Mel bands to generate in the Mel-spectrogram

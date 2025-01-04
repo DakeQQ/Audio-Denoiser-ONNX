@@ -1,6 +1,7 @@
 import gc
 import shutil
 import time
+import site
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -12,10 +13,8 @@ from pydub import AudioSegment
 
 from STFT_Process import STFT_Process  # The custom STFT/ISTFT can be exported in ONNX format.
 
-model_path = "/home/DakeQQ/Downloads/speech_zipenhancer_ans_multiloss_16k_base"                                                      # The ZipEnhancer download path.
-onnx_model_A = "/home/DakeQQ/Downloads/ZipEnhancer_ONNX/ZipEnhancer.onnx"                                                            # The exported onnx model path.
-python_modelscope_package_path = '/home/DakeQQ/anaconda3/envs/python_312/lib/python3.12/site-packages/modelscope/models/audio/ans/'  # The Python package path.
-modified_path = './modeling_modified/'
+model_path = "/home/DakeQQ/Downloads/speech_zipenhancer_ans_multiloss_16k_base"         # The ZipEnhancer download path.
+onnx_model_A = "/home/DakeQQ/Downloads/ZipEnhancer_ONNX/ZipEnhancer.onnx"               # The exported onnx model path.
 test_noisy_audio = model_path + "/examples/speech_with_noise1.wav"                      # The noisy audio path.
 save_denoised_audio = model_path + "/examples/speech_with_noise1_denoised.wav"          # The output denoised audio path.
 
@@ -32,11 +31,11 @@ SAMPLE_RATE = 16000                     # The ZipEnhancer parameter, do not edit
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
 
 
-shutil.copyfile(modified_path + "zipenhancer.py", python_modelscope_package_path + "zipenhancer.py")
-shutil.copyfile(modified_path + "generator.py", python_modelscope_package_path + "zipenhancer_layers/generator.py")
-shutil.copyfile(modified_path + "scaling.py", python_modelscope_package_path + "zipenhancer_layers/scaling.py")
-shutil.copyfile(modified_path + "zipenhancer_layer.py", python_modelscope_package_path + "zipenhancer_layers/zipenhancer_layer.py")
-shutil.copyfile(modified_path + "zipformer.py", python_modelscope_package_path + "zipenhancer_layers/zipformer.py")
+shutil.copyfile("./modeling_modified/zipenhancer.py", site.getsitepackages()[0] + "/modelscope/models/audio/ans/zipenhancer.py")
+shutil.copyfile("./modeling_modified/generator.py", site.getsitepackages()[0] + "/modelscope/models/audio/ans/zipenhancer_layers/generator.py")
+shutil.copyfile("./modeling_modified/scaling.py", site.getsitepackages()[0] + "/modelscope/models/audio/ans/zipenhancer_layers/scaling.py")
+shutil.copyfile("./modeling_modified/zipenhancer_layer.py", site.getsitepackages()[0] + "/modelscope/models/audio/ans/zipenhancer_layers/zipenhancer_layer.py")
+shutil.copyfile("./modeling_modified/zipformer.py", site.getsitepackages()[0] + "/modelscope/models/audio/ans/zipenhancer_layers/zipformer.py")
 
 
 class ZipEnhancer(torch.nn.Module):

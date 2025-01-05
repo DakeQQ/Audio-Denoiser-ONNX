@@ -14,10 +14,8 @@ from modelscope.utils.constant import Tasks
 from STFT_Process import STFT_Process  # The custom STFT/ISTFT can be exported in ONNX format.
 
 
-model_path = "/home/DakeQQ/Downloads/speech_dfsmn_ans_psm_48k_causal"                                                                   # The DFSMN download path.
-onnx_model_A = "/home/DakeQQ/Downloads/DFSMN_ONNX/DFSMN.onnx"                                                                           # The exported onnx model path.
-python_modelscope_package_path = '/home/DakeQQ/anaconda3/envs/python_312/lib/python3.12/site-packages/modelscope/models/audio/ans/'     # The Python package path.
-modified_path = './modeling_modified/'
+model_path = "/home/DakeQQ/Downloads/speech_dfsmn_ans_psm_48k_causal"                      # The DFSMN download path.
+onnx_model_A = "/home/DakeQQ/Downloads/DFSMN_ONNX/DFSMN.onnx"                              # The exported onnx model path.
 test_noisy_audio = model_path + "/examples/speech_with_noise_48k.wav"                      # The noisy audio path.
 save_denoised_audio = model_path + "/examples/speech_with_noise_48k_denoised.wav"          # The output denoised audio path.
 

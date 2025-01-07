@@ -30,12 +30,12 @@ HOP_LENGTH = 100                        # Number of samples between successive f
 SAMPLE_RATE = 16000                     # The ZipEnhancer parameter, do not edit the value.
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
 
-
-shutil.copyfile("./modeling_modified/zipenhancer.py", site.getsitepackages()[0] + "/modelscope/models/audio/ans/zipenhancer.py")
-shutil.copyfile("./modeling_modified/generator.py", site.getsitepackages()[0] + "/modelscope/models/audio/ans/zipenhancer_layers/generator.py")
-shutil.copyfile("./modeling_modified/scaling.py", site.getsitepackages()[0] + "/modelscope/models/audio/ans/zipenhancer_layers/scaling.py")
-shutil.copyfile("./modeling_modified/zipenhancer_layer.py", site.getsitepackages()[0] + "/modelscope/models/audio/ans/zipenhancer_layers/zipenhancer_layer.py")
-shutil.copyfile("./modeling_modified/zipformer.py", site.getsitepackages()[0] + "/modelscope/models/audio/ans/zipenhancer_layers/zipformer.py")
+site_package_path = site.getsitepackages()[-1]
+shutil.copyfile("./modeling_modified/zipenhancer.py", site_package_path + "/modelscope/models/audio/ans/zipenhancer.py")
+shutil.copyfile("./modeling_modified/generator.py", site_package_path + "/modelscope/models/audio/ans/zipenhancer_layers/generator.py")
+shutil.copyfile("./modeling_modified/scaling.py", site_package_path + "/modelscope/models/audio/ans/zipenhancer_layers/scaling.py")
+shutil.copyfile("./modeling_modified/zipenhancer_layer.py", site_package_path + "/modelscope/models/audio/ans/zipenhancer_layers/zipenhancer_layer.py")
+shutil.copyfile("./modeling_modified/zipformer.py", site_package_path + "/modelscope/models/audio/ans/zipenhancer_layers/zipformer.py")
 
 
 class ZipEnhancer(torch.nn.Module):

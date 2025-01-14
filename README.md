@@ -21,6 +21,8 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [Download Models](https://drive.google.com/drive/folders/1L13BJRqdBrPX8jQj3wwCiI67xC5QIT3S?usp=drive_link)  
    - [Explore More Projects](https://dakeqq.github.io/overview/)  
 
+5. **Note**
+   - Please note that the denoiser model optimized on Windows cannot be used on Linux, and vice versa.
 ---
 
 ### 性能 Performance  
@@ -58,4 +60,6 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [下载模型](https://drive.google.com/drive/folders/1L13BJRqdBrPX8jQj3wwCiI67xC5QIT3S?usp=drive_link)  
    - [探索更多项目](https://dakeqq.github.io/overview/)  
 
+5. **Note**
+   - 请注意，在 Windows 系统上优化的降噪模型无法在 Linux 系统上使用，反之亦然。
 ---

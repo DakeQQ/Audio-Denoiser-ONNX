@@ -10,7 +10,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
 
 2. **Dynamic Quantization**:  
-   - Dynamic quantization is **not recommended** for ZipEnhancer as it significantly reduces performance due to increased computational overhead.  
+   - Dynamic quantization is **not recommended** for Denoiser as it significantly reduces performance due to increased computational overhead.  
 
 3. **End-to-End Processing**:  
    - The solution includes internal `STFT/ISTFT` processing.  
@@ -49,7 +49,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
 
 2. **动态量化**：  
-   - **不建议**对 ZipEnhancer 应用动态量化，因为这会由于计算负载增加而显著降低性能。
+   - **不建议**对 Denoiser 应用动态量化，因为这会由于计算负载增加而显著降低性能。
 
 3. **端到端处理**：  
    - 解决方案内置 `STFT/ISTFT` 处理。  

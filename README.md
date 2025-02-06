@@ -8,9 +8,10 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [ZipEnhancer](https://modelscope.cn/models/iic/speech_zipenhancer_ans_multiloss_16k_base)  
    - [GTCRN](https://github.com/Xiaobin-Rong/gtcrn)
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
+   - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
 
 2. **Dynamic Quantization**:  
-   - Dynamic quantization is **not recommended** for Denoiser as it significantly reduces performance due to increased computational overhead.  
+   - Dynamic quantization is **not recommended** for Denoiser as it significantly reduces performance due to increased computational overhead. Except, Mel-Band-Roformer. 
 
 3. **End-to-End Processing**:  
    - The solution includes internal `STFT/ISTFT` processing.  
@@ -34,10 +35,11 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | GTCRN <br> f32       | 0.0036                                            |
 | macOS 15     | MacBook Air  | CPU <br> M3       | GTCRN <br> f32       | 0.0013 ~<br> 0.0019                               |  
 | Ubuntu-24.04 | Laptop       | CPU <br> i5-7300HQ | DFSMN <br> f32      | 0.0068 ~<br> 0.012                                |
+| Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | MelBandRofomer <br> q8f32 | 1.40 <br> (Chunk Size: 1000ms)              |
 ---
 
 ### To-Do List  
-- [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
+- None
 ---
 
 ## Audio-Denoiser-ONNX  
@@ -48,9 +50,10 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [ZipEnhancer](https://modelscope.cn/models/iic/speech_zipenhancer_ans_multiloss_16k_base)
    - [GTCRN](https://github.com/Xiaobin-Rong/gtcrn)
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
+   - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
 
 2. **动态量化**：  
-   - **不建议**对 Denoiser 应用动态量化，因为这会由于计算负载增加而显著降低性能。
+   - **除了 Mel-Band-Roformer 之外，不建议**对其餘 Denoiser 应用动态量化，因为这会由于计算负载增加而显著降低性能。
 
 3. **端到端处理**：  
    - 解决方案内置 `STFT/ISTFT` 处理。  

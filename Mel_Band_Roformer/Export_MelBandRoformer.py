@@ -36,11 +36,10 @@ class MelBandRoformer_Modified(torch.nn.Module):
         self.mel_band_roformer = mel_band_roformer
         self.stft_model = stft_model
         self.istft_model = istft_model
-        self.inv_int16 = float(1.0 / 32768.0)
         self.zeros = torch.zeros((1, 1, (nfft // 2 + 1) * 2, max_signal_len, 2), dtype=torch.uint8)
 
     def forward(self, audio):
-        audio = audio * self.inv_int16
+        audio = audio.float()
         audio_L, audio_R = torch.chunk(audio, 2, dim=1)
         real_L, imag_L = self.stft_model(audio_L, 'constant')
         real_R, imag_R = self.stft_model(audio_R, 'constant')
@@ -53,7 +52,7 @@ class MelBandRoformer_Modified(torch.nn.Module):
         audio_L = custom_istft(torch.sqrt(real_L * real_L + imag_L * imag_L), real_L, imag_L)
         audio_R = custom_istft(torch.sqrt(real_R * real_R + imag_R * imag_R), real_R, imag_R)
         audio = torch.cat((audio_L, audio_R), dim=1)
-        return (audio * 32768.0).clamp(min=-32768.0, max=32767.0).to(torch.int16)
+        return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 
 print('Export start ...')

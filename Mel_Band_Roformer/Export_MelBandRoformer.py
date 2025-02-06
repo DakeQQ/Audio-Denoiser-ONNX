@@ -13,8 +13,8 @@ from modeling_modified.mel_band_roformer import MelBandRoformer
 from STFT_Process import STFT_Process   # The custom STFT/ISTFT can be exported in ONNX format.
 
 
-model_path = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main"                  # The MelBandRoformer download path.
-onnx_model_A = "/home/DakeQQ/Downloads/MelBandRoformer_ONNX/MelBandRoformer.onnx"         # The exported onnx model path.
+model_path = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main"                # The Mel-Band-Roformer download path.
+onnx_model_A = "/home/DakeQQ/Downloads/MelBandRoformer_ONNX/MelBandRoformer.onnx"       # The exported onnx model path.
 test_noisy_audio = "./test.wav"                                                         # The noisy audio path.
 save_denoised_audio = "./test_denoised.wav"                                             # The output denoised audio path.
 
@@ -148,7 +148,7 @@ def process_segment(_inv_audio_len, _slice_start, _slice_end, _audio):
     return _slice_start * _inv_audio_len, ort_session_A.run([out_name_A0], {in_name_A0: _audio[:, :, _slice_start: _slice_end]})[0]
 
 
-# Start to run MelBandRoformer
+# Start to run Mel-Band-Roformer
 print("\nRunning the MelBandRoformer by ONNX Runtime.")
 results = []
 start_time = time.time()

@@ -58,10 +58,10 @@ if audio_len > INPUT_AUDIO_LENGTH:
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
     pad_amount = total_length_needed - audio_len
     final_slice = audio[:, :, -pad_amount:]
-    white_noise = (np.sqrt(np.mean(final_slice * final_slice)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, pad_amount))).astype(audio.dtype)
+    white_noise = (np.sqrt(np.mean(final_slice * final_slice, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, pad_amount))).astype(audio.dtype)
     audio = np.concatenate((audio, white_noise), axis=-1)
 elif audio_len < INPUT_AUDIO_LENGTH:
-    white_noise = (np.sqrt(np.mean(audio * audio)) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
+    white_noise = (np.sqrt(np.mean(audio * audio, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
     audio = np.concatenate((audio, white_noise), axis=-1)
 aligned_len = audio.shape[-1]
 

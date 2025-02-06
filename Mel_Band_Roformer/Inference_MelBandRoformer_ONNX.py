@@ -14,7 +14,7 @@ save_denoised_audio = "./test_denoised.wav"                                     
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 MAX_THREADS = 4                         # Number of parallel threads for audio denoising.
-SAMPLE_RATE = 44100                     # The ZipEnhancer parameter, do not edit the value.
+SAMPLE_RATE = 44100                     # The Mel-Band-Roformer parameter, do not edit the value.
 DEVICE_ID = 0
 
 if "OpenVINOExecutionProvider" in ORT_Accelerate_Providers:
@@ -39,7 +39,7 @@ elif "CUDAExecutionProvider" in ORT_Accelerate_Providers:
             'do_copy_in_default_stream': '1',
             'cudnn_conv1d_pad_to_nc1d': '1',
             'enable_cuda_graph': '0',  # Set to '0' to avoid potential errors when enabled.
-            'use_tf32': '1'            # Float16 doesn't work on F5_transformer.onnx with CUDA
+            'use_tf32': '1'            # Float16 may not work.
         }
     ]
 else:
@@ -105,7 +105,7 @@ def process_segment(_inv_audio_len, _slice_start, _slice_end, _audio):
     return _slice_start * _inv_audio_len, ort_session_A.run([out_name_A0], {in_name_A0: _audio[:, :, _slice_start: _slice_end]})[0]
 
 
-# Start to run MelBandRoformer
+# Start to run Mel-Band-Roformer
 print("\nRunning the MelBandRoformer by ONNX Runtime.")
 results = []
 start_time = time.time()

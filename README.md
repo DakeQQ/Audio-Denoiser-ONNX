@@ -53,7 +53,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
 
 2. **动态量化**：  
-   - **除了 Mel-Band-Roformer 之外，不建议**对其餘 Denoiser 应用动态量化，因为这会由于计算负载增加而显著降低性能。
+   - 除了 Mel-Band-Roformer 之外，**不建议**对其餘 Denoiser 应用动态量化，因为这会由于计算负载增加而显著降低性能。
 
 3. **端到端处理**：  
    - 解决方案内置 `STFT/ISTFT` 处理。  

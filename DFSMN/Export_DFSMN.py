@@ -41,9 +41,10 @@ class DFSMN(torch.nn.Module):
         self.istft_model = istft_model
         self.pre_emphasis = pre_emphasis
         self.fbank = (torchaudio.functional.melscale_fbanks(nfft // 2 + 1, 20, 24000, n_mels, sample_rate, None, 'htk')).transpose(0, 1).unsqueeze(0)
+        self.inv_int16 = float(1.0 / 32768.0)
 
     def forward(self, audio):
-        audio = audio.float()
+        audio = audio * self.inv_int16
         audio -= torch.mean(audio)  # Remove DC Offset
         audio = torch.cat((audio[:, :, :1], audio[:, :, 1:] - self.pre_emphasis * audio[:, :, :-1]), dim=-1)  # Pre Emphasize
         real_part, imag_part = self.stft_model(audio, 'constant')
@@ -53,7 +54,7 @@ class DFSMN(torch.nn.Module):
         imag_part *= mask
         magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part)
         audio = self.istft_model(magnitude, real_part, imag_part)
-        return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
+        return (audio * 32768.0).clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 
 print('Export start ...')

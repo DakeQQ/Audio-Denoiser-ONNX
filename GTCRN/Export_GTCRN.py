@@ -40,7 +40,7 @@ class GTCRN_CUSTOM(torch.nn.Module):
         self.inv_int16 = float(1.0 / 32768.0)
 
     def forward(self, audio):
-        audio = audio.float() * self.inv_int16
+        audio = audio * self.inv_int16
         real_part, imag_part = self.stft_model(audio, 'constant')
         magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part)
         magnitude, s_real, s_imag = self.gtcrn.forward(magnitude, real_part, imag_part)

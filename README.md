@@ -39,7 +39,8 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 ---
 
 ### To-Do List  
-- None
+- [ExNet-BF-PF](https://github.com/AdiCohen501/ExNet-BF-PF)
+- [MP-SENet](https://github.com/yxlu-0102/MP-SENet)
 ---
 
 ## Audio-Denoiser-ONNX  

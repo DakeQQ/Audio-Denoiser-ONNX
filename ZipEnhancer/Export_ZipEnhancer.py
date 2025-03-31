@@ -110,7 +110,7 @@ out_name_A0 = out_name_A[0].name
 
 # Load the input audio
 print(f"\nTest Input Audio: {test_noisy_audio}")
-audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples())
+audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples(), dtype=np.int16)
 audio_len = len(audio)
 inv_audio_len = float(100.0 / audio_len)
 audio = audio.reshape(1, 1, -1)

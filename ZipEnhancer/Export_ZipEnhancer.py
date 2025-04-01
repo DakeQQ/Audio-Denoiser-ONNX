@@ -38,6 +38,12 @@ shutil.copyfile("./modeling_modified/zipenhancer_layer.py", site_package_path + 
 shutil.copyfile("./modeling_modified/zipformer.py", site_package_path + "/modelscope/models/audio/ans/zipenhancer_layers/zipformer.py")
 
 
+def normalize_to_int16(audio):
+    max_val = np.max(np.abs(audio.astype(np.float32)))
+    scaling_factor = 32767.0 / max_val if max_val > 0 else 1.0
+    return (audio * float(scaling_factor)).astype(np.int16)
+
+
 class ZipEnhancer(torch.nn.Module):
     def __init__(self, zip_enhancer, stft_model, istft_model):
         super(ZipEnhancer, self).__init__()
@@ -110,7 +116,8 @@ out_name_A0 = out_name_A[0].name
 
 # Load the input audio
 print(f"\nTest Input Audio: {test_noisy_audio}")
-audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples(), dtype=np.int16)
+audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples(), dtype=np.int32)
+audio = normalize_to_int16(audio)
 audio_len = len(audio)
 inv_audio_len = float(100.0 / audio_len)
 audio = audio.reshape(1, 1, -1)

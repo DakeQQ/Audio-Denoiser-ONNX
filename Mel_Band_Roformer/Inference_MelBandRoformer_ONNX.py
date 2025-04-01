@@ -66,11 +66,18 @@ in_name_A0 = in_name_A[0].name
 out_name_A0 = out_name_A[0].name
 
 
+def normalize_to_int16(audio):
+    max_val = np.max(np.abs(audio.astype(np.float32)))
+    scaling_factor = 32767.0 / max_val if max_val > 0 else 1.0
+    return (audio * float(scaling_factor)).astype(np.int16)
+
+
 # Load the input audio
 print(f"\nTest Input Audio: {test_noisy_audio}")
 audio = AudioSegment.from_file(test_noisy_audio).set_frame_rate(SAMPLE_RATE)
 audio_channels = audio.channels
-audio = np.array(audio.get_array_of_samples(), dtype=np.int16)
+audio = np.array(audio.get_array_of_samples(), dtype=np.int32)
+audio = normalize_to_int16(audio)
 if audio_channels == 1:
     audio = audio.reshape(1, 1, -1)
     audio = np.concatenate((audio, audio), axis=1)

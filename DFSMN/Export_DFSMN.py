@@ -48,14 +48,19 @@ def normalize_to_int16(audio):
 
 
 class DFSMN(torch.nn.Module):
-    def __init__(self, dfsmn, stft_model, istft_model,  nfft_stft, nfft_fbank, stft_signal_len, n_mels, sample_rate, pre_emphasis):
+    def __init__(self, dfsmn, stft_model, istft_model, nfft_stft, nfft_fbank, stft_signal_len, n_mels, sample_rate, pre_emphasis):
         super(DFSMN, self).__init__()
         self.dfsmn = dfsmn
         self.stft_model = stft_model
         self.istft_model = istft_model
         self.pre_emphasis = pre_emphasis
         self.fbank = (torchaudio.functional.melscale_fbanks(nfft_fbank // 2 + 1, 20, sample_rate // 2, n_mels, sample_rate, None, 'htk')).transpose(0, 1).unsqueeze(0)
-        self.padding = torch.zeros((1, (nfft_fbank - nfft_stft) // 2, stft_signal_len), dtype=torch.int8)
+        self.nfft_stft = nfft_stft
+        self.nfft_fbank = nfft_fbank
+        if self.nfft_stft > self.nfft_fbank:
+            self.padding = torch.zeros((1, n_mels, (nfft_stft - nfft_fbank) // 2), dtype=torch.float32)
+        else:
+            self.padding = torch.zeros((1, (nfft_fbank - nfft_stft) // 2, stft_signal_len), dtype=torch.int8)
 
     def forward(self, audio):
         audio = audio.float()       # Don't divide by 32768.0
@@ -63,7 +68,9 @@ class DFSMN(torch.nn.Module):
         audio = torch.cat((audio[:, :, :1], audio[:, :, 1:] - self.pre_emphasis * audio[:, :, :-1]), dim=-1)  # Pre Emphasize
         real_part, imag_part = self.stft_model(audio, 'constant')
         power = real_part * real_part + imag_part * imag_part
-        if self.padding.shape[1] != 0:
+        if self.nfft_stft > self.nfft_fbank:
+            self.fbank = torch.cat((self.fbank, self.padding), dim=-1)
+        elif self.nfft_fbank > self.nfft_stft:
             power = torch.cat((power, self.padding[:, :, :power.shape[-1]].float()), dim=1)
         mel_features = torch.matmul(self.fbank, power).transpose(1, 2).clamp(min=1e-5).log()
         mask = self.dfsmn.forward(mel_features).transpose(1, 2)

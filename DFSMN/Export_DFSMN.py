@@ -58,7 +58,7 @@ class DFSMN(torch.nn.Module):
         self.padding = torch.zeros((1, (nfft_fbank - nfft_stft) // 2, stft_signal_len), dtype=torch.int8)
 
     def forward(self, audio):
-        audio = audio.float()
+        audio = audio.float()       # Don't divide by 32768.0
         audio -= torch.mean(audio)  # Remove DC Offset
         audio = torch.cat((audio[:, :, :1], audio[:, :, 1:] - self.pre_emphasis * audio[:, :, :-1]), dim=-1)  # Pre Emphasize
         real_part, imag_part = self.stft_model(audio, 'constant')

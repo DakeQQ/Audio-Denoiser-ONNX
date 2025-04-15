@@ -33,10 +33,6 @@ MAX_THREADS = 4                         # Number of parallel threads for test au
 
 
 STFT_SIGNAL_LENGTH = INPUT_AUDIO_LENGTH // HOP_LENGTH + 1   # The length after STFT processed
-if NFFT_FBANK < NFFT_STFT:
-    NFFT_FBANK = NFFT_STFT
-if NFFT_FBANK > INPUT_AUDIO_LENGTH:
-    NFFT_FBANK = INPUT_AUDIO_LENGTH
 if HOP_LENGTH > INPUT_AUDIO_LENGTH:
     HOP_LENGTH = INPUT_AUDIO_LENGTH
 

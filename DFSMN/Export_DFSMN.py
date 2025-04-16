@@ -55,6 +55,7 @@ class DFSMN(torch.nn.Module):
         self.nfft_fbank = nfft_fbank
         if self.nfft_stft > self.nfft_fbank:
             self.padding = torch.zeros((1, n_mels, (nfft_stft - nfft_fbank) // 2), dtype=torch.float32)
+            self.fbank = torch.cat((self.fbank, self.padding), dim=-1)
         else:
             self.padding = torch.zeros((1, (nfft_fbank - nfft_stft) // 2, stft_signal_len), dtype=torch.int8)
 
@@ -64,9 +65,7 @@ class DFSMN(torch.nn.Module):
         audio = torch.cat((audio[:, :, :1], audio[:, :, 1:] - self.pre_emphasis * audio[:, :, :-1]), dim=-1)  # Pre Emphasize
         real_part, imag_part = self.stft_model(audio, 'constant')
         power = real_part * real_part + imag_part * imag_part
-        if self.nfft_stft > self.nfft_fbank:
-            self.fbank = torch.cat((self.fbank, self.padding), dim=-1)
-        elif self.nfft_fbank > self.nfft_stft:
+        if self.nfft_fbank > self.nfft_stft:
             power = torch.cat((power, self.padding[:, :, :power.shape[-1]].float()), dim=1)
         mel_features = torch.matmul(self.fbank, power).transpose(1, 2).clamp(min=1e-5).log()
         mask = self.dfsmn.forward(mel_features).transpose(1, 2)

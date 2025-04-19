@@ -47,7 +47,7 @@ class MelBandRoformer_Modified(torch.nn.Module):
 
     def forward(self, audio):
         audio = audio * self.inv_int16
-        audio_L, audio_R = torch.chunk(audio, 2, dim=1)
+        audio_L, audio_R = torch.split(audio, [1, 1], dim=1)
         real_L, imag_L = self.stft_model(audio_L, 'constant')
         real_R, imag_R = self.stft_model(audio_R, 'constant')
         stft_repr_L = torch.stack((real_L, imag_L), dim=-1)

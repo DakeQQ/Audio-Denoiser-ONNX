@@ -22,8 +22,8 @@ ORT_Accelerate_Providers = []           # If you have accelerate devices for : [
                                         # else keep empty.
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
 INPUT_AUDIO_LENGTH = 44100              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 22050 and less than 362800. Higher values yield better quality but time consume. It is better to set an integer multiple of the HOP_LENGTH value.
-MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else (INPUT_AUDIO_LENGTH // 100 + 1)  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
-WINDOW_TYPE = 'kaiser'                  # Type of window function used in the STFT
+MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else (INPUT_AUDIO_LENGTH // 100 + 1)  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
+WINDOW_TYPE = 'hann'                    # Type of window function used in the STFT
 NFFT = 2048                             # Number of FFT components for the STFT process
 HOP_LENGTH = 441                        # Number of samples between successive frames in the STFT
 SAMPLE_RATE = 44100                     # The MelBandRoformer parameter, do not edit the value.

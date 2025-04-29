@@ -42,7 +42,7 @@ class Attend(nn.Module):
         super().__init__()
         self.dropout = dropout
         self.attn_dropout = nn.Dropout(dropout)
-
+        self.scale = float(64 ** -0.5)
         self.flash = flash
         assert not (flash and version.parse(torch.__version__) < version.parse('2.0.0')), 'in order to use flash attention, you must be using pytorch 2.0 or above'
 
@@ -61,7 +61,6 @@ class Attend(nn.Module):
         else:
             self.cuda_config = FlashAttentionConfig(False, True, True)
 
-        self.scale = float(64 ** -0.5)
 
     def flash_attn(self, q, k, v):
         _, heads, q_len, _, k_len, is_cuda, device = *q.shape, k.shape[-2], q.is_cuda, q.device

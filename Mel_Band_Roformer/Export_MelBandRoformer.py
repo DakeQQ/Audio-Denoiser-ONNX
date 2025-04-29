@@ -3,20 +3,20 @@ import time
 import yaml
 from ml_collections import ConfigDict
 from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 import onnxruntime
 import torch
 import soundfile as sf
 from pydub import AudioSegment
 from modeling_modified.mel_band_roformer import MelBandRoformer
-from STFT_Process import STFT_Process   # The custom STFT/ISTFT can be exported in ONNX format.
+from STFT_Process import STFT_Process                                                           # The custom STFT/ISTFT can be exported in ONNX format.
 
 
-model_path = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main"                # The Mel-Band-Roformer download path.
-onnx_model_A = "/home/DakeQQ/Downloads/MelBandRoformer_ONNX/MelBandRoformer.onnx"       # The exported onnx model path.
-test_noisy_audio = "./test.wav"                                                         # The noisy audio path.
-save_denoised_audio = "./test_denoised.wav"                                             # The output denoised audio path.
+project_path = "/home/iamj/Downloads/Mel-Band-Roformer-Vocal-Model-main"                        # The Mel-Band-Roformer GitHub project path.
+model_path = "/home/iamj/Downloads/Mel-Band-Roformer-Vocal-Model-main/MelBandRoformer.ckpt"     # The model download path.
+onnx_model_A = "/home/iamj/Downloads/MelBandRoformer_ONNX/MelBandRoformer.onnx"                 # The exported onnx model path.
+test_noisy_audio = "./test.wav"                                                                 # The noisy audio path.
+save_denoised_audio = "./test_denoised.wav"                                                     # The output denoised audio path.
 
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
@@ -66,10 +66,10 @@ print('Export start ...')
 with torch.inference_mode():
     custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
     custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
-    with open(model_path + "/configs/config_vocals_mel_band_roformer.yaml") as f:
+    with open(project_path + "/configs/config_vocals_mel_band_roformer.yaml") as f:
       config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
     model = MelBandRoformer(**dict(config.model))
-    model.load_state_dict(torch.load(model_path + "/melbandroformer.ckpt", map_location=torch.device('cpu')))
+    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
     mel_band_roformer = MelBandRoformer_Modified(model.eval(), custom_stft, custom_istft, NFFT, MAX_SIGNAL_LENGTH)
     audio = torch.ones((1, 2, INPUT_AUDIO_LENGTH), dtype=torch.int16)
     torch.onnx.export(

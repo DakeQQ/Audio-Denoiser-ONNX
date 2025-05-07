@@ -413,7 +413,7 @@ class BiasNorm(torch.nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         x_minus = x - self.bias
-        return x * self.log_scale.exp() / torch.sqrt(torch.mean(x_minus * x_minus, dim=self.channel_dim, keepdim=True))
+        return self.log_scale.exp() * (x / torch.sqrt(x_minus.pow(2).mean(dim=self.channel_dim, keepdim=True) + 1e-6))
 
 
 def ScaledLinear(*args, initial_scale: float = 1.0, **kwargs) -> nn.Linear:

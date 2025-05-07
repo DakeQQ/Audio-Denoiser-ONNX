@@ -80,8 +80,8 @@ class TRA(nn.Module):
 
     def forward(self, x):
         """x: (B,C,T,F)"""
-        zt = torch.mean(x * x, dim=-1)  # (B,C,T)
-        at = self.att_gru(zt.transpose(1,2))[0]
+        zt = x.pow(2).mean(dim=-1)  # (B,C,T)
+        at = self.att_gru(zt.transpose(1, 2))[0]
         at = self.att_fc(at).transpose(1, 2)
         at = self.att_act(at)
         At = at.unsqueeze(-1)

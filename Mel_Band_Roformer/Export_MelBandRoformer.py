@@ -12,9 +12,9 @@ from modeling_modified.mel_band_roformer import MelBandRoformer
 from STFT_Process import STFT_Process                                                           # The custom STFT/ISTFT can be exported in ONNX format.
 
 
-project_path = "/home/iamj/Downloads/Mel-Band-Roformer-Vocal-Model-main"                        # The Mel-Band-Roformer GitHub project path.
-model_path = "/home/iamj/Downloads/Mel-Band-Roformer-Vocal-Model-main/MelBandRoformer.ckpt"     # The model download path.
-onnx_model_A = "/home/iamj/Downloads/MelBandRoformer_ONNX/MelBandRoformer.onnx"                 # The exported onnx model path.
+project_path = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main"                        # The Mel-Band-Roformer GitHub project path.
+model_path = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main/MelBandRoformer.ckpt"     # The model download path.
+onnx_model_A = "/home/DakeQQ/Downloads/MelBandRoformer_ONNX/MelBandRoformer.onnx"                 # The exported onnx model path.
 test_noisy_audio = "./test.wav"                                                                 # The noisy audio path.
 save_denoised_audio = "./test_denoised.wav"                                                     # The output denoised audio path.
 
@@ -25,6 +25,7 @@ INPUT_AUDIO_LENGTH = 44100              # Maximum input audio length: the length
 MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else (INPUT_AUDIO_LENGTH // 100 + 1)  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
 WINDOW_TYPE = 'hann'                    # Type of window function used in the STFT
 NFFT = 2048                             # Number of FFT components for the STFT process
+WINDOW_LENGTH = 1920                     # Length of windowing, edit it carefully.
 HOP_LENGTH = 441                        # Number of samples between successive frames in the STFT
 SAMPLE_RATE = 44100                     # The MelBandRoformer parameter, do not edit the value.
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
@@ -64,8 +65,8 @@ class MelBandRoformer_Modified(torch.nn.Module):
 
 print('Export start ...')
 with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
+    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
+    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
     with open(project_path + "/configs/config_vocals_mel_band_roformer.yaml") as f:
       config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
     model = MelBandRoformer(**dict(config.model))

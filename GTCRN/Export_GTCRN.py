@@ -26,6 +26,7 @@ INPUT_AUDIO_LENGTH = 48000              # Maximum input audio length: the length
 WINDOW_TYPE = 'hann'                    # Type of window function used in the STFT
 N_MELS = 100                            # Number of Mel bands to generate in the Mel-spectrogram
 NFFT = 512                              # Number of FFT components for the STFT process
+WINDOW_LENGTH = 512                     # Length of windowing, edit it carefully.
 HOP_LENGTH = 256                        # Number of samples between successive frames in the STFT
 SAMPLE_RATE = 16000                     # The GTCRN parameter, do not edit the value.
 MAX_THREADS = 8                         # Number of parallel threads for test audio denoising.
@@ -49,15 +50,15 @@ class GTCRN_CUSTOM(torch.nn.Module):
         audio = audio * self.inv_int16
         real_part, imag_part = self.stft_model(audio, 'constant')
         magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part)
-        magnitude, s_real, s_imag = self.gtcrn.forward(magnitude, real_part, imag_part)
+        magnitude, s_real, s_imag = self.gtcrn(magnitude, real_part, imag_part)
         audio = self.istft_model(magnitude, s_real, s_imag)
         return (audio * 32768.0).clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 
 print('Export start ...')
 with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, n_mels=N_MELS, hop_len=HOP_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, n_mels=N_MELS, hop_len=HOP_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
+    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
+    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
     gtcrn = GTCRN().eval()
     ckpt = torch.load(model_path + "/checkpoints/model_trained_on_dns3.tar", map_location='cpu')
     gtcrn.load_state_dict(ckpt['model'])

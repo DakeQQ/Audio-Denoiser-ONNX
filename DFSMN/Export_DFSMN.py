@@ -27,7 +27,6 @@ N_MELS = 120                            # Number of Mel bands to generate in the
 NFFT_STFT = 1920                        # Number of FFT components for the STFT process, edit it carefully.
 WINDOW_LENGTH = 1920                    # Length of windowing, edit it carefully.
 HOP_LENGTH = 960                        # Number of samples between successive frames in the STFT
-PRE_EMPHASIZE = 0.97                    # For audio preprocessing.
 SAMPLE_RATE = 48000                     # The DFSMN parameter, do not edit the value.
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
 

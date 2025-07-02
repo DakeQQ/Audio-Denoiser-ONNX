@@ -15,7 +15,7 @@ from STFT_Process import STFT_Process                                           
 model_path = "/home/DakeQQ/Downloads/speech_dfsmn_ans_psm_48k_causal"                      # The DFSMN download path.
 onnx_model_A = "/home/DakeQQ/Downloads/DFSMN_ONNX/DFSMN.onnx"                              # The exported onnx model path.
 test_noisy_audio = model_path + "/examples/speech_with_noise_48k.wav"                      # The noisy audio path.
-save_denoised_audio = model_path + "/examples/speech_with_noise_48k_denoised.wav"          # The output denoised audio path.
+save_denoised_audio = "./speech_with_noise_48k_denoised.wav"          # The output denoised audio path.
 
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
@@ -25,7 +25,7 @@ INPUT_AUDIO_LENGTH = 96000              # The maximum input audio length.
 WINDOW_TYPE = 'hann'                  # Type of window function used in the STFT
 N_MELS = 120                            # Number of Mel bands to generate in the Mel-spectrogram
 NFFT_STFT = 1920                        # Number of FFT components for the STFT process, edit it carefully.
-WINDOW_LENGTH = 1800                     # Length of windowing, edit it carefully.
+WINDOW_LENGTH = 1920                    # Length of windowing, edit it carefully.
 HOP_LENGTH = 960                        # Number of samples between successive frames in the STFT
 PRE_EMPHASIZE = 0.97                    # For audio preprocessing.
 SAMPLE_RATE = 48000                     # The DFSMN parameter, do not edit the value.
@@ -44,19 +44,16 @@ def normalize_to_int16(audio):
 
 
 class DFSMN(torch.nn.Module):
-    def __init__(self, dfsmn, stft_model, istft_model, nfft_stft, stft_signal_len, n_mels, sample_rate, pre_emphasis):
+    def __init__(self, dfsmn, stft_model, istft_model, nfft_stft, n_mels, sample_rate):
         super(DFSMN, self).__init__()
         self.dfsmn = dfsmn
         self.stft_model = stft_model
         self.istft_model = istft_model
-        self.pre_emphasis = pre_emphasis
         self.fbank = (torchaudio.functional.melscale_fbanks(nfft_stft // 2 + 1, 20, sample_rate // 2, n_mels, sample_rate, None, 'htk')).transpose(0, 1).unsqueeze(0)
         self.nfft_stft = nfft_stft
 
     def forward(self, audio):
         audio = audio.float()       # Don't divide by 32768.0
-        audio = audio - torch.mean(audio)  # Remove DC Offset
-        audio = torch.cat((audio[:, :, :1], audio[:, :, 1:] - self.pre_emphasis * audio[:, :, :-1]), dim=-1)  # Pre Emphasize
         real_part, imag_part = self.stft_model(audio, 'constant')
         mel_features = torch.matmul(self.fbank, real_part * real_part + imag_part * imag_part).transpose(1, 2).clamp(min=1e-5).log()
         mask = self.dfsmn(mel_features).transpose(1, 2)
@@ -76,7 +73,7 @@ with torch.inference_mode():
         model=model_path,
         device='cpu'
     ).model
-    dfsmn = DFSMN(dfsmn, custom_stft, custom_istft, NFFT_STFT, STFT_SIGNAL_LENGTH, N_MELS, SAMPLE_RATE, PRE_EMPHASIZE)
+    dfsmn = DFSMN(dfsmn, custom_stft, custom_istft, NFFT_STFT, N_MELS, SAMPLE_RATE)
     audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16)
     torch.onnx.export(
         dfsmn,

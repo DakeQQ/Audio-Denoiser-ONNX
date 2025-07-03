@@ -58,8 +58,7 @@ class DFSMN(torch.nn.Module):
         mask = self.dfsmn(mel_features).transpose(1, 2)
         real_part *= mask
         imag_part *= mask
-        magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part)
-        audio = self.istft_model(magnitude, real_part, imag_part)
+        audio = self.istft_model(real_part, imag_part)
         return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 

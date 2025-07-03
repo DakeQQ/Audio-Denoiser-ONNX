@@ -57,8 +57,8 @@ class MelBandRoformer_Modified(torch.nn.Module):
         real_part, imag_part = self.mel_band_roformer(stft_repr, self.zeros)
         real_L, real_R = torch.split(real_part, [1, 1], dim=0)
         imag_L, imag_R = torch.split(imag_part, [1, 1], dim=0)
-        audio_L = custom_istft(torch.sqrt(real_L * real_L + imag_L * imag_L), real_L, imag_L)
-        audio_R = custom_istft(torch.sqrt(real_R * real_R + imag_R * imag_R), real_R, imag_R)
+        audio_L = custom_istft(real_L, imag_L)
+        audio_R = custom_istft(real_R, imag_R)
         audio = torch.cat((audio_L, audio_R), dim=1)
         return (audio * 32768.0).clamp(min=-32768.0, max=32767.0).to(torch.int16)
 

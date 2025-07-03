@@ -57,7 +57,7 @@ class ZipEnhancer(torch.nn.Module):
         self.inv_int16 = float(1.0 / 32768.0)
 
     def forward(self, audio):
-        audio = audio * self.inv_int16
+        audio = audio.float() * self.inv_int16
         norm_factor = torch.sqrt(torch.mean(audio * audio, dim=-1, keepdim=True) + 1e-6)
         real_part, imag_part = self.stft_model(audio / norm_factor, 'constant')
         magnitude = torch.pow(real_part * real_part + imag_part * imag_part, self.compress_factor_sqrt)

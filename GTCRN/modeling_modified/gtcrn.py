@@ -306,7 +306,7 @@ class GTCRN(nn.Module):
 
         s_real, s_imag = self.mask(m, real_part, imag_part) # (1,T,F)
 
-        return torch.sqrt(s_real * s_real + s_imag * s_imag), s_real, s_imag
+        return s_real, s_imag
 
 
 if __name__ == "__main__":

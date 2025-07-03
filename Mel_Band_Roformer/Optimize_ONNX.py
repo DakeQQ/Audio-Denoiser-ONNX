@@ -84,7 +84,7 @@ slim(
 
 # Upgrade the Opset version. (optional process)
 model = onnx.load(optimized_model_path)
-model = onnx.version_converter.convert_version(model, 21)
+model = onnx.version_converter.convert_version(model, 18)
 onnx.save(model, optimized_model_path, save_as_external_data=False)
 del model
 gc.collect()

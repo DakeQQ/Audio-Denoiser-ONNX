@@ -15,7 +15,7 @@ from modeling_modified.gtcrn import GTCRN
 model_path = "/home/DakeQQ/Downloads/gtcrn-main"                          # The GTCRN download path.
 onnx_model_A = "/home/DakeQQ/Downloads/GTCRN_ONNX/GTCRN.onnx"             # The exported onnx model path.
 test_noisy_audio =  model_path + "/test_wavs/mix.wav"                     # The noisy audio path.
-save_denoised_audio = model_path + "/test_wavs/denoised.wav"              # The output denoised audio path.
+save_denoised_audio = "./denoised.wav"                                    # The output denoised audio path.
 
 
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
@@ -47,11 +47,11 @@ class GTCRN_CUSTOM(torch.nn.Module):
         self.inv_int16 = float(1.0 / 32768.0)
 
     def forward(self, audio):
-        audio = audio * self.inv_int16
+        audio = audio.float() * self.inv_int16
         real_part, imag_part = self.stft_model(audio, 'constant')
         magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part)
-        magnitude, s_real, s_imag = self.gtcrn(magnitude, real_part, imag_part)
-        audio = self.istft_model(magnitude, s_real, s_imag)
+        s_real, s_imag = self.gtcrn(magnitude, real_part, imag_part)
+        audio = self.istft_model(s_real, s_imag)
         return (audio * 32768.0).clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 

@@ -14,8 +14,60 @@ save_denoised_audio = "/home/DakeQQ/Downloads/speech_zipenhancer_ans_multiloss_1
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 MAX_THREADS = 4                         # Number of parallel threads for audio denoising.
-SAMPLE_RATE = 16000                     # The ZipEnhancer parameter, do not edit the value.
+DEVICE_ID = 0                           # The GPU id, default to 0.
+SAMPLE_RATE = 16000                     # The MossFormer_SE parameter, do not edit the value.
 
+
+# ONNX Runtime settings
+if "OpenVINOExecutionProvider" in ORT_Accelerate_Providers:
+    provider_options = [
+        {
+            'device_type': 'CPU',                         # [CPU, NPU, GPU, GPU.0, GPU.1]]
+            'precision': 'ACCURACY',                      # [FP32, FP16, ACCURACY]
+            'num_of_threads': MAX_THREADS,
+            'num_streams': 1,
+            'enable_opencl_throttling': True,
+            'enable_qdq_optimizer': False,                # Enable it carefully
+            'disable_dynamic_shapes': True
+        }
+    ]
+    device_type = 'cpu'
+elif "CUDAExecutionProvider" in ORT_Accelerate_Providers:
+    provider_options = [
+        {
+            'device_id': DEVICE_ID,
+            'gpu_mem_limit': 24 * 1024 * 1024 * 1024,     # 24 GB
+            'arena_extend_strategy': 'kNextPowerOfTwo',   # ["kNextPowerOfTwo", "kSameAsRequested"]
+            'cudnn_conv_algo_search': 'DEFAULT',          # ["DEFAULT", "HEURISTIC", "EXHAUSTIVE"]   The MossFormer_SE must using DEFAULT.
+            'sdpa_kernel': '2',                           # ["0", "1", "2"]
+            'use_tf32': '1',
+            'fuse_conv_bias': '0',                        # Set to '0' to avoid potential errors when enabled.
+            'cudnn_conv_use_max_workspace': '1',
+            'cudnn_conv1d_pad_to_nc1d': '1',
+            'tunable_op_enable': '1',
+            'tunable_op_tuning_enable': '1',
+            'tunable_op_max_tuning_duration_ms': 10000,
+            'do_copy_in_default_stream': '0',
+            'enable_cuda_graph': '0',                     # Set to '0' to avoid potential errors when enabled.
+            'prefer_nhwc': '0',
+            'enable_skip_layer_norm_strict_mode': '0',
+            'use_ep_level_unified_stream': '0',
+        }
+    ]
+    device_type = 'cuda'
+elif "DmlExecutionProvider" in ORT_Accelerate_Providers:
+    provider_options = [
+        {
+            'device_id': DEVICE_ID,
+            'performance_preference': 'high_performance',  # [high_performance, default, minimum_power]
+            'device_filter': 'npu'                         # [any, npu, gpu]
+        }
+    ]
+    device_type = 'dml'
+else:
+    # Please config by yourself for others providers.
+    device_type = 'cpu'
+    provider_options = None
 
 def normalize_to_int16(audio):
     max_val = np.max(np.abs(audio))
@@ -25,10 +77,10 @@ def normalize_to_int16(audio):
 
 # ONNX Runtime settings
 session_opts = onnxruntime.SessionOptions()
-session_opts.log_severity_level = 3         # error level, it an adjustable value.
-session_opts.inter_op_num_threads = 0       # Run different nodes with num_threads. Set 0 for auto.
-session_opts.intra_op_num_threads = 0       # Under the node, execute the operators with num_threads. Set 0 for auto.
-session_opts.enable_cpu_mem_arena = True    # True for execute speed; False for less memory usage.
+session_opts.log_severity_level = 4                   # Fatal level, it an adjustable value.
+session_opts.inter_op_num_threads = MAX_THREADS       # Run different nodes with num_threads. Set 0 for auto.
+session_opts.intra_op_num_threads = MAX_THREADS       # Under the node, execute the operators with num_threads. Set 0 for auto.
+session_opts.enable_cpu_mem_arena = True              # True for execute speed; False for less memory usage.
 session_opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
 session_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
 session_opts.add_session_config_entry("session.set_denormal_as_zero", "1")
@@ -41,7 +93,8 @@ session_opts.add_session_config_entry("disable_synchronize_execution_providers",
 session_opts.add_session_config_entry("optimization.minimal_build_optimizations", "")
 session_opts.add_session_config_entry("session.use_device_allocator_for_initializers", "1")
 
-ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=ORT_Accelerate_Providers)
+
+ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=ORT_Accelerate_Providers, provider_options=provider_options)
 print(f"\nUsable Providers: {ort_session_A.get_providers()}")
 in_name_A = ort_session_A.get_inputs()
 out_name_A = ort_session_A.get_outputs()

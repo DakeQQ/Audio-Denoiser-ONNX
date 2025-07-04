@@ -12,9 +12,9 @@ from pydub import AudioSegment
 from STFT_Process import STFT_Process  # The custom STFT/ISTFT can be exported in ONNX format.
 
 
-onnx_model_A = "/home/DakeQQ/Downloads/MossFormer_ONNX/MossFormer_SE.onnx"    # The exported onnx model path.
-test_noisy_audio = "./examples/speech_with_noise1.wav"                        # The noisy audio path.
-save_denoised_audio = "./examples/speech_with_noise1_denoised.wav"            # The output denoised audio path.
+onnx_model_A = "/home/DakeQQ/Downloads/MossFormer_ONNX/MossFormerGAN_SE_16K.onnx"    # The exported onnx model path.
+test_noisy_audio = "./examples/speech_with_noise1.wav"                               # The noisy audio path.
+save_denoised_audio = "./examples/speech_with_noise1_denoised.wav"                   # The output denoised audio path.
 
 
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.

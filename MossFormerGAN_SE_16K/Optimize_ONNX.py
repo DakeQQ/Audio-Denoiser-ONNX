@@ -9,13 +9,13 @@ import onnxruntime
 from onnxslim import slim
 
 # Path Setting
-original_folder_path = "/home/DakeQQ/Downloads/MossFormer_ONNX"                         # The fp32 saved folder.
-optimized_folder_path = "/home/DakeQQ/Downloads/MossFormer_Optimized"                   # The optimized folder.
-model_path = os.path.join(original_folder_path, "MossFormer_SE.onnx")                   # The original fp32 model name.
-optimized_model_path = os.path.join(optimized_folder_path, "MossFormer_SE.onnx")        # The optimized model name.
-use_gpu_fp16 = False                                                                    # If true, the transformers.optimizer will remain the FP16 processes.
-provider = 'CPUExecutionProvider'                                                       # ['CPUExecutionProvider', 'CUDAExecutionProvider']
-target_platform = "amd64"                                                               # ['arm', 'amd64']; The 'amd64' means x86_64 desktop, not means the AMD chip.
+original_folder_path = "/home/DakeQQ/Downloads/MossFormer_ONNX"                                # The fp32 saved folder.
+optimized_folder_path = "/home/DakeQQ/Downloads/MossFormer_Optimized"                          # The optimized folder.
+model_path = os.path.join(original_folder_path, "MossFormerGAN_SE_16K.onnx")                   # The original fp32 model name.
+optimized_model_path = os.path.join(optimized_folder_path, "MossFormerGAN_SE_16K.onnx")        # The optimized model name.
+use_gpu_fp16 = False                                                                           # If true, the transformers.optimizer will remain the FP16 processes.
+provider = 'CPUExecutionProvider'                                                              # ['CPUExecutionProvider', 'CUDAExecutionProvider']
+target_platform = "amd64"                                                                      # ['arm', 'amd64']; The 'amd64' means x86_64 desktop, not means the AMD chip.
 
 
 shutil.copyfile("./modeling_modified/onnx_model_bert.py", site.getsitepackages()[-1] + "/onnxruntime/transformers/onnx_model_bert.py")

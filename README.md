@@ -9,6 +9,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [GTCRN](https://github.com/Xiaobin-Rong/gtcrn)
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
    - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
+   - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
 
 2. **Dynamic Quantization**:  
    - Dynamic quantization is **not recommended** for Denoiser as it significantly reduces performance due to increased computational overhead. Except, Mel-Band-Roformer. 
@@ -36,10 +37,11 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 | macOS 15     | MacBook Air  | CPU <br> M3       | GTCRN <br> f32       | 0.0013 ~<br> 0.0019                               |  
 | Ubuntu-24.04 | Laptop       | CPU <br> i5-7300HQ | DFSMN <br> f32      | 0.0068 ~<br> 0.012                                |
 | Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | MelBandRofomer <br> q8f32 | 1.40 <br> (Chunk Size: 1000ms)              |
+| Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | MossFormerGAN_SE_16K <br> f32 | 1.085                                    |
+| Ubuntu-24.04 | Desktop      | OpenVINO-CPU <br> i3-12300 | MossFormerGAN_SE_16K <br> f32 | 0.95                            |
 ---
 
 ### To-Do List  
-- [ ] [Denoiser-MossFormer2-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
 - [ ] [Denoiser-MossFormer2-48K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K)
 - [ ] [Upscale the Resolution of Audio-MossFormer2-48K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SR_48K)
 - [ ] [ExNet-BF-PF](https://github.com/AdiCohen501/ExNet-BF-PF)
@@ -55,6 +57,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [GTCRN](https://github.com/Xiaobin-Rong/gtcrn)
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
    - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
+   - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
 
 2. **动态量化**：  
    - 除了 Mel-Band-Roformer 之外，**不建议**对其餘 Denoiser 应用动态量化，因为这会由于计算负载增加而显著降低性能。

@@ -100,8 +100,8 @@ with torch.inference_mode():
     custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
     from clearvoice import ClearVoice
     myClearVoice = ClearVoice(task='speech_enhancement', model_names=['MossFormerGAN_SE_16K'])
-    mossformer = myClearVoice.models[0].model
-    mossformer = MOSSFORMER_SE(mossformer.eval().float(), custom_stft, custom_istft)
+    mossformer = myClearVoice.models[0].model.eval().float().to("cpu")
+    mossformer = MOSSFORMER_SE(mossformer, custom_stft, custom_istft)
     audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16)
     torch.onnx.export(
         mossformer,

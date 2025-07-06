@@ -45,7 +45,6 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 
 ### To-Do List  
 - [ ] [Denoiser-MossFormer2-48K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K)
-- [ ] 
 - [ ] [ExNet-BF-PF](https://github.com/AdiCohen501/ExNet-BF-PF)
 - [ ] [MP-SENet](https://github.com/yxlu-0102/MP-SENet)
 ---

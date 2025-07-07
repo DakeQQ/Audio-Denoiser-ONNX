@@ -61,12 +61,12 @@ class MOSSFORMER_SE(torch.nn.Module):
         real_part, imag_part = self.stft_model(audio / norm_factor, 'constant')
         power = real_part * real_part + imag_part * imag_part
         magnitude_compress = torch.pow(power, self.compress_factor_sqrt)
-        inv_magnitude = torch.pow(power, -0.5)
+        inv_magnitude = torch.pow(power, -0.5) * magnitude_compress
         cos_phase = real_part * inv_magnitude
         sin_phase = imag_part * inv_magnitude
 
         # Prepare input for model
-        x_in = torch.cat([magnitude_compress, magnitude_compress * cos_phase, magnitude_compress * sin_phase], dim=0).unsqueeze(0)
+        x_in = torch.cat([magnitude_compress, cos_phase, sin_phase], dim=0).unsqueeze(0)
 
         # MossFormer processing
         x = self.mossformer_se.dense_encoder(x_in.transpose(-1, -2))
@@ -78,9 +78,8 @@ class MOSSFORMER_SE(torch.nn.Module):
         complex_out = self.mossformer_se.complex_decoder(x).transpose(-1, -2)
 
         # Apply mask and combine with complex output
-        out_mag = mask * magnitude_compress
-        mag_real = out_mag * cos_phase
-        mag_imag = out_mag * sin_phase
+        mag_real = mask * cos_phase
+        mag_imag = mask * sin_phase
 
         final_real = mag_real + complex_out[:, 0]
         final_imag = mag_imag + complex_out[:, 1]
@@ -91,7 +90,7 @@ class MOSSFORMER_SE(torch.nn.Module):
         # ISTFT and final processing
         audio = self.istft_model(final_real * factor, final_imag * factor) * norm_factor
 
-        return (audio * 32768.0).clamp(min=-32768.0, max=32767.0).to(torch.int16)
+        return (audio.clamp(min=-1.0, max=1.0) * 32767.0).to(torch.int16)
 
 
 print('Export start ...')

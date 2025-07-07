@@ -1,12 +1,15 @@
 import gc
 import os
+import site
+import shutil
 import subprocess
 
 import onnx.version_converter
 import onnxruntime
 from onnxslim import slim
-from onnxruntime.transformers.optimizer import optimize_model
 
+shutil.copyfile("./modeling_modified/onnx_model_bert.py", site.getsitepackages()[-1] + "/onnxruntime/transformers/onnx_model_bert.py")
+from onnxruntime.transformers.optimizer import optimize_model
 
 # Path Setting
 original_folder_path = "/home/DakeQQ/Downloads/MossFormer_ONNX"                                # The fp32 saved folder.

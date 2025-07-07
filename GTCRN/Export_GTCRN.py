@@ -52,7 +52,7 @@ class GTCRN_CUSTOM(torch.nn.Module):
         magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part)
         s_real, s_imag = self.gtcrn(magnitude, real_part, imag_part)
         audio = self.istft_model(s_real, s_imag)
-        return (audio * 32768.0).clamp(min=-32768.0, max=32767.0).to(torch.int16)
+        return (audio.clamp(min=-1.0, max=1.0) * 32767.0).to(torch.int16)
 
 
 print('Export start ...')

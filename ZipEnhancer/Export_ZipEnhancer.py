@@ -64,8 +64,7 @@ class ZipEnhancer(torch.nn.Module):
         phase = torch.atan2(imag_part, real_part)
         magnitude, phase = self.zip_enhancer(magnitude, phase)
         audio = self.istft_model(torch.pow(magnitude, self.compress_factor_inv), phase) * norm_factor
-        return (audio * 32768.0).clamp(min=-32768.0, max=32767.0).to(torch.int16)
-
+        return (audio.clamp(min=-1.0, max=1.0) * 32767.0).to(torch.int16)
 
 print('Export start ...')
 with torch.inference_mode():

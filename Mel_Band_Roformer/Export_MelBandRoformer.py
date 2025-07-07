@@ -60,7 +60,7 @@ class MelBandRoformer_Modified(torch.nn.Module):
         audio_L = custom_istft(real_L, imag_L)
         audio_R = custom_istft(real_R, imag_R)
         audio = torch.cat((audio_L, audio_R), dim=1)
-        return (audio * 32768.0).clamp(min=-32768.0, max=32767.0).to(torch.int16)
+        return (audio.clamp(min=-1.0, max=1.0) * 32767.0).to(torch.int16)
 
 
 print('Export start ...')

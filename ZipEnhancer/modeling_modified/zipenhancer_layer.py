@@ -86,20 +86,20 @@ class DualPathZipformer2Encoder(nn.Module):
         attn_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        b, c, t, f = src.size()
-        pos_emb_f = self.encoder_pos(src.permute(3, 0, 2, 1).contiguous().view(f, b * t, c))
-        pos_emb_t = self.encoder_pos(src.permute(2, 0, 3, 1).contiguous().view(t, b * f, c))
+        _, c, _, f = src.size()
+        pos_emb_f = self.encoder_pos(src.permute(3, 0, 2, 1).contiguous().view(f, -1, c))
+        pos_emb_t = self.encoder_pos(src.permute(2, 0, 3, 1).contiguous().view(-1, f, c))
         src = src.permute(3, 2, 0, 1).contiguous()
         src = self.bypass_layers[0](src, self.f_layers[0](
-            src.view(f, b * t, c),
+            src.view(f, -1, c),
             pos_emb_f,
             src_key_padding_mask=src_key_padding_mask,
-        ).view(f, t, b, c)).permute(1, 0, 2, 3).contiguous()
+        ).view(f, -1, 1, c)).permute(1, 0, 2, 3).contiguous()
         return self.bypass_layers[1](src, self.t_layers[0](
-            src.view(t, b * f, c),
+            src.view(-1, f, c),
             pos_emb_t,
             src_key_padding_mask=src_key_padding_mask,
-        ).view(t, f, b, c)).permute(2, 3, 0, 1).contiguous()
+        ).view(-1, f, 1, c)).permute(2, 3, 0, 1).contiguous()
 
 
 class DualPathDownsampledZipformer2Encoder(nn.Module):
@@ -142,15 +142,14 @@ class DualPathDownsampledZipformer2Encoder(nn.Module):
         attn_mask: Optional[Tensor] = None,
         src_key_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        b, c, t, f = src.size()
+        _, c, t, f = src.size()
         src_orig = src.permute(2, 3, 0, 1)  # (t, f, b, c)
-        src = src.permute(2, 0, 3, 1).contiguous().view(t, b * f, c)
+        src = src.permute(2, 0, 3, 1).contiguous().view(t, f, c)
         src = self.downsample_t(src)
         downsample_t = src.size(0)
-        src = src.view(downsample_t, b, f, c).permute(2, 1, 0, 3).contiguous().view(f, b * downsample_t, c)
+        src = src.view(downsample_t, 1, f, c).permute(2, 1, 0, 3).contiguous().view(f, downsample_t, c)
         src = self.downsample_f(src)
-        downsample_f = src.size(0)
-        src = src.view(downsample_f, b, downsample_t, c).permute(1, 3, 2, 0)
+        src = src.view(-1, 1, downsample_t, c).permute(1, 3, 2, 0)
         src = self.encoder(
             src,
             chunk_size=chunk_size,
@@ -158,11 +157,11 @@ class DualPathDownsampledZipformer2Encoder(nn.Module):
             attn_mask=attn_mask,
             src_key_padding_mask=src_key_padding_mask,
         )
-        src = src.permute(3, 0, 2, 1).contiguous().view(downsample_f, b * downsample_t, c)
+        src = src.permute(3, 0, 2, 1).contiguous().view(-1, downsample_t, c)
         src = self.upsample_f(src)
-        src = src[:f].view(f, b, downsample_t, c).permute(2, 1, 0, 3).contiguous().view(downsample_t, b * f, c)
+        src = src[:f].view(f, 1, downsample_t, c).permute(2, 1, 0, 3).contiguous().view(downsample_t, f, c)
         src = self.upsample_t(src)
-        src = src[:t].view(t, b, f, c).permute(0, 2, 1, 3).contiguous()
+        src = src[:t].view(t, 1, f, c).permute(0, 2, 1, 3).contiguous()
         out = self.out_combiner(src_orig, src)
         out = out.permute(2, 3, 0, 1).contiguous()
         return out

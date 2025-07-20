@@ -887,7 +887,7 @@ class SwooshROnnx(torch.nn.Module):
 # ActivationDropoutAndLinearFunction.
 def SwooshLForward(x: Tensor):
     x_offset = x - 4.0
-    log_sum = (1.0 + x_offset.exp()).log().to(x.dtype)
+    log_sum = (1.0 + x_offset.exp()).log()
     # log_sum = torch.where(log_sum == float('inf'), x_offset, log_sum)
     return log_sum - 0.08 * x - 0.035
 
@@ -911,7 +911,7 @@ def SwooshLForwardAndDeriv(x: Tensor):
 # ActivationDropoutAndLinearFunction.
 def SwooshRForward(x: Tensor):
     x_offset = x - 1.0
-    log_sum = (1.0 + x_offset.exp()).log().to(x.dtype)
+    log_sum = (1.0 + x_offset.exp()).log()
     # log_sum = torch.where(log_sum == float('inf'), x_offset, log_sum)
     return log_sum - 0.08 * x - 0.313261687
 

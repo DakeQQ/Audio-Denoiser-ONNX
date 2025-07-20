@@ -178,7 +178,7 @@ class Zipformer2EncoderLayer(nn.Module):
             key_padding_mask=src_key_padding_mask,
         )
         src = src + self.feed_forward1(src)
-        src = src + self.nonlin_attention(src, attn_weights[0:1])
+        src = src + self.nonlin_attention(src, attn_weights[:1])
         src = src + self.self_attn1(src, attn_weights)
         src = src + self.conv_module1(src, chunk_size=chunk_size, src_key_padding_mask=src_key_padding_mask)
         src = src + self.feed_forward2(src)
@@ -260,11 +260,12 @@ class SimpleDownsample(torch.nn.Module):
         self.dropout = copy.deepcopy(dropout)
 
         self.downsample = downsample
+        self.downsample_minus = self.downsample - 1
 
     def forward(self, src: Tensor) -> Tensor:
         (seq_len, batch_size, in_channels) = src.shape
-        d_seq_len = (seq_len + self.downsample - 1) // self.downsample
-        src_extra = src[src.shape[0] - 1:].expand(d_seq_len * self.downsample - seq_len, src.shape[1], src.shape[2])
+        d_seq_len = (seq_len + self.downsample_minus) // self.downsample
+        src_extra = src[seq_len - 1:].expand(d_seq_len * self.downsample - seq_len, batch_size, in_channels)
         src = torch.cat((src, src_extra), dim=0).reshape(d_seq_len, self.downsample, batch_size, in_channels)
         return (src * self.bias.softmax(dim=0).unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
 
@@ -281,7 +282,7 @@ class SimpleUpsample(torch.nn.Module):
 
     def forward(self, src: Tensor) -> Tensor:
         (seq_len, batch_size, num_channels) = src.shape
-        return src.unsqueeze(1).expand(seq_len, self.upsample, batch_size, num_channels).reshape(seq_len * self.upsample, batch_size, num_channels)
+        return src.unsqueeze(1).expand(seq_len, self.upsample, batch_size, num_channels).reshape(-1, batch_size, num_channels)
 
 
 class CompactRelPositionalEncoding(torch.nn.Module):
@@ -376,11 +377,11 @@ class CompactRelPositionalEncoding(torch.nn.Module):
         pe[:, -1] = 1.0  # for bias.
 
         self.pe = pe.unsqueeze(0).to(dtype=x.dtype)
+        self.factor = self.pe.size(1) // 2
 
     def forward(self, x: Tensor, left_context_len: int = 0) -> Tensor:
-        factor = self.pe.size(1) // 2
         x_size = x.size(0)
-        return self.pe[:, factor - x_size + 1:factor + x_size, :, ]
+        return self.pe[:, self.factor - x_size + 1:self.factor + x_size, :, ]
 
 
 class RelPositionMultiheadAttentionWeights(nn.Module):
@@ -444,7 +445,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         self.linear_pos = ScaledLinear(
             pos_dim, num_heads * pos_head_dim, bias=False, initial_scale=0.05)
 
-        self.rows = torch.arange(start=1025 - 1, end=-1, step=-1, dtype=torch.int16)
+        self.rows = torch.arange(start=1024, end=-1, step=-1, dtype=torch.int16)
         self.cols = torch.arange(1024, dtype=torch.int16)
 
     def forward(
@@ -500,15 +501,16 @@ class SelfAttention(nn.Module):
             bias=True,
             initial_scale=0.05)
 
+        self.num_heads = 4
+
     def forward(
         self,
         x: Tensor,
         attn_weights: Tensor,
     ) -> Tensor:
-        (seq_len, batch_size, embed_dim) = x.shape
-        num_heads = attn_weights.shape[0]
-        x = self.in_proj(x).reshape(seq_len, batch_size, num_heads, -1).permute(2, 1, 0, 3)
-        return self.out_proj(torch.matmul(attn_weights, x).permute(2, 1, 0, 3).contiguous().view(seq_len, batch_size, -1))
+        (seq_len, batch_size, _) = x.shape
+        x = self.in_proj(x).reshape(seq_len, batch_size, self.num_heads, -1).permute(2, 1, 0, 3)
+        return self.out_proj(torch.matmul(attn_weights, x).permute(2, 1, 0, 3).contiguous().view(seq_len, batch_size, self.out_proj.in_features))
 
 
 class FeedforwardModule(nn.Module):

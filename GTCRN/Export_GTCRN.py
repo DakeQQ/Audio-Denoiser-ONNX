@@ -48,6 +48,7 @@ class GTCRN_CUSTOM(torch.nn.Module):
 
     def forward(self, audio):
         audio = audio.float() * self.inv_int16
+        audio = audio - torch.mean(audio)  # Remove DC Offset
         real_part, imag_part = self.stft_model(audio, 'constant')
         magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part)
         s_real, s_imag = self.gtcrn(magnitude, real_part, imag_part)

@@ -206,9 +206,8 @@ class NET(torch.nn.Module):
         return y_out
 
     def forward(self, x):
-        X0 = x
-        e0 = self.in_ch_lstm(X0)
-        e0 = self.in_conv(torch.cat([e0, X0], 1))
+        e0 = self.in_ch_lstm(x)
+        e0 = self.in_conv(torch.cat([e0, x], 1))
         e1 = self.cfb_e1(e0)
         e2 = self.cfb_e2(e1)
         e3 = self.cfb_e3(e2)

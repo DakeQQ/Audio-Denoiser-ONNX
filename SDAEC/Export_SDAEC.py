@@ -139,7 +139,7 @@ class LayerNorm(torch.nn.Module):
     def forward(self, x):
         mean = x.mean([1, 2], keepdim=True)
         std = x.std([1, 2], keepdim=True)
-        x = (x - mean) / (std + 1e-8) * self.w + self.b
+        x = (x - mean) / (std + 1e-6) * self.w + self.b
         return x
 
 
@@ -178,7 +178,7 @@ class NET(torch.nn.Module):
             win_len = min(self.n_fft, max_output_len - s)
             if win_len <= 0: break
             window_sum[s:s + win_len] += win_sq[:win_len]
-        window_sum_inv = self.n_fft / (window_sum * self.hop_length + 1e-7)
+        window_sum_inv = self.n_fft / (window_sum * self.hop_length + 1e-6)
         self.register_buffer('window_sum_inv', window_sum_inv)
 
         # --- Model Layers ---

@@ -32,7 +32,7 @@ slim(
 # transformers.optimizer
 model = optimize_model(optimized_model_path,
                        use_gpu=False,
-                       opt_level=1 if use_gpu_fp16 else 2,
+                       opt_level=1,  # 1 perform much better in CUDA and OpenVINO
                        num_heads=0,
                        hidden_size=0,
                        provider=provider,

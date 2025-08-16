@@ -18,8 +18,6 @@ test_far_end_audio = "./examples/farend_speech1.wav"             # The far end a
 save_aec_output = "./aec.wav"                                    # The output Acoustic Echo Cancellation audio path.
 
 
-ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
-                                        # else keep empty.
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
 MAX_SIGNAL_LENGTH = 2048 if DYNAMIC_AXES else 192  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
 INPUT_AUDIO_LENGTH = 23841              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
@@ -269,7 +267,11 @@ class SDAEC(torch.nn.Module):
         self.inv_int16 = float(1.0 / 32768.0)
         self.k = k
         self.register_buffer('pad_zero', torch.zeros((1, 2, nfft // 2 + 1, k - 1), dtype=torch.float32))
-        self.frame_starts = torch.arange(max_len, dtype=torch.int16).unsqueeze(1) + torch.arange(k, dtype=torch.int16).unsqueeze(0)
+        if max_len < 256:
+            dtype = torch.uint8
+        else:
+            dtype = torch.int16
+        self.frame_starts = torch.arange(max_len, dtype=dtype).unsqueeze(1) + torch.arange(k, dtype=dtype).unsqueeze(0)
         self.k_minus = k - 1
 
     def onnx_friendly_unfold(self, input_tensor):
@@ -355,7 +357,7 @@ session_opts.add_session_config_entry("optimization.minimal_build_optimizations"
 session_opts.add_session_config_entry("session.use_device_allocator_for_initializers", "1")
 
 
-ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=ORT_Accelerate_Providers, provider_options=None)
+ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=["CPUExecutionProvider"], provider_options=None)
 print(f"\nUsable Providers: {ort_session_A.get_providers()}")
 in_name_A = ort_session_A.get_inputs()
 out_name_A = ort_session_A.get_outputs()

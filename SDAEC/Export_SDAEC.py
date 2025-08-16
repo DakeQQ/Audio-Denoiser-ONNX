@@ -11,7 +11,7 @@ from pydub import AudioSegment
 from STFT_Process import STFT_Process
 
 
-project_path = "/home/DakeQQ/Downloads/SDAEC-main"               # The SDAEC download path.
+project_path = "/home/DakeQQ/Downloads/SDAEC-main"               # The SDAEC github project download path.
 onnx_model_A = "/home/DakeQQ/Downloads/SDAEC_ONNX/SDAEC.onnx"    # The exported onnx model path.
 test_near_end_audio = "./examples/nearend_mic1.wav"              # The near end audio path.
 test_far_end_audio = "./examples/farend_speech1.wav"             # The far end audio path.

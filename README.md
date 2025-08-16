@@ -11,7 +11,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
    - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
    - [MossFormer2-Super-Resolution](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SR_48K)
-   - [SDAEC](https://github.com/ZhaoF-i/SDAEC)
+   - [SDAEC - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/SDAEC)
 
 2. **Dynamic Quantization**:  
    - Dynamic quantization is **not recommended** for Denoiser as it significantly reduces performance due to increased computational overhead. Except, Mel-Band-Roformer. 
@@ -63,7 +63,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
    - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
    - [MossFormer2-Super-Resolution](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SR_48K)
-   - [SDAEC](https://github.com/ZhaoF-i/SDAEC)
+   - [SDAEC - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/SDAEC)
 
 2. **动态量化**：  
    - 除了 Mel-Band-Roformer 之外，**不建议**对其餘 Denoiser 应用动态量化，因为这会由于计算负载增加而显著降低性能。

@@ -283,6 +283,8 @@ class SDAEC(torch.nn.Module):
     def forward(self, near_end_audio, far_end_audio):
         near_end_audio = near_end_audio.float() * self.inv_int16
         far_end_audio = far_end_audio.float() * self.inv_int16
+        near_end_audio = near_end_audio - torch.mean(near_end_audio)
+        far_end_audio = far_end_audio - torch.mean(far_end_audio)
         near_real_part, near_imag_part = self.custom_stft(near_end_audio, 'constant')
         far_real_part, far_imag_part = self.custom_stft(far_end_audio, 'constant')
         mix_comp = torch.cat([near_real_part, near_imag_part], dim=0).unsqueeze(0)

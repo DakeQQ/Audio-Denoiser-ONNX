@@ -13,7 +13,7 @@ from STFT_Process import STFT_Process                                    # The c
 
 
 project_path_A = "/home/DakeQQ/Downloads/speech_dfsmn_aec_psm_16k"         # The DFSMN AEC download path.
-project_path_B = "/home/DakeQQ/Downloads/SDAEC-main"                       # The SDAEC github project download path. The modified DFSMN AEC need it.
+project_path_B = "/home/DakeQQ/Downloads/SDAEC-main"                       # The SDAEC github project download path. The modified DFSMN AEC need it. https://github.com/ZhaoF-i/SDAEC
 onnx_model_A = "/home/DakeQQ/Downloads/DFSMN_AEC_ONNX/DFSMN_AEC.onnx"      # The exported onnx model path.
 test_near_end_audio = "./examples/nearend_mic1.wav"                        # The near end audio path.
 test_far_end_audio = "./examples/farend_speech1.wav"                       # The far end audio path.

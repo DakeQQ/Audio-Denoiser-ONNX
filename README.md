@@ -12,6 +12,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
    - [MossFormer2-Super-Resolution](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SR_48K)
    - [SDAEC - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/SDAEC)
+   - [DFSMN - Acoustic Echo Cancellation](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k)
 
 2. **Dynamic Quantization**:  
    - Dynamic quantization is **not recommended** for Denoiser as it significantly reduces performance due to increased computational overhead. Except, Mel-Band-Roformer. 
@@ -41,8 +42,10 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | MossFormerGAN_SE_16K <br> f32 | 1.085                                    |
 | Ubuntu-24.04 | Desktop      | OpenVINO-CPU <br> i3-12300 | MossFormerGAN_SE_16K <br> f32 | 0.95                            |
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | MossFormer2-SR <br> f32 | 1.49                                           |
-| Ubuntu-24.04 | Desktop      | CPU <br> i7-1165G7 | SDAEC <br> f32 | 0.115                                                  |
+| Ubuntu-24.04 | Desktop      | CPU <br> i7-1165G7 | SDAEC <br> f32 | 0.105                                                  |
 | Ubuntu-24.04 | Desktop      |  OpenVINO-CPU <br> i7-1165G7 | SDAEC <br> f32 | 0.095                                        |
+| Ubuntu-24.04 | Desktop      | CPU <br> i7-1165G7 | DFSMN_AEC <br> f32 | 0.11                                               |
+
 ---
 
 ### To-Do List  
@@ -63,6 +66,8 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
    - [MossFormer2-Super-Resolution](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SR_48K)
    - [SDAEC - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/SDAEC)
+   - [DFSMN - Acoustic Echo Cancellation](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k)
+
 
 2. **动态量化**：  
    - 除了 Mel-Band-Roformer 之外，**不建议**对其餘 Denoiser 应用动态量化，因为这会由于计算负载增加而显著降低性能。

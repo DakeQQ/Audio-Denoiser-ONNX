@@ -34,13 +34,13 @@ WIN_LENGTH = min(WIN_LENGTH, NFFT)
 HOP_LENGTH = min(HOP_LENGTH, INPUT_AUDIO_LENGTH)
 
 WINDOW_FUNCTIONS = {
-    'bartlett': lambda L: torch.hamming_window(L, periodic=False),
-    'blackman': lambda L: torch.blackman_window(L, periodic=False),
-    'hamming' : lambda L: torch.hamming_window(L, periodic=False),
-    'hann'    : lambda L: torch.hann_window(L, periodic=False),
-    'kaiser'  : lambda L: torch.kaiser_window(L, periodic=False, beta=12.0)
+    'bartlett': lambda L: torch.hamming_window(L, periodic=True),
+    'blackman': lambda L: torch.blackman_window(L, periodic=True),
+    'hamming' : lambda L: torch.hamming_window(L, periodic=True),
+    'hann'    : lambda L: torch.hann_window(L, periodic=True),
+    'kaiser'  : lambda L: torch.kaiser_window(L, periodic=True, beta=12.0)
 }
-DEFAULT_WINDOW_FN = torch.hann_window
+DEFAULT_WINDOW_FN = lambda L: torch.hann_window(L, periodic=True)
 
 
 def create_padded_window(win_length, n_fft, window_type):

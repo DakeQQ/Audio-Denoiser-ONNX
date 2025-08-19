@@ -15,8 +15,9 @@ INPUT_AUDIO_LENGTH  = 16000          # dummy length for export / test
 MAX_SIGNAL_LENGTH   = 2048           # Maximum number of frames for the audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
 WINDOW_TYPE         = 'hann'         # bartlett | blackman | hamming | hann | kaiser
 PAD_MODE            = 'constant'     # reflect | constant
+CENTER_PAD          = True           # Use center=True or not for STFT process.
 
-STFT_TYPE  = "stft_B"                # # stft_A: output real_part only;  stft_B: outputs real_part & imag_part
+STFT_TYPE  = "stft_B"                # stft_A: output real_part only;  stft_B: outputs real_part & imag_part
 ISTFT_TYPE = "istft_B"               # istft_A: Inputs = [magnitude, phase];  istft_B: Inputs = [real_part, imag_part], The dtype of imag_part is float format.
 
 export_path_stft  = f"{STFT_TYPE}.onnx"
@@ -34,25 +35,30 @@ WIN_LENGTH = min(WIN_LENGTH, NFFT)
 HOP_LENGTH = min(HOP_LENGTH, INPUT_AUDIO_LENGTH)
 
 WINDOW_FUNCTIONS = {
-    'bartlett': torch.bartlett_window,
-    'blackman': torch.blackman_window,
-    'hamming' : torch.hamming_window,
-    'hann'    : torch.hann_window,
+    'bartlett': lambda L: torch.hamming_window(L, periodic=True),
+    'blackman': lambda L: torch.blackman_window(L, periodic=True),
+    'hamming' : lambda L: torch.hamming_window(L, periodic=True),
+    'hann'    : lambda L: torch.hann_window(L, periodic=True),
+    'hann_sqrt': lambda L: torch.hann_window(L, periodic=True).pow(0.5),
     'kaiser'  : lambda L: torch.kaiser_window(L, periodic=True, beta=12.0)
 }
-DEFAULT_WINDOW_FN = torch.hann_window
+DEFAULT_WINDOW_FN = lambda L: torch.hann_window(L, periodic=True)
 
 
-def create_padded_window(win_length, n_fft, window_type):
+def create_padded_window(win_length, n_fft, window_type, center_pad=True):
     """Return length-n_fft window (centre-padded / cropped if needed)."""
     win_fn = WINDOW_FUNCTIONS.get(window_type, DEFAULT_WINDOW_FN)
     win    = win_fn(win_length).float()
     if win_length == n_fft:
         return win
-    if win_length < n_fft:                                   # pad
-        pl = (n_fft - win_length) // 2
-        pr = n_fft - win_length - pl
-        return torch.nn.functional.pad(win, (pl, pr))
+    if win_length < n_fft:
+        pad_len = n_fft - win_length
+        if center_pad:
+            pl = pad_len // 2
+            pr = pad_len - pl
+            return torch.nn.functional.pad(win, (pl, pr))
+        else:
+            return torch.nn.functional.pad(win, (0, pad_len))
     # truncate (shouldn’t occur given sanity checks)
     start = (win_length - n_fft) // 2
     return win[start:start + n_fft]
@@ -71,17 +77,22 @@ class STFT_Process(torch.nn.Module):
                  win_length=WIN_LENGTH,
                  hop_len=HOP_LENGTH,
                  max_frames=MAX_SIGNAL_LENGTH,
-                 window_type=WINDOW_TYPE):
+                 window_type=WINDOW_TYPE,
+                 center_pad=True):
         super().__init__()
         self.model_type  = model_type
         self.n_fft       = n_fft
         self.hop_len     = hop_len
         self.half_n_fft  = n_fft // 2
+        self.center_pad = center_pad
 
         window = create_padded_window(win_length, n_fft, window_type)
 
         # constant-pad buffer (for 'constant' pad mode)
-        self.register_buffer('padding_zero', torch.zeros(1, 1, self.half_n_fft, dtype=torch.float32))
+        if self.center_pad:
+            self.register_buffer('padding_zero', torch.zeros(1, 1, self.half_n_fft, dtype=torch.float32))
+        else:
+            self.register_buffer('padding_zero', torch.zeros(1, 1, self.n_fft, dtype=torch.float32))
 
         # ─── kernels for STFT_A / STFT_B ───────────────────────────────────
         if model_type in ('stft_A', 'stft_B'):
@@ -142,9 +153,14 @@ class STFT_Process(torch.nn.Module):
 
     # ───── STFT (A & B) ────────────────────────────────────────────────────
     def _pad_input(self, x, mode):
-        if mode == 'reflect':
-            return torch.nn.functional.pad(x, (self.half_n_fft, self.half_n_fft), mode='reflect')
-        return torch.cat((self.padding_zero, x, self.padding_zero), dim=-1)
+        if self.center_pad:
+            if mode == 'reflect':
+                return torch.nn.functional.pad(x, (self.half_n_fft, self.half_n_fft), mode='reflect')
+            return torch.cat([self.padding_zero, x, self.padding_zero], dim=-1)
+        else:
+            if mode == 'reflect':
+                return torch.nn.functional.pad(x, (0, self.n_fft), mode='reflect')
+            return torch.cat([x, self.padding_zero], dim=-1)
 
     def stft_A_forward(self, x, pad_mode='reflect' if PAD_MODE == 'reflect' else 'constant'):
         x_padded = self._pad_input(x, pad_mode)
@@ -176,36 +192,36 @@ class STFT_Process(torch.nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  Test helpers  (A & B variants)
 # ─────────────────────────────────────────────────────────────────────────────
-def test_onnx_stft_A(x):
+def test_onnx_stft_A(x, center_pad=True):
     torch_out = torch.view_as_real(torch.stft(
         x.squeeze(0),
         n_fft=NFFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
         return_complex=True,
         window=WINDOW_FUNCTIONS.get(WINDOW_TYPE, DEFAULT_WINDOW_FN)(WIN_LENGTH),
-        pad_mode=PAD_MODE, center=True
+        pad_mode=PAD_MODE, center=center_pad
     ))
     pt_real = torch_out[..., 0].squeeze().numpy()
 
     sess = ort.InferenceSession(export_path_stft)
     ort_real = sess.run(None, {sess.get_inputs()[0].name: x.numpy()})[0].squeeze()
-    print("\nSTFT Result (A): mean |Δ| =", np.abs(pt_real - ort_real).mean())
+    print("\nSTFT Result (A): mean |Δ| =", np.abs(pt_real - ort_real[:, :pt_real.shape[-1]]).mean())
 
 
-def test_onnx_stft_B(x):
+def test_onnx_stft_B(x, center_pad=True):
     torch_out = torch.view_as_real(torch.stft(
         x.squeeze(0),
         n_fft=NFFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
         return_complex=True,
         window=WINDOW_FUNCTIONS.get(WINDOW_TYPE, DEFAULT_WINDOW_FN)(WIN_LENGTH),
-        pad_mode=PAD_MODE, center=True
+        pad_mode=PAD_MODE, center=center_pad
     ))
     pt_r = torch_out[..., 0].squeeze().numpy()
     pt_i = torch_out[..., 1].squeeze().numpy()
 
     sess = ort.InferenceSession(export_path_stft)
     ort_r, ort_i = sess.run(None, {sess.get_inputs()[0].name: x.numpy()})
-    diff = 0.5 * (np.abs(pt_r - ort_r.squeeze()).mean() +
-                  np.abs(pt_i - ort_i.squeeze()).mean())
+    diff = 0.5 * (np.abs(pt_r - ort_r.squeeze()[:, :pt_r.shape[-1]]).mean() +
+                  np.abs(pt_i - ort_i.squeeze()[:, :pt_r.shape[-1]]).mean())
     print("\nSTFT Result (B): mean |Δ| =", diff)
 
 
@@ -247,7 +263,7 @@ def main():
     with torch.inference_mode():
         print(f"\nConfig  NFFT={NFFT}, WIN_LEN={WIN_LENGTH}, HOP={HOP_LENGTH}")
         # ─── STFT export ───────────────────────────────────────────────────
-        stft_model   = STFT_Process(STFT_TYPE).eval()
+        stft_model   = STFT_Process(STFT_TYPE, center_pad=CENTER_PAD).eval()
         dummy_audio  = torch.randn(1, 1, INPUT_AUDIO_LENGTH)
 
         dyn_axes_sft = {'input_audio': {2: 'audio_len'}}
@@ -265,7 +281,7 @@ def main():
             opset_version=17, do_constant_folding=True
         )
         # ─── ISTFT export ──────────────────────────────────────────────────
-        istft_model = STFT_Process(ISTFT_TYPE).eval()
+        istft_model = STFT_Process(ISTFT_TYPE, center_pad=CENTER_PAD).eval()
 
         if ISTFT_TYPE == 'istft_A':
             dummy_mag   = torch.randn(1, HALF_NFFT + 1, STFT_SIGNAL_LENGTH)
@@ -298,9 +314,9 @@ def main():
         # ─── quick comparisons ────────────────────────────────────────────
         print("\nTesting Custom STFT against torch.stft …")
         if STFT_TYPE == 'stft_A':
-            test_onnx_stft_A(dummy_audio)
+            test_onnx_stft_A(dummy_audio, center_pad=CENTER_PAD)
         else:
-            test_onnx_stft_B(dummy_audio)
+            test_onnx_stft_B(dummy_audio, center_pad=CENTER_PAD)
 
         print("\nTesting Custom ISTFT against torch.istft …")
         if ISTFT_TYPE == 'istft_A':
@@ -311,4 +327,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

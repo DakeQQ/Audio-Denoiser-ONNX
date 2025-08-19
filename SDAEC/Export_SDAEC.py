@@ -20,7 +20,7 @@ save_aec_output = "./aec.wav"                                    # The output Ac
 
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
 MAX_SIGNAL_LENGTH = 2048 if DYNAMIC_AXES else 192  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
-INPUT_AUDIO_LENGTH = 23841              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
+INPUT_AUDIO_LENGTH = 16001              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
 WINDOW_TYPE = 'hamming'                 # Type of window function used in the STFT
 NFFT = 319                              # Number of FFT components for the STFT process
 WINDOW_LENGTH = 319                     # Length of windowing, edit it carefully.

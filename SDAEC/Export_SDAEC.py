@@ -307,10 +307,10 @@ print('Export start ...')
 with torch.inference_mode():
     custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
     iccrn = NET(max_frames=MAX_SIGNAL_LENGTH)
-    iccrn.load_state_dict(torch.load(project_path + '/Model/ICCRN.ckpt'), strict=False)
+    iccrn.load_state_dict(torch.load(project_path + '/Model/ICCRN.ckpt', map_location='cpu'), strict=False)
     iccrn = iccrn.float().eval()
     alpha_predictor = AlphaPredictor(ALPHA_K)
-    alpha_predictor.load_state_dict(torch.load(project_path + '/Model/alpha.ckpt'), strict=False)
+    alpha_predictor.load_state_dict(torch.load(project_path + '/Model/alpha.ckpt', map_location='cpu'), strict=False)
     alpha_predictor = alpha_predictor.float().eval()
 
     sdaec = SDAEC(iccrn, alpha_predictor, custom_stft, NFFT, ALPHA_K, MAX_SIGNAL_LENGTH)

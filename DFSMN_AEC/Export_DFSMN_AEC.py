@@ -279,7 +279,7 @@ class CH_LSTM_F(torch.nn.Module):
 class DFSMN_AEC(torch.nn.Module):
     def __init__(self, dfsmn_aec, iccrn, alpha_predictor, custom_stft_A, custom_stft_A2, custom_istft_A2, custom_stft_B, nfft_A, nfft_B, k, max_len, pre_emphasis, sample_rate, n_mels):
         super(DFSMN_AEC, self).__init__()
-        self.dfsmn_aec = dfsmn_aec.model
+        self.dfsmn_aec = dfsmn_aec.model.to('cpu').float()
         self.shift = (dfsmn_aec.preprocessor.feature.shift + torch.log(torch.tensor(32768 ** 2, dtype=torch.float32))).view(1, 1, -1)
         self.scale = dfsmn_aec.preprocessor.feature.scale.view(1, 1, -1)
         self.iccrn = iccrn
@@ -359,10 +359,10 @@ with torch.inference_mode():
     custom_istft_A2 = STFT_Process(model_type='istft_B', n_fft=NFFT_A2, hop_len=HOP_LENGTH_A, win_length=WINDOW_LENGTH_A, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
     custom_stft_B = STFT_Process(model_type='stft_B', n_fft=NFFT_B, hop_len=HOP_LENGTH_B, win_length=WINDOW_LENGTH_B, max_frames=0, window_type=WINDOW_TYPE).eval()
     iccrn = NET(max_frames=MAX_SIGNAL_LENGTH)
-    iccrn.load_state_dict(torch.load(project_path_B + '/Model/ICCRN.ckpt'), strict=False)
+    iccrn.load_state_dict(torch.load(project_path_B + '/Model/ICCRN.ckpt', map_location='cpu'), strict=False)
     iccrn = iccrn.float().eval()
     alpha_predictor = AlphaPredictor(ALPHA_K)
-    alpha_predictor.load_state_dict(torch.load(project_path_B + '/Model/alpha.ckpt'), strict=False)
+    alpha_predictor.load_state_dict(torch.load(project_path_B + '/Model/alpha.ckpt', map_location='cpu'), strict=False)
     alpha_predictor = alpha_predictor.float().eval()
 
     dfsmn_aec = pipeline(

@@ -1,5 +1,7 @@
 import gc
 import time
+import site
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -11,6 +13,7 @@ from pydub import AudioSegment
 from STFT_Process import STFT_Process  # The custom STFT/ISTFT can be exported in ONNX format.
 
 
+model_path = "/home/DakeQQ/Downloads/MossFormer2_SR_48K"
 onnx_model_A = "/home/DakeQQ/Downloads/MossFormer_ONNX/MossFormer2_SR.onnx"     # The exported onnx model path.
 test_audio = "./examples/speech_with_noise1.wav"                                # The original audio path.
 save_generated_audio = "./examples/speech_with_noise1_super_resolution.wav"     # The output super resolution audio path.
@@ -19,7 +22,7 @@ save_generated_audio = "./examples/speech_with_noise1_super_resolution.wav"     
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
 INPUT_AUDIO_LENGTH = 32000              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 8000. Higher values yield better quality but time consume. It is better to set an integer multiple of the NFFT value.
 MAX_SIGNAL_LENGTH = 1024                # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
-WINDOW_TYPE = 'hann'                    # Type of window function used in the STFT
+WINDOW_TYPE = 'hamming'                 # Type of window function used in the STFT
 N_MELS = 80                             # Number of Mel bands to generate in the Mel-spectrogram
 NFFT = 1024                             # Number of FFT components for the STFT process
 WINDOW_LENGTH = 1024                    # Length of windowing, edit it carefully.
@@ -29,8 +32,13 @@ WINDOW_LENGTH_POST = 256                # The MossFormer_SR parameter, do not ed
 HOP_LENGTH_POST = 128                   # The MossFormer_SR parameter, do not edit the value.
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
 SPUER_SAMPLE_RATE = 48000               # The target audio sample rate, do not edit the value.
-
 ORIGINAL_SAMPLE_RATE = 16000            # The input audio sample rate. This value cannot be changed after the ONNX model is exported.
+
+
+site_package_path = site.getsitepackages()[-1]
+shutil.copyfile("./modeling_modified/__init__.py", site_package_path + "/clearvoice/__init__.py")
+shutil.copyfile("./modeling_modified/network_wrapper.py", site_package_path + "/clearvoice/network_wrapper.py")
+from clearvoice import ClearVoice
 
 
 class MOSSFORMER_SR(torch.nn.Module):
@@ -93,9 +101,8 @@ with torch.inference_mode():
     pre_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
     post_stft = STFT_Process(model_type='stft_B', n_fft=NFFT_POST, hop_len=HOP_LENGTH_POST, win_length=WINDOW_LENGTH_POST, max_frames=0, window_type=WINDOW_TYPE).eval()
     post_istft = STFT_Process(model_type='istft_B', n_fft=NFFT_POST, hop_len=HOP_LENGTH_POST, win_length=WINDOW_LENGTH_POST, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
-
-    from clearvoice import ClearVoice
-    myClearVoice = ClearVoice(task='speech_super_resolution', model_names=['MossFormer2_SR_48K'])
+   
+    myClearVoice = ClearVoice(task='speech_super_resolution', model_names=['MossFormer2_SR_48K'], model_path=model_path)
     mossformer = myClearVoice.models[0].model.eval().float().to("cpu")
     mossformer = MOSSFORMER_SR(mossformer, pre_stft, post_stft, post_istft, NFFT, NFFT_POST, N_MELS, ORIGINAL_SAMPLE_RATE, SPUER_SAMPLE_RATE, transition_ms=int(0.1 * INPUT_AUDIO_LENGTH * 1000 / ORIGINAL_SAMPLE_RATE))
     audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16)

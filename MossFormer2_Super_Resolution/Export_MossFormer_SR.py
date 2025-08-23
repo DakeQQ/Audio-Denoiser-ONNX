@@ -91,7 +91,7 @@ class MOSSFORMER_SR(torch.nn.Module):
         cross_b = wav_sub[..., :self.transition_len] * self.fade_ramp
         head = cross_a + cross_b
         tail = wav_sub[..., self.transition_len:]
-        smoothed= torch.cat([head, tail], dim=-1)
+        smoothed = torch.cat([head, tail], dim=-1)
         super_audio = (smoothed.clamp(-32768., 32767.)).to(torch.int16)
         return super_audio
 

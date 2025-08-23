@@ -55,7 +55,6 @@ class ZipEnhancer(torch.nn.Module):
         self.compress_factor = float(0.3)
         self.compress_factor_inv = float(1.0 / self.compress_factor)
         self.compress_factor_sqrt = float(self.compress_factor * 0.5)
-        self.inv_int16 = float(1.0 / 32768.0)
 
     def forward(self, audio):
         audio = audio.float()

@@ -98,7 +98,7 @@ class MOSSFORMER_SE(torch.nn.Module):
                     align_corners=True
                 )
             audio = audio - torch.mean(audio)
-        real_part, imag_part = self.stft_model(audio, 'reflect')
+        real_part, imag_part = self.stft_model(audio, 'constant')
         mel_features = torch.matmul(self.fbank, real_part * real_part + imag_part * imag_part).clamp(min=1e-6).log()
         mel_features_len = mel_features.shape[-1].unsqueeze(0)
         mel_features_delta = self.compute_deltas(mel_features, time_dim=mel_features_len)

@@ -10,26 +10,27 @@ import soundfile as sf
 import torch
 from modelscope.models.base import Model
 from pydub import AudioSegment
-
 from STFT_Process import STFT_Process  # The custom STFT/ISTFT can be exported in ONNX format.
 
 model_path = "/home/DakeQQ/Downloads/speech_zipenhancer_ans_multiloss_16k_base"         # The ZipEnhancer download path.
 onnx_model_A = "/home/DakeQQ/Downloads/ZipEnhancer_ONNX/ZipEnhancer.onnx"               # The exported onnx model path.
 test_noisy_audio = model_path + "/examples/speech_with_noise1.wav"                      # The noisy audio path.
-save_denoised_audio = model_path + "/examples/speech_with_noise1_denoised.wav"          # The output denoised audio path.
+save_denoised_audio = "./speech_with_noise1_denoised.wav"          # The output denoised audio path.
+
 
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-INPUT_AUDIO_LENGTH = 8000               # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4800 and less than 48000. Higher values yield better quality but time consume. It is better to set an integer multiple of the NFFT value.
+INPUT_AUDIO_LENGTH = 16000               # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4800 and less than 48000. Higher values yield better quality but time consume. It is better to set an integer multiple of the NFFT value.
 MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else (INPUT_AUDIO_LENGTH // 100 + 1)  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
-WINDOW_TYPE = 'hann'                    # Type of window function used in the STFT
+WINDOW_TYPE = 'hamming'                 # Type of window function used in the STFT
 N_MELS = 100                            # Number of Mel bands to generate in the Mel-spectrogram
-NFFT = 400                              # Number of FFT components for the STFT process
+NFFT = 512                              # Number of FFT components for the STFT process
 WINDOW_LENGTH = 400                     # Length of windowing, edit it carefully.
 HOP_LENGTH = 100                        # Number of samples between successive frames in the STFT
 SAMPLE_RATE = 16000                     # The ZipEnhancer parameter, do not edit the value.
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
+
 
 site_package_path = site.getsitepackages()[-1]
 shutil.copyfile("./modeling_modified/zipenhancer.py", site_package_path + "/modelscope/models/audio/ans/zipenhancer.py")
@@ -57,14 +58,14 @@ class ZipEnhancer(torch.nn.Module):
         self.inv_int16 = float(1.0 / 32768.0)
 
     def forward(self, audio):
-        audio = audio.float() * self.inv_int16
+        audio = audio.float()
         norm_factor = torch.sqrt(torch.mean(audio * audio, dim=-1, keepdim=True) + 1e-6)
         real_part, imag_part = self.stft_model(audio / norm_factor, 'constant')
         magnitude = torch.pow(real_part * real_part + imag_part * imag_part, self.compress_factor_sqrt)
         phase = torch.atan2(imag_part, real_part)
         magnitude, phase = self.zip_enhancer(magnitude, phase)
         audio = self.istft_model(torch.pow(magnitude, self.compress_factor_inv), phase) * norm_factor
-        return (audio.clamp(min=-1.0, max=1.0) * 32767.0).to(torch.int16)
+        return (audio.clamp(min=-32768.0, max=32767.0)).to(torch.int16)
 
 print('Export start ...')
 with torch.inference_mode():

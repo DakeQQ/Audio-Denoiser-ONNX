@@ -51,9 +51,9 @@ class MOSSFORMER_SR(torch.nn.Module):
         self.register_buffer("fade_ramp_inv", 1.0 - fade, persistent=False)
         self.freq_vec  = (torch.arange(post_nfft // 2 + 1, dtype=torch.float32) * step).view(1, -1, 1)
 
-    def forward(self, audio):
+        def forward(self, audio):
         orig_res = torch.nn.functional.interpolate(
-            audio.float() * self.inv_int16,
+            audio.float(),
             scale_factor=self.scale_factor,
             mode="linear",
             align_corners=False,
@@ -84,7 +84,7 @@ class MOSSFORMER_SR(torch.nn.Module):
         head = cross_a + cross_b
         tail = wav_sub[..., self.transition_len:]
         smoothed= torch.cat([head, tail], dim=-1)
-        super_audio = (smoothed.clamp(-1., 1.) * 32767.0).to(torch.int16)
+        super_audio = (smoothed.clamp(-32768., 32767.)).to(torch.int16)
         return super_audio
 
 

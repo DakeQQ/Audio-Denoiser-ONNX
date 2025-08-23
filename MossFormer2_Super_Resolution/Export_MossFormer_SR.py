@@ -51,7 +51,7 @@ class MOSSFORMER_SR(torch.nn.Module):
         self.register_buffer("fade_ramp_inv", 1.0 - fade, persistent=False)
         self.freq_vec  = (torch.arange(post_nfft // 2 + 1, dtype=torch.float32) * step).view(1, -1, 1)
 
-        def forward(self, audio):
+    def forward(self, audio):
         orig_res = torch.nn.functional.interpolate(
             audio.float(),
             scale_factor=self.scale_factor,

@@ -10,6 +10,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
    - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
    - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
+   - [Denoiser-MossFormer2-48K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K)
    - [MossFormer2-Super-Resolution](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SR_48K)
    - [SDAEC - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/SDAEC)
    - [DFSMN - Acoustic Echo Cancellation](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k)
@@ -30,7 +31,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 ---
 
 ### 性能 Performance  
-| OS           | Device       | Backend           | Model        | Real-Time Factor <br> (Chunk Size: 4000 or 250ms) |
+| OS           | Device       | Backend           | Model        | Real-Time Factor <br> (Chunk Size: 8000 or 500ms) |
 |:------------:|:------------:|:-----------------:|:------------:|:------------------------------------------------:|
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | ZipEnhancer <br> f32 | 0.32                                              |
 | Ubuntu-24.04 | Desktop      | OpenVINO-CPU <br> i3-12300 | ZipEnhancer <br> f32 | 0.25                                     |
@@ -45,12 +46,12 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 | Ubuntu-24.04 | Desktop      | CPU <br> i7-1165G7 | SDAEC <br> f32 | 0.105                                                  |
 | Ubuntu-24.04 | Desktop      |  OpenVINO-CPU <br> i7-1165G7 | SDAEC <br> f32 | 0.095                                        |
 | Ubuntu-24.04 | Desktop      | CPU <br> i7-1165G7 | DFSMN_AEC <br> f32 | 0.11                                               |
+| Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | MossFormer2_SE_48K <br> f32 | 0.09                                       |
 
 ---
 
 ### To-Do List  
 - [ ] [SCNet](https://github.com/starrytong/SCNet)
-- [ ] [Denoiser-MossFormer2-48K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K)
 - [ ] [ExNet-BF-PF](https://github.com/AdiCohen501/ExNet-BF-PF)
 - [ ] [MP-SENet](https://github.com/yxlu-0102/MP-SENet)
 ---
@@ -65,6 +66,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
    - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
    - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
+   - [Denoiser-MossFormer2-48K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K)
    - [MossFormer2-Super-Resolution](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SR_48K)
    - [SDAEC - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/SDAEC)
    - [DFSMN - Acoustic Echo Cancellation](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k)

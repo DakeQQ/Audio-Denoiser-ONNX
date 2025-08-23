@@ -12,6 +12,7 @@ from pydub import AudioSegment
 from STFT_Process import STFT_Process  # The custom STFT/ISTFT can be exported in ONNX format.
 
 
+model_path = "/home/DakeQQ/Downloads/MossFormerGAN_SE_16K"
 onnx_model_A = "/home/DakeQQ/Downloads/MossFormer_ONNX/MossFormerGAN_SE_16K.onnx"    # The exported onnx model path.
 test_noisy_audio = "./examples/speech_with_noise1.wav"                               # The noisy audio path.
 save_denoised_audio = "./examples/speech_with_noise1_denoised.wav"                   # The output denoised audio path.
@@ -28,11 +29,15 @@ HOP_LENGTH = 100                        # Number of samples between successive f
 SAMPLE_RATE = 16000                     # The MossFormer_SE parameter, do not edit the value.
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
 
+
 site_package_path = site.getsitepackages()[-1]
+shutil.copyfile("./modeling_modified/__init__.py", site_package_path + "/clearvoice/__init__.py")
+shutil.copyfile("./modeling_modified/network_wrapper.py", site_package_path + "/clearvoice/network_wrapper.py")
 shutil.copyfile("./modeling_modified/generator.py", site_package_path + "/clearvoice/models/mossformer_gan_se/generator.py")
 shutil.copyfile("./modeling_modified/mossformer.py", site_package_path + "/clearvoice/models/mossformer_gan_se/mossformer.py")
 shutil.copyfile("./modeling_modified/se_layer.py", site_package_path + "/clearvoice/models/mossformer_gan_se/se_layer.py")
 shutil.copyfile("./modeling_modified/fsmn.py", site_package_path + "/clearvoice/models/mossformer_gan_se/fsmn.py")
+from clearvoice import ClearVoice
 
 
 def normalize_to_int16(audio):
@@ -50,11 +55,10 @@ class MOSSFORMER_SE(torch.nn.Module):
         self.compress_factor = float(0.3)
         self.compress_factor_inv = float(0.5 / self.compress_factor) - 0.5
         self.compress_factor_sqrt = float(self.compress_factor * 0.5)
-        self.inv_int16 = float(1.0 / 32768.0)
 
     def forward(self, audio):
         # Initial preprocessing
-        audio = audio * self.inv_int16
+        audio = audio.float()
         norm_factor = torch.sqrt(torch.mean(audio * audio, dim=-1, keepdim=True) + 1e-6)
 
         # STFT and magnitude/phase extraction
@@ -90,15 +94,15 @@ class MOSSFORMER_SE(torch.nn.Module):
         # ISTFT and final processing
         audio = self.istft_model(final_real * factor, final_imag * factor) * norm_factor
 
-        return (audio.clamp(min=-1.0, max=1.0) * 32767.0).to(torch.int16)
+        return (audio.clamp(min=-32768.0, max=32767.0)).to(torch.int16)
 
 
 print('Export start ...')
 with torch.inference_mode():
     custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
     custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
-    from clearvoice import ClearVoice
-    myClearVoice = ClearVoice(task='speech_enhancement', model_names=['MossFormerGAN_SE_16K'])
+
+    myClearVoice = ClearVoice(task='speech_enhancement', model_names=['MossFormerGAN_SE_16K'], model_path=model_path)
     mossformer = myClearVoice.models[0].model.eval().float().to("cpu")
     mossformer = MOSSFORMER_SE(mossformer, custom_stft, custom_istft)
     audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16)

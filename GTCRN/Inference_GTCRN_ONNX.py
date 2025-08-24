@@ -17,7 +17,7 @@ ORT_Accelerate_Providers = []           # If you have accelerate devices for : [
 MAX_THREADS = 8                         # Number of parallel threads for audio denoising.
 DEVICE_ID = 0                           # The GPU id, default to 0.
 SAMPLE_RATE = 16000                     # Keep the same value as the exported model.
-KEEP_ORIGINAL_SAMPLE_RATE = False       # Keep the same value as the exported model.
+KEEP_ORIGINAL_SAMPLE_RATE = True        # Keep the same value as the exported model.
 
 
 # ONNX Runtime settings
@@ -112,12 +112,15 @@ audio = normalize_to_int16(audio)
 audio_len = len(audio)
 audio = audio.reshape(1, 1, -1)
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
+shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
 if isinstance(shape_value_in, str):
     INPUT_AUDIO_LENGTH = min(30 * SAMPLE_RATE, audio_len)  # Default to slice in 30 seconds. You can adjust it.
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
 if audio_len > INPUT_AUDIO_LENGTH:
+    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (KEEP_ORIGINAL_SAMPLE_RATE):
+        stride_step = shape_value_out
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
     pad_amount = total_length_needed - audio_len

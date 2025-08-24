@@ -15,8 +15,8 @@ ORT_Accelerate_Providers = []           # If you have accelerate devices for : [
                                         # else keep empty.
 MAX_THREADS = 4                         # Number of parallel threads for audio denoising.
 DEVICE_ID = 0                           # The GPU id, default to 0.
-SAMPLE_RATE = 48000                     # The MossFormer2_SE_48K parameter, keep the same value with exported model.
-KEEP_ORIGINAL_SAMPLE_RATE = False       # keep the same value with exported model.
+SAMPLE_RATE = 48000                     # Keep the same value as the exported model.
+KEEP_ORIGINAL_SAMPLE_RATE = False       # Keep the same value as the exported model.
 
 
 SAMPLE_RATE_SCALE = float(48000.0 / SAMPLE_RATE)

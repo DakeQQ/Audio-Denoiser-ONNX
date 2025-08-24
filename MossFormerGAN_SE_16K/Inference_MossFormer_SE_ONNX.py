@@ -6,7 +6,8 @@ import onnxruntime
 import soundfile as sf
 from pydub import AudioSegment
 
-onnx_model_A = "/home/DakeQQ/Downloads/MossFormer_Optimized/MossFormerGAN_SE_16K.onnx"   # The exported onnx model path.
+
+onnx_model_A = "/home/DakeQQ/Downloads/MossFormer_ONNX/MossFormerGAN_SE_16K.onnx"        # The exported onnx model path.
 test_noisy_audio = "./examples/speech_with_noise1.wav"                                   # The noisy audio path.
 save_denoised_audio = "./examples/speech_with_noise1_denoised.wav"                       # The output denoised audio path.
 
@@ -15,7 +16,8 @@ ORT_Accelerate_Providers = []           # If you have accelerate devices for : [
                                         # else keep empty.
 MAX_THREADS = 4                         # Number of parallel threads for audio denoising.
 DEVICE_ID = 0                           # The GPU id, default to 0.
-SAMPLE_RATE = 16000                     # The MossFormer_SE parameter, do not edit the value.
+SAMPLE_RATE = 16000                     # Keep the same value as the exported model.
+KEEP_ORIGINAL_SAMPLE_RATE = False       # Keep the same value as the exported model.
 
 
 # ONNX Runtime settings
@@ -107,7 +109,6 @@ print(f"\nTest Input Audio: {test_noisy_audio}")
 audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples(), dtype=np.float32)
 audio = normalize_to_int16(audio)
 audio_len = len(audio)
-inv_audio_len = float(100.0 / audio_len)
 audio = audio.reshape(1, 1, -1)
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
@@ -130,6 +131,13 @@ elif audio_len < INPUT_AUDIO_LENGTH:
     white_noise = (np.sqrt(np.mean(audio_float * audio_float, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
     audio = np.concatenate((audio, white_noise), axis=-1)
 aligned_len = audio.shape[-1]
+inv_audio_len = float(100.0 / audio_len)
+
+
+if SAMPLE_RATE != 16000 and not KEEP_ORIGINAL_SAMPLE_RATE:
+    SAMPLE_RATE_SCALE = float(16000.0 / SAMPLE_RATE)
+    audio_len = int(audio_len * SAMPLE_RATE_SCALE)
+    SAMPLE_RATE = 16000
 
 
 def process_segment(_inv_audio_len, _slice_start, _slice_end, _audio):

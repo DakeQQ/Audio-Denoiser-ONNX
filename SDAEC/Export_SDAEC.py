@@ -19,15 +19,19 @@ save_aec_output = "./aec.wav"                                    # The output Ac
 
 
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-MAX_SIGNAL_LENGTH = 2048 if DYNAMIC_AXES else 192  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
+KEEP_ORIGINAL_SAMPLE_RATE = True        # If False, the model outputs audio at 16kHz; otherwise, it uses the original sample rate.
+SAMPLE_RATE = 16000                     # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 INPUT_AUDIO_LENGTH = 16001              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
+MAX_SIGNAL_LENGTH = 2048 if DYNAMIC_AXES else 256  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
 WINDOW_TYPE = 'hamming'                 # Type of window function used in the STFT
 NFFT = 319                              # Number of FFT components for the STFT process
 WINDOW_LENGTH = 319                     # Length of windowing, edit it carefully.
 HOP_LENGTH = 160                        # Number of samples between successive frames in the STFT
 ALPHA_K = 10                            # The SDAEC parameter, do not edit the value.
-SAMPLE_RATE = 16000                     # The SDAEC parameter, do not edit the value.
 MAX_THREADS = 8                         # Number of parallel threads for test audio denoising.
+
+
+SAMPLE_RATE_SCALE = float(16000.0 / SAMPLE_RATE)
 
 
 def normalize_to_int16(audio):
@@ -259,7 +263,7 @@ class CH_LSTM_F(torch.nn.Module):
 
 
 class SDAEC(torch.nn.Module):
-    def __init__(self, iccrn, alpha_predictor, custom_stft, nfft, k, max_len):
+    def __init__(self, iccrn, alpha_predictor, custom_stft, nfft, k, max_len, sample_rate):
         super(SDAEC, self).__init__()
         self.iccrn = iccrn
         self.alpha_predictor = alpha_predictor
@@ -273,6 +277,7 @@ class SDAEC(torch.nn.Module):
             dtype = torch.int16
         self.frame_starts = torch.arange(max_len, dtype=dtype).unsqueeze(1) + torch.arange(k, dtype=dtype).unsqueeze(0)
         self.k_minus = k - 1
+        self.sample_rate = sample_rate
 
     def onnx_friendly_unfold(self, input_tensor):
         num_frames = input_tensor.shape[-1] - self.k_minus
@@ -281,10 +286,44 @@ class SDAEC(torch.nn.Module):
         return unfolded
 
     def forward(self, near_end_audio, far_end_audio):
-        near_end_audio = near_end_audio.float() * self.inv_int16
-        far_end_audio = far_end_audio.float() * self.inv_int16
-        near_end_audio = near_end_audio - torch.mean(near_end_audio)
-        far_end_audio = far_end_audio - torch.mean(far_end_audio)
+        near_end_audio = near_end_audio.float()
+        far_end_audio = far_end_audio.float()
+        if SAMPLE_RATE_SCALE < 1.0:
+            near_end_audio *= self.inv_int16
+            far_end_audio *= self.inv_int16
+            near_end_audio = near_end_audio - torch.mean(near_end_audio)
+            far_end_audio = far_end_audio - torch.mean(far_end_audio)
+            if self.sample_rate != 16000:
+                near_end_audio = torch.nn.functional.interpolate(
+                    near_end_audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+                far_end_audio = torch.nn.functional.interpolate(
+                    far_end_audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+        else:
+            if self.sample_rate != 16000:
+                near_end_audio = torch.nn.functional.interpolate(
+                    near_end_audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+                far_end_audio = torch.nn.functional.interpolate(
+                    far_end_audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+            near_end_audio *= self.inv_int16
+            far_end_audio *= self.inv_int16
+            near_end_audio = near_end_audio - torch.mean(near_end_audio)
+            far_end_audio = far_end_audio - torch.mean(far_end_audio)
         near_real_part, near_imag_part = self.custom_stft(near_end_audio, 'constant')
         far_real_part, far_imag_part = self.custom_stft(far_end_audio, 'constant')
         mix_comp = torch.cat([near_real_part, near_imag_part], dim=0).unsqueeze(0)
@@ -299,8 +338,26 @@ class SDAEC(torch.nn.Module):
         alpha = self.alpha_predictor.linear1(torch.sum(concat_input, dim=2, keepdim=True)).squeeze(dim=-1)
         alpha = self.alpha_predictor.linear2(alpha).squeeze(dim=-1)
         far_comp = far_comp * torch.abs(alpha)
-        aec_audio = self.iccrn(torch.cat([mix_comp, far_comp.squeeze(1)], dim=1))
-        return (aec_audio.clamp(min=-1.0, max=1.0) * 32767.0).to(torch.int16)
+        audio = self.iccrn(torch.cat([mix_comp, far_comp.squeeze(1)], dim=1))
+        if SAMPLE_RATE_SCALE < 1.0:
+            audio *= 32767.0
+            if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 16000:
+                audio = torch.nn.functional.interpolate(
+                    audio,
+                    scale_factor=1.0 / SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+        else:
+            if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 16000:
+                audio = torch.nn.functional.interpolate(
+                    audio,
+                    scale_factor=1.0 / SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+            audio *= 32767.0
+        return audio.clamp(min=-32768.0, max=32767).to(torch.int16)
 
 
 print('Export start ...')
@@ -313,7 +370,7 @@ with torch.inference_mode():
     alpha_predictor.load_state_dict(torch.load(project_path + '/Model/alpha.ckpt', map_location='cpu'), strict=False)
     alpha_predictor = alpha_predictor.float().eval()
 
-    sdaec = SDAEC(iccrn, alpha_predictor, custom_stft, NFFT, ALPHA_K, MAX_SIGNAL_LENGTH)
+    sdaec = SDAEC(iccrn, alpha_predictor, custom_stft, NFFT, ALPHA_K, MAX_SIGNAL_LENGTH, SAMPLE_RATE)
     near_end_audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16)
     far_end_audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16)
 
@@ -377,14 +434,13 @@ far_nd_audio_len = len(far_end_audio)
 min_len = min(near_end_audio_len, far_nd_audio_len)
 near_end_audio = normalize_to_int16(near_end_audio[:min_len])
 far_end_audio = normalize_to_int16(far_end_audio[:min_len])
-inv_audio_len = float(100.0 / min_len)
 near_end_audio = near_end_audio.reshape(1, 1, -1)
 far_end_audio = far_end_audio.reshape(1, 1, -1)
 
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
 if isinstance(shape_value_in, str):
-    INPUT_AUDIO_LENGTH = min(20 * SAMPLE_RATE, min_len)  # Default to slice in 20 seconds. You can adjust it.
+    INPUT_AUDIO_LENGTH = max(20 * SAMPLE_RATE, min_len)  # Default to slice in 20 seconds. You can adjust it.
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
 
@@ -392,7 +448,7 @@ else:
 def align_audio(audio, audio_len):
     stride_step = INPUT_AUDIO_LENGTH
     if audio_len > INPUT_AUDIO_LENGTH:
-        if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int):
+        if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (KEEP_ORIGINAL_SAMPLE_RATE):
             stride_step = shape_value_out
         num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
         total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
@@ -410,6 +466,12 @@ def align_audio(audio, audio_len):
 
 near_end_audio, _, _ = align_audio(near_end_audio, min_len)
 far_end_audio, aligned_len, stride_step = align_audio(far_end_audio, min_len)
+
+
+if SAMPLE_RATE != 16000 and not KEEP_ORIGINAL_SAMPLE_RATE:
+    SAMPLE_RATE = 16000
+    min_len = int(min_len * SAMPLE_RATE_SCALE)
+inv_audio_len = float(100.0 / min_len)
 
 
 def process_segment(_inv_audio_len, _slice_start, _slice_end, _near_end_audio, _far_end_audio):

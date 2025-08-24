@@ -20,8 +20,8 @@ save_generated_audio = "./examples/speech_with_noise1_super_resolution.wav"     
 
 
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-INPUT_AUDIO_LENGTH = 32000              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 8000. Higher values yield better quality but time consume. It is better to set an integer multiple of the NFFT value.
-MAX_SIGNAL_LENGTH = 1024                # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
+INPUT_AUDIO_LENGTH = 48000              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 8000. Higher values yield better quality but time consume. It is better to set an integer multiple of the NFFT value.
+MAX_SIGNAL_LENGTH = 1280                # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
 WINDOW_TYPE = 'hamming'                 # Type of window function used in the STFT
 N_MELS = 80                             # Number of Mel bands to generate in the Mel-spectrogram
 NFFT = 1024                             # Number of FFT components for the STFT process
@@ -49,7 +49,6 @@ class MOSSFORMER_SR(torch.nn.Module):
         self.post_stft = post_stft
         self.post_istft = post_istft
         self.fbank = (torchaudio.functional.melscale_fbanks(pre_nfft // 2 + 1, 0, 8000, n_mels, super_sample_rate, 'slaney', 'slaney')).transpose(0, 1).unsqueeze(0)
-        self.inv_int16 = float(1.0 / 32768.0)
         self.scale_factor = float(super_sample_rate / original_sample_rate)
         self.energy_thr = float(energy_threshold)
         step = float(super_sample_rate / post_nfft)
@@ -60,20 +59,22 @@ class MOSSFORMER_SR(torch.nn.Module):
         self.freq_vec  = (torch.arange(post_nfft // 2 + 1, dtype=torch.float32) * step).view(1, -1, 1)
 
     def forward(self, audio):
-        orig_res = torch.nn.functional.interpolate(
-            audio.float(),
+        audio = audio.float()
+        audio = audio - torch.mean(audio)
+        audio = torch.nn.functional.interpolate(
+            audio,
             scale_factor=self.scale_factor,
             mode="linear",
-            align_corners=False,
+            align_corners=True,
             recompute_scale_factor=False
         )
-        real_part, imag_part = self.pre_stft(orig_res, 'constant')
-        real_a, imag_a = self.post_stft(orig_res, 'constant')
-        mel_features = torch.matmul(self.fbank, torch.sqrt(real_part * real_part + imag_part * imag_part)).clamp(min=1e-5).log()
+        real_part, imag_part = self.pre_stft(audio, 'reflect')
+        real_a, imag_a = self.post_stft(audio, 'reflect')
+        mel_features = torch.matmul(self.fbank, torch.sqrt(real_part * real_part + imag_part * imag_part)).clamp(min=1e-6).log()
         mossformer_output = self.mossformer_sr[0](mel_features)
         generated_wav = self.mossformer_sr[1](mossformer_output)
-        generated_wav = generated_wav[..., :orig_res.shape[-1]]
-        real_b, imag_b = self.post_stft(generated_wav, 'constant')
+        generated_wav = generated_wav[..., :audio.shape[-1]]
+        real_b, imag_b = self.post_stft(generated_wav, 'reflect')
         psd = (real_a * real_a + imag_a * imag_a) * self.post_istft.inv_win_sum_for_mossformer
         energy_per_f = psd.sum(dim=-1)     
         cum_energy = energy_per_f.cumsum(dim=1)
@@ -87,12 +88,12 @@ class MOSSFORMER_SR(torch.nn.Module):
         real_mix = real_a * lp_mask + real_b * lp_mask_minus
         imag_mix = imag_a * lp_mask + imag_b * lp_mask_minus
         wav_sub = self.post_istft(real_mix, imag_mix)
-        cross_a = orig_res[..., :self.transition_len] * self.fade_ramp_inv
+        cross_a = audio[..., :self.transition_len] * self.fade_ramp_inv
         cross_b = wav_sub[..., :self.transition_len] * self.fade_ramp
         head = cross_a + cross_b
         tail = wav_sub[..., self.transition_len:]
         smoothed = torch.cat([head, tail], dim=-1)
-        super_audio = (smoothed.clamp(-32768., 32767.)).to(torch.int16)
+        super_audio = smoothed.clamp(-32768.0, 32767.0).to(torch.int16)
         return super_audio
 
 

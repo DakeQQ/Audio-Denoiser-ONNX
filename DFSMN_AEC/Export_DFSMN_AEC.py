@@ -502,6 +502,7 @@ else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
 
+
 def align_audio(audio, audio_len):
     if audio_len > INPUT_AUDIO_LENGTH:
         num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1

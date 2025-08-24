@@ -199,7 +199,7 @@ with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel genera
         print(f"Complete: {results[-1][0]:.3f}%")
 results.sort(key=lambda x: x[0])
 saved = [result[1] for result in results]
-generated_wav = np.concatenate(saved, axis=-1)[0, 0, :super_audio_len]
+generated_wav = np.concatenate(saved, axis=-1).reshape(-1)[:super_audio_len]
 end_time = time.time()
 
 # Save the generated wav.

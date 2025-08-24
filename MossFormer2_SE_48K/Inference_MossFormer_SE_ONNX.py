@@ -19,9 +19,6 @@ SAMPLE_RATE = 48000                     # Keep the same value as the exported mo
 KEEP_ORIGINAL_SAMPLE_RATE = False       # Keep the same value as the exported model.
 
 
-SAMPLE_RATE_SCALE = float(48000.0 / SAMPLE_RATE)
-
-
 # ONNX Runtime settings
 if "OpenVINOExecutionProvider" in ORT_Accelerate_Providers:
     provider_options = [
@@ -134,8 +131,9 @@ inv_audio_len = float(100.0 / aligned_len)
 
 
 if SAMPLE_RATE != 48000 and not KEEP_ORIGINAL_SAMPLE_RATE:
-    SAMPLE_RATE = 48000
+    SAMPLE_RATE_SCALE = float(48000.0 / SAMPLE_RATE)
     audio_len = int(audio_len * SAMPLE_RATE_SCALE)
+    SAMPLE_RATE = 48000
 
 
 def process_segment(_inv_audio_len, _slice_start, _slice_end, _audio):

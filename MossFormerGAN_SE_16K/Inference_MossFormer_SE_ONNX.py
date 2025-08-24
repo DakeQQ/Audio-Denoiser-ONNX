@@ -80,7 +80,7 @@ def normalize_to_int16(audio):
 
 # ONNX Runtime settings
 session_opts = onnxruntime.SessionOptions()
-session_opts.log_severity_level = 4                   # error level, it an adjustable value.
+session_opts.log_severity_level = 4                   # Fatal level, it an adjustable value.
 session_opts.inter_op_num_threads = MAX_THREADS       # Run different nodes with num_threads. Set 0 for auto.
 session_opts.intra_op_num_threads = MAX_THREADS       # Under the node, execute the operators with num_threads. Set 0 for auto.
 session_opts.enable_cpu_mem_arena = True              # True for execute speed; False for less memory usage.

@@ -63,7 +63,6 @@ class ZipEnhancer(torch.nn.Module):
 
     def forward(self, audio):
         audio = audio.float()
-
         if SAMPLE_RATE_SCALE < 1.0:
             norm_factor = torch.sqrt(torch.mean(audio * audio, dim=-1, keepdim=True) + 1e-6)
             audio /= norm_factor

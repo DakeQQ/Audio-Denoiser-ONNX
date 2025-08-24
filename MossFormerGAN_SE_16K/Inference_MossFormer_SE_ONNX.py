@@ -17,7 +17,7 @@ ORT_Accelerate_Providers = []           # If you have accelerate devices for : [
 MAX_THREADS = 4                         # Number of parallel threads for audio denoising.
 DEVICE_ID = 0                           # The GPU id, default to 0.
 SAMPLE_RATE = 16000                     # Keep the same value as the exported model.
-KEEP_ORIGINAL_SAMPLE_RATE = False       # Keep the same value as the exported model.
+KEEP_ORIGINAL_SAMPLE_RATE = True        # Keep the same value as the exported model.
 
 
 # ONNX Runtime settings
@@ -118,7 +118,7 @@ else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
 if audio_len > INPUT_AUDIO_LENGTH:
-    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int):
+    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (KEEP_ORIGINAL_SAMPLE_RATE):
         stride_step = shape_value_out
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
@@ -131,7 +131,7 @@ elif audio_len < INPUT_AUDIO_LENGTH:
     white_noise = (np.sqrt(np.mean(audio_float * audio_float, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
     audio = np.concatenate((audio, white_noise), axis=-1)
 aligned_len = audio.shape[-1]
-inv_audio_len = float(100.0 / audio_len)
+inv_audio_len = float(100.0 / aligned_len)
 
 
 if SAMPLE_RATE != 16000 and not KEEP_ORIGINAL_SAMPLE_RATE:

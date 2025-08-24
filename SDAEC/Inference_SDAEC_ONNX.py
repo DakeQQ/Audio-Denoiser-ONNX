@@ -7,15 +7,17 @@ import soundfile as sf
 from pydub import AudioSegment
 
 onnx_model_A = "/home/DakeQQ/Downloads/SDAEC_Optimized/SDAEC.onnx"   # The exported onnx model path.
-test_near_end_audio = "./examples/nearend_mic1.wav"                # The near end audio path.
-test_far_end_audio = "./examples/farend_speech1.wav"               # The far end audio path.
-save_aec_output = "./aec.wav"                                      # The output Acoustic Echo Cancellation audio path.
+test_near_end_audio = "./examples/nearend_mic1.wav"                  # The near end audio path.
+test_far_end_audio = "./examples/farend_speech1.wav"                 # The far end audio path.
+save_aec_output = "./aec.wav"                                        # The output Acoustic Echo Cancellation audio path.
+
 
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 MAX_THREADS = 8                         # Number of parallel threads for audio denoising.
 DEVICE_ID = 0                           # The GPU id, default to 0.
-SAMPLE_RATE = 16000                     # The SDAEC parameter, do not edit the value.
+SAMPLE_RATE = 16000                     # Keep the same value as the exported model.
+KEEP_ORIGINAL_SAMPLE_RATE = True        # Keep the same value as the exported model.
 
 
 if "OpenVINOExecutionProvider" in ORT_Accelerate_Providers:
@@ -93,6 +95,7 @@ session_opts.add_session_config_entry("disable_synchronize_execution_providers",
 session_opts.add_session_config_entry("optimization.minimal_build_optimizations", "")
 session_opts.add_session_config_entry("session.use_device_allocator_for_initializers", "1")
 
+
 ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=ORT_Accelerate_Providers)
 print(f"\nUsable Providers: {ort_session_A.get_providers()}")
 in_name_A = ort_session_A.get_inputs()
@@ -111,14 +114,12 @@ far_nd_audio_len = len(far_end_audio)
 min_len = min(near_end_audio_len, far_nd_audio_len)
 near_end_audio = normalize_to_int16(near_end_audio[:min_len])
 far_end_audio = normalize_to_int16(far_end_audio[:min_len])
-inv_audio_len = float(100.0 / min_len)
 near_end_audio = near_end_audio.reshape(1, 1, -1)
 far_end_audio = far_end_audio.reshape(1, 1, -1)
-
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
 if isinstance(shape_value_in, str):
-    INPUT_AUDIO_LENGTH = min(30 * SAMPLE_RATE, min_len)  # Default to slice in 30 seconds. You can adjust it.
+    INPUT_AUDIO_LENGTH = max(30 * SAMPLE_RATE, min_len)  # Default to slice in 30 seconds. You can adjust it.
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
 
@@ -126,7 +127,7 @@ else:
 def align_audio(audio, audio_len):
     stride_step = INPUT_AUDIO_LENGTH
     if audio_len > INPUT_AUDIO_LENGTH:
-        if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int):
+        if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (KEEP_ORIGINAL_SAMPLE_RATE):
             stride_step = shape_value_out
         num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
         total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
@@ -144,6 +145,13 @@ def align_audio(audio, audio_len):
 
 near_end_audio, _, _ = align_audio(near_end_audio, min_len)
 far_end_audio, aligned_len, stride_step = align_audio(far_end_audio, min_len)
+
+
+if SAMPLE_RATE != 16000 and not KEEP_ORIGINAL_SAMPLE_RATE:
+    SAMPLE_RATE_SCALE = float(16000.0 / SAMPLE_RATE)
+    min_len = int(min_len * SAMPLE_RATE_SCALE)
+    SAMPLE_RATE = 16000
+inv_audio_len = float(100.0 / min_len)
 
 
 def process_segment(_inv_audio_len, _slice_start, _slice_end, _near_end_audio, _far_end_audio):

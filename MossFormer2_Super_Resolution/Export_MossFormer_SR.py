@@ -61,13 +61,14 @@ class MOSSFORMER_SR(torch.nn.Module):
     def forward(self, audio):
         audio = audio.float()
         audio = audio - torch.mean(audio)
-        audio = torch.nn.functional.interpolate(
-            audio,
-            scale_factor=self.scale_factor,
-            mode="linear",
-            align_corners=True,
-            recompute_scale_factor=False
-        )
+        if self.scale_factor != 1.0:
+            audio = torch.nn.functional.interpolate(
+                audio,
+                scale_factor=self.scale_factor,
+                mode="linear",
+                align_corners=True,
+                recompute_scale_factor=False
+            )
         real_part, imag_part = self.pre_stft(audio, 'reflect')
         real_a, imag_a = self.post_stft(audio, 'reflect')
         mel_features = torch.matmul(self.fbank, torch.sqrt(real_part * real_part + imag_part * imag_part)).clamp(min=1e-6).log()

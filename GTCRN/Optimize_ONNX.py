@@ -12,9 +12,9 @@ original_folder_path = "/home/DakeQQ/Downloads/GTCRN_ONNX"                      
 optimized_folder_path = "/home/DakeQQ/Downloads/GTCRN_Optimized"                  # The optimized folder.
 model_path = os.path.join(original_folder_path, "GTCRN.onnx")                     # The original fp32 model name.
 optimized_model_path = os.path.join(optimized_folder_path, "GTCRN.onnx")          # The optimized model name.
-use_gpu_fp16 = False                                                                    # If true, the transformers.optimizer will remain the FP16 processes.
-provider = 'CPUExecutionProvider'                                                       # ['CPUExecutionProvider', 'CUDAExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider']
-target_platform = "amd64"                                                               # ['arm', 'amd64']; The 'amd64' means x86_64 desktop, not means the AMD chip.
+use_gpu_fp16 = False                                                              # If true, the transformers.optimizer will remain the FP16 processes.
+provider = 'CPUExecutionProvider'                                                 # ['CPUExecutionProvider', 'CUDAExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider']
+target_platform = "amd64"                                                         # ['arm', 'amd64']; The 'amd64' means x86_64 desktop, not means the AMD chip.
 
 
 # Check model

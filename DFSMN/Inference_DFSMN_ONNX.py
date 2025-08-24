@@ -7,9 +7,9 @@ import soundfile as sf
 from pydub import AudioSegment
 
 
-onnx_model_A = "/home/DakeQQ/Downloads/DFSMN_ONNX/DFSMN.onnx"                                                              # The exported onnx model path.
-test_noisy_audio = "/home/DakeQQ/Downloads/speech_dfsmn_ans_psm_48k_causal/examples/speech_with_noise_48k.wav"                  # The noisy audio path.
-save_denoised_audio = "./speech_with_noise_48k_denoised.wav"      # The output denoised audio path.
+onnx_model_A = "/home/DakeQQ/Downloads/DFSMN_ONNX/DFSMN.onnx"                                                        # The exported onnx model path.
+test_noisy_audio = "/home/DakeQQ/Downloads/speech_dfsmn_ans_psm_48k_causal/examples/speech_with_noise_48k.wav"       # The noisy audio path.
+save_denoised_audio = "./speech_with_noise_48k_denoised.wav"                                                         # The output denoised audio path.
 
 
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']

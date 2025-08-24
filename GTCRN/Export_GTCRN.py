@@ -21,7 +21,7 @@ save_denoised_audio = "./denoised.wav"                                    # The 
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-KEEP_ORIGINAL_SAMPLE_RATE = False       # If False, the model outputs audio at 16kHz; otherwise, it uses the original sample rate.
+KEEP_ORIGINAL_SAMPLE_RATE = True        # If False, the model outputs audio at 16kHz; otherwise, it uses the original sample rate.
 SAMPLE_RATE = 16000                     # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 INPUT_AUDIO_LENGTH = 31744              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the HOP_LENGTH value.
 MAX_SIGNAL_LENGTH = 4096 if DYNAMIC_AXES else 256  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
@@ -156,12 +156,15 @@ audio = normalize_to_int16(audio)
 audio_len = len(audio)
 audio = audio.reshape(1, 1, -1)
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
+shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
 if isinstance(shape_value_in, str):
     INPUT_AUDIO_LENGTH = min(30 * SAMPLE_RATE, audio_len)  # Default to slice in 30 seconds. You can adjust it.
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
 if audio_len > INPUT_AUDIO_LENGTH:
+    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (KEEP_ORIGINAL_SAMPLE_RATE):
+        stride_step = shape_value_out
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
     pad_amount = total_length_needed - audio_len

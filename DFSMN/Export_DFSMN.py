@@ -12,23 +12,28 @@ from concurrent.futures import ThreadPoolExecutor
 from STFT_Process import STFT_Process                                                      # The custom STFT/ISTFT can be exported in ONNX format.
 
 
-model_path = "/home/DakeQQ/Downloads/speech_dfsmn_ans_psm_48k_causal"                      # The DFSMN download path.
-onnx_model_A = "/home/DakeQQ/Downloads/DFSMN_ONNX/DFSMN.onnx"                              # The exported onnx model path.
-test_noisy_audio = model_path + "/examples/speech_with_noise_48k.wav"                      # The noisy audio path.
-save_denoised_audio = "./speech_with_noise_48k_denoised.wav"          # The output denoised audio path.
+model_path = "/home/DakeQQ/Downloads/speech_dfsmn_ans_psm_48k_causal"         # The DFSMN download path.
+onnx_model_A = "/home/DakeQQ/Downloads/DFSMN_ONNX/DFSMN.onnx"                 # The exported onnx model path.
+test_noisy_audio = model_path + "/examples/speech_with_noise_48k.wav"         # The noisy audio path.
+save_denoised_audio = "./speech_with_noise_48k_denoised.wav"                  # The output denoised audio path.
+
 
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else 128  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
+KEEP_ORIGINAL_SAMPLE_RATE = True        # If False, the model outputs audio at 16kHz; otherwise, it uses the original sample rate.
+SAMPLE_RATE = 48000                     # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 INPUT_AUDIO_LENGTH = 96000              # The maximum input audio length.
+MAX_SIGNAL_LENGTH = 2048 if DYNAMIC_AXES else 256  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
 WINDOW_TYPE = 'hamming'                 # Type of window function used in the STFT
 N_MELS = 120                            # Number of Mel bands to generate in the Mel-spectrogram
 NFFT_STFT = 1920                        # Number of FFT components for the STFT process, edit it carefully.
 WINDOW_LENGTH = 1920                    # Length of windowing, edit it carefully.
 HOP_LENGTH = 960                        # Number of samples between successive frames in the STFT
-SAMPLE_RATE = 48000                     # The DFSMN parameter, do not edit the value.
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
+
+
+SAMPLE_RATE_SCALE = float(48000.0 / SAMPLE_RATE)
 
 
 STFT_SIGNAL_LENGTH = INPUT_AUDIO_LENGTH // HOP_LENGTH + 1   # The length after STFT processed
@@ -48,18 +53,43 @@ class DFSMN(torch.nn.Module):
         self.dfsmn = dfsmn
         self.stft_model = stft_model
         self.istft_model = istft_model
-        self.fbank = (torchaudio.functional.melscale_fbanks(nfft_stft // 2 + 1, 20, sample_rate // 2, n_mels, sample_rate, None, 'htk')).transpose(0, 1).unsqueeze(0)
+        self.fbank = (torchaudio.functional.melscale_fbanks(nfft_stft // 2 + 1, 20, 24000, n_mels, 48000, None, 'htk')).transpose(0, 1).unsqueeze(0)
         self.nfft_stft = nfft_stft
+        self.sample_rate = sample_rate
 
     def forward(self, audio):
         audio = audio.float()       # Don't divide by 32768.0
-        audio = audio - torch.mean(audio)  # Remove DC Offset
+        if SAMPLE_RATE_SCALE < 1.0:
+            audio = audio - torch.mean(audio)  # Remove DC Offset
+            if self.sample_rate != 48000:
+                audio = torch.nn.functional.interpolate(
+                    audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+        else:
+            if self.sample_rate != 48000:
+                audio = torch.nn.functional.interpolate(
+                    audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+            audio = audio - torch.mean(audio)  # Remove DC Offset
         real_part, imag_part = self.stft_model(audio, 'constant')
-        mel_features = torch.matmul(self.fbank, real_part * real_part + imag_part * imag_part).transpose(1, 2).clamp(min=1e-5).log()
+        mel_features = torch.matmul(self.fbank, real_part * real_part + imag_part * imag_part).transpose(1, 2).clamp(min=1e-6).log()
         mask = self.dfsmn(mel_features).transpose(1, 2)
         real_part *= mask
         imag_part *= mask
         audio = self.istft_model(real_part, imag_part)
+        if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 48000:
+            audio = torch.nn.functional.interpolate(
+                audio,
+                scale_factor=1.0 / SAMPLE_RATE_SCALE,
+                mode='linear',
+                align_corners=True
+            )
         return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 
@@ -97,15 +127,21 @@ print('\nExport done!\n\nStart to run DFSMN by ONNX Runtime.\n\nNow, loading the
 
 # ONNX Runtime settings
 session_opts = onnxruntime.SessionOptions()
-session_opts.log_severity_level = 3         # error level, it an adjustable value.
+session_opts.log_severity_level = 4         # Fatal level, it an adjustable value.
 session_opts.inter_op_num_threads = 0       # Run different nodes with num_threads. Set 0 for auto.
 session_opts.intra_op_num_threads = 0       # Under the node, execute the operators with num_threads. Set 0 for auto.
 session_opts.enable_cpu_mem_arena = True    # True for execute speed; False for less memory usage.
 session_opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
 session_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+session_opts.add_session_config_entry("session.set_denormal_as_zero", "1")
 session_opts.add_session_config_entry("session.intra_op.allow_spinning", "1")
 session_opts.add_session_config_entry("session.inter_op.allow_spinning", "1")
-session_opts.add_session_config_entry("session.set_denormal_as_zero", "1")
+session_opts.add_session_config_entry("session.enable_quant_qdq_cleanup", "1")
+session_opts.add_session_config_entry("session.qdq_matmulnbits_accuracy_level", "4")
+session_opts.add_session_config_entry("optimization.enable_gelu_approximation", "1")
+session_opts.add_session_config_entry("disable_synchronize_execution_providers", "1")
+session_opts.add_session_config_entry("optimization.minimal_build_optimizations", "")
+session_opts.add_session_config_entry("session.use_device_allocator_for_initializers", "1")
 
 
 ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=ORT_Accelerate_Providers)
@@ -121,17 +157,16 @@ print(f"\nTest Input Audio: {test_noisy_audio}")
 audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples(), dtype=np.float32)
 audio = normalize_to_int16(audio)
 audio_len = len(audio)
-inv_audio_len = float(100.0 / audio_len)
 audio = audio.reshape(1, 1, -1)
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
 if isinstance(shape_value_in, str):
-    INPUT_AUDIO_LENGTH = min(96000, audio_len)  # You can adjust it.
+    INPUT_AUDIO_LENGTH = max(6 * SAMPLE_RATE, audio_len)  # You can adjust it.
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
 if audio_len > INPUT_AUDIO_LENGTH:
-    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int):
+    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (KEEP_ORIGINAL_SAMPLE_RATE):
         stride_step = shape_value_out
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
@@ -144,6 +179,12 @@ elif audio_len < INPUT_AUDIO_LENGTH:
     white_noise = (np.sqrt(np.mean(audio_float * audio_float, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
     audio = np.concatenate((audio, white_noise), axis=-1)
 aligned_len = audio.shape[-1]
+inv_audio_len = float(100.0 / aligned_len)
+
+
+if SAMPLE_RATE != 48000 and not KEEP_ORIGINAL_SAMPLE_RATE:
+    SAMPLE_RATE = 48000
+    audio_len = int(audio_len * SAMPLE_RATE_SCALE)
 
 
 def process_segment(_inv_audio_len, _slice_start, _slice_end, _audio):
@@ -167,7 +208,7 @@ with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denois
         print(f"Complete: {results[-1][0]:.3f}%")
 results.sort(key=lambda x: x[0])
 saved = [result[1] for result in results]
-denoised_wav = np.concatenate(saved, axis=-1)[0, 0, :audio_len]
+denoised_wav = np.concatenate(saved, axis=-1).reshape(-1)[:audio_len]
 end_time = time.time()
 print(f"Complete: 100.00%")
 

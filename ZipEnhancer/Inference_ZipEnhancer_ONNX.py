@@ -15,7 +15,8 @@ ORT_Accelerate_Providers = []           # If you have accelerate devices for : [
                                         # else keep empty.
 MAX_THREADS = 4                         # Number of parallel threads for audio denoising.
 DEVICE_ID = 0                           # The GPU id, default to 0.
-SAMPLE_RATE = 16000                     # The MossFormer_SE parameter, do not edit the value.
+SAMPLE_RATE = 16000                     # Keep the same value as the exported model.
+KEEP_ORIGINAL_SAMPLE_RATE = False       # Keep the same value as the exported model.
 
 
 # ONNX Runtime settings
@@ -107,18 +108,14 @@ print(f"\nTest Input Audio: {test_noisy_audio}")
 audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples(), dtype=np.float32)
 audio = normalize_to_int16(audio)
 audio_len = len(audio)
-inv_audio_len = float(100.0 / audio_len)
 audio = audio.reshape(1, 1, -1)
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
-shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
 if isinstance(shape_value_in, str):
-    INPUT_AUDIO_LENGTH = min(32000, audio_len)  # 36000 for (8 threads + 32GB RAM), 64000 for (4 threads + 32GB RAM), Max <= 99999 for model limit.
+    INPUT_AUDIO_LENGTH = max(96000, audio_len)  # 36000 for (8 threads + 32GB RAM), 64000 for (4 threads + 32GB RAM), Max <= 99999 for model limit.
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
 if audio_len > INPUT_AUDIO_LENGTH:
-    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int):
-        stride_step = shape_value_out
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
     pad_amount = total_length_needed - audio_len
@@ -130,6 +127,13 @@ elif audio_len < INPUT_AUDIO_LENGTH:
     white_noise = (np.sqrt(np.mean(audio_float * audio_float, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
     audio = np.concatenate((audio, white_noise), axis=-1)
 aligned_len = audio.shape[-1]
+inv_audio_len = float(100.0 / audio_len)
+
+
+if SAMPLE_RATE != 16000 and not KEEP_ORIGINAL_SAMPLE_RATE:
+    SAMPLE_RATE_SCALE = float(16000.0 / SAMPLE_RATE)
+    audio_len = int(audio_len * SAMPLE_RATE_SCALE)
+    SAMPLE_RATE = 16000
 
 
 def process_segment(_inv_audio_len, _slice_start, _slice_end, _audio):
@@ -153,7 +157,7 @@ with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denois
         print(f"Complete: {results[-1][0]:.3f}%")
 results.sort(key=lambda x: x[0])
 saved = [result[1] for result in results]
-denoised_wav = np.concatenate(saved, axis=-1)[0, 0, :audio_len]
+denoised_wav = np.concatenate(saved, axis=-1).reshape(-1)[:audio_len]
 end_time = time.time()
 print(f"Complete: 100.00%")
 

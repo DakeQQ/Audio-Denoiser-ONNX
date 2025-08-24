@@ -12,8 +12,6 @@ from beartype import beartype
 
 from rotary_embedding_torch import RotaryEmbedding
 
-from einops import rearrange, pack, unpack, reduce, repeat
-
 from librosa import filters
 
 
@@ -25,14 +23,6 @@ def exists(val):
 
 def default(v, d):
     return v if exists(v) else d
-
-
-def pack_one(t, pattern):
-    return pack([t], pattern)
-
-
-def unpack_one(t, ps, pattern):
-    return unpack(t, ps, pattern)[0]
 
 
 def pad_at_dim(t, pad, dim=-1, value=0.):
@@ -89,6 +79,7 @@ class Attention(Module):
     ):
         super().__init__()
         self.heads = heads
+        self.dim_head = dim_head
         self.scale = dim_head ** -0.5
         dim_inner = heads * dim_head
 
@@ -109,7 +100,11 @@ class Attention(Module):
     def forward(self, x):
         x = self.norm(x)
 
-        q, k, v = rearrange(self.to_qkv(x), 'b n (qkv h d) -> qkv b h n d', qkv=3, h=self.heads)
+        b, n, _ = x.shape
+
+        # More direct QKV projection and splitting
+        qkv = self.to_qkv(x).reshape(b, n, 3, self.heads, self.dim_head).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(dim=0)
 
         if exists(self.rotary_embed):
             q = self.rotary_embed.rotate_queries_or_keys(q)
@@ -118,9 +113,14 @@ class Attention(Module):
         out = self.attend(q, k, v)
 
         gates = self.to_gates(x)
-        out = out * rearrange(gates, 'b n h -> b h n 1').sigmoid()
 
-        out = rearrange(out, 'b h n d -> b n (h d)')
+        # Apply sigmoid gates
+        gated_mask = gates.permute(0, 2, 1).unsqueeze(-1).sigmoid()
+        out = out * gated_mask
+
+        # Combine heads and project out, using reshape for clarity
+        out = out.permute(0, 2, 1, 3).reshape(b, n, -1)
+
         return self.to_out(out)
 
 
@@ -277,7 +277,6 @@ class MelBandRoformer(Module):
             sample_rate=44100,  # needed for mel filter bank from librosa
             stft_n_fft=2048,
             stft_hop_length=512,
-            # 10ms at 44100Hz, from sections 4.1, 4.4 in the paper - @faroit recommends // 2 or // 4 for better reconstruction
             stft_win_length=2048,
             stft_normalized=False,
             stft_window_fn: Optional[Callable] = None,
@@ -325,46 +324,36 @@ class MelBandRoformer(Module):
         )
 
         freqs = torch.stft(torch.randn(1, 4096), **self.stft_kwargs, return_complex=True).shape[1]
-
-        # create mel filter bank
-        # with librosa.filters.mel as in section 2 of paper
+        self.num_freqs = freqs
 
         mel_filter_bank_numpy = filters.mel(sr=sample_rate, n_fft=stft_n_fft, n_mels=num_bands)
-
         mel_filter_bank = torch.from_numpy(mel_filter_bank_numpy)
 
-        # for some reason, it doesn't include the first freq? just force a value for now
-
         mel_filter_bank[0][0] = 1.
-
-        # In some systems/envs we get 0.0 instead of ~1.9e-18 in the last position,
-        # so let's force a positive value
-
         mel_filter_bank[-1, -1] = 1.
-
-        # binary as in paper (then estimated masks are averaged for overlapping regions)
 
         freqs_per_band = mel_filter_bank > 0
         assert freqs_per_band.any(dim=0).all(), 'all frequencies need to be covered by all bands for now'
 
-        repeated_freq_indices = repeat(torch.arange(freqs), 'f -> b f', b=num_bands)
+        repeated_freq_indices = torch.arange(freqs).expand(num_bands, -1)
         freq_indices = repeated_freq_indices[freqs_per_band]
 
         if stereo:
-            freq_indices = repeat(freq_indices, 'f -> f s', s=2)
-            freq_indices = freq_indices * 2 + torch.arange(2)
-            freq_indices = rearrange(freq_indices, 'f s -> (f s)')
+            freq_indices = freq_indices.unsqueeze(1).expand(-1, self.audio_channels)
+            freq_indices = freq_indices * 2 + torch.arange(self.audio_channels)
+            freq_indices = freq_indices.flatten()
 
         self.register_buffer('freq_indices', freq_indices, persistent=False)
         self.register_buffer('freqs_per_band', freqs_per_band, persistent=False)
 
-        num_freqs_per_band = reduce(freqs_per_band, 'b f -> b', 'sum')
-        num_bands_per_freq = reduce(freqs_per_band, 'b f -> f', 'sum')
+        num_freqs_per_band = freqs_per_band.sum(dim=1)
+        num_bands_per_freq = freqs_per_band.sum(dim=0)
 
         self.register_buffer('num_freqs_per_band', num_freqs_per_band, persistent=False)
         self.register_buffer('num_bands_per_freq', num_bands_per_freq, persistent=False)
 
-        # band split and mask estimator
+        denom = self.num_bands_per_freq.repeat_interleave(self.audio_channels).view(-1, 1, 1)
+        self.register_buffer('denom', 1.0 / denom.clamp(min=1e-8), persistent=False)
 
         freqs_per_bands_with_complex = tuple(2 * f * self.audio_channels for f in num_freqs_per_band.tolist())
 
@@ -381,10 +370,7 @@ class MelBandRoformer(Module):
                 dim_inputs=freqs_per_bands_with_complex,
                 depth=mask_estimator_depth
             )
-
             self.mask_estimators.append(mask_estimator)
-
-        # for the multi-resolution stft loss
 
         self.multi_stft_resolution_loss_weight = multi_stft_resolution_loss_weight
         self.multi_stft_resolutions_window_sizes = multi_stft_resolutions_window_sizes
@@ -398,7 +384,6 @@ class MelBandRoformer(Module):
 
         self.match_input_audio_length = match_input_audio_length
 
-
     def forward(
             self,
             stft_repr,
@@ -406,27 +391,44 @@ class MelBandRoformer(Module):
             target=None,
             return_loss_breakdown=False
     ):
-        stft_repr = rearrange(stft_repr, 'b s f t c -> b (f s) t c')
+        b, s, f, t, c = stft_repr.shape
+
+        stft_repr = stft_repr.permute(0, 2, 1, 3, 4).reshape(b, -1, t, c)
+
         x = stft_repr[:, self.freq_indices]
-        x = rearrange(x, 'b f t c -> b t (f c)')
+
+        x = x.permute(0, 2, 1, 3).reshape(b, t, -1)
+
         x = self.band_split(x)
+
         for time_transformer, freq_transformer in self.layers:
-            x = rearrange(x, 'b t f d -> b f t d')
-            x, ps = pack([x], '* t d')
+            b_t, t_t, f_t, d_t = x.shape
+            x = x.permute(0, 2, 1, 3).reshape(-1, t_t, d_t)
             x = time_transformer(x)
-            x, = unpack(x, ps, '* t d')
-            x = rearrange(x, 'b f t d -> b t f d')
-            x, ps = pack([x], '* f d')
+            x = x.reshape(b_t, f_t, t_t, d_t).permute(0, 2, 1, 3)
+
+            b_f, t_f, f_f, d_f = x.shape
+            x = x.reshape(-1, f_f, d_f)
             x = freq_transformer(x)
-            x, = unpack(x, ps, '* f d')
+            x = x.reshape(b_f, t_f, f_f, d_f)
+
         masks = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)
-        masks = rearrange(masks, 'b n t (f c) -> b n f t c', c=2)
-        stft_repr = rearrange(stft_repr, 'b f t c -> b 1 f t c')
-        scatter_indices = repeat(self.freq_indices, 'f -> b n f t c', b=1, n=1, t=stft_repr.shape[-2], c=2)
-        masks_summed = zeros[:, :, :, :stft_repr.shape[-2]].to(stft_repr.dtype).scatter_add_(2, scatter_indices, masks)
-        denom = repeat(self.num_bands_per_freq, 'f -> (f r) 1 1', r=2)
-        masks_averaged = masks_summed / denom.clamp(min=1e-8)
-        stft_repr = stft_repr * masks_averaged
-        stft_repr = rearrange(stft_repr, 'b 1 (f s) t c ->  (b s) f t c', s=2)
-        real_part, imag_part = torch.chunk(stft_repr, 2, dim=-1)
-        return real_part.squeeze(-1), imag_part.squeeze(-1)
+
+        b_m, n_m, t_m, _ = masks.shape
+        masks = masks.view(b_m, n_m, t_m, -1, 2).permute(0, 1, 3, 2, 4)
+
+        stft_repr = stft_repr.unsqueeze(1)
+
+        time_dim = stft_repr.shape[-2]
+        scatter_indices = self.freq_indices.view(1, 1, -1, 1, 1).expand(-1, -1, -1, time_dim, 2)
+
+        masks_summed = zeros[:, :, :, :time_dim].to(stft_repr.dtype).scatter_add_(2, scatter_indices, masks)
+
+        masks_averaged = masks_summed * self.denom
+        masked_stft = stft_repr * masks_averaged
+
+        b_o, n_o, _, t_o, c_o = masked_stft.shape
+
+        output_stft = masked_stft.view(b_o, n_o, self.num_freqs, self.audio_channels, t_o, c_o).permute(0, 1, 3, 2, 4, 5).reshape(-1, self.num_freqs, t_o, c_o)
+
+        return output_stft[..., 0], output_stft[..., 1]

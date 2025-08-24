@@ -78,7 +78,7 @@ class GTCRN_CUSTOM(torch.nn.Module):
         s_real, s_imag = self.gtcrn(magnitude, real_part, imag_part)
         audio = self.istft_model(s_real, s_imag)
         if SAMPLE_RATE_SCALE < 1.0:
-            audio = audio.clamp(min=-1.0, max=1.0) * 32767.0
+            audio *= 32767.0
             if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 16000:
                 audio = torch.nn.functional.interpolate(
                     audio,
@@ -94,8 +94,8 @@ class GTCRN_CUSTOM(torch.nn.Module):
                     mode='linear',
                     align_corners=True
                 )
-            audio = audio.clamp(min=-1.0, max=1.0) * 32767.0
-        return audio.to(torch.int16)
+            audio *= 32767.0
+        return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 
 print('Export start ...')

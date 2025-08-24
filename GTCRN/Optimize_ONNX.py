@@ -39,7 +39,7 @@ slim(
 # transformers.optimizer
 model = optimize_model(optimized_model_path,
                        use_gpu=use_gpu_fp16,
-                       opt_level=99 if (target_platform == "amd64") and not use_gpu_fp16 else 2,
+                       opt_level=2,
                        num_heads=0,
                        hidden_size=0,
                        provider=provider,

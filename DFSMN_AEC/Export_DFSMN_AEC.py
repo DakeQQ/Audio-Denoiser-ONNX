@@ -21,7 +21,7 @@ save_aec_output = "./aec.wav"                                              # The
 
 
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-KEEP_ORIGINAL_SAMPLE_RATE = False       # If False, the model outputs audio at 16kHz; otherwise, it uses the original sample rate.
+KEEP_ORIGINAL_SAMPLE_RATE = True        # If False, the model outputs audio at 16kHz; otherwise, it uses the original sample rate.
 SAMPLE_RATE = 16000                     # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 INPUT_AUDIO_LENGTH = 16001              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
 MAX_SIGNAL_LENGTH = 2048 if DYNAMIC_AXES else 256  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
@@ -496,15 +496,18 @@ near_end_audio = near_end_audio.reshape(1, 1, -1)
 far_end_audio = far_end_audio.reshape(1, 1, -1)
 
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
+shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
 if isinstance(shape_value_in, str):
     INPUT_AUDIO_LENGTH = max(20 * SAMPLE_RATE, min_len)  # Default to slice in 20 seconds. You can adjust it.
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
-stride_step = INPUT_AUDIO_LENGTH
 
 
 def align_audio(audio, audio_len):
+    stride_step = INPUT_AUDIO_LENGTH
     if audio_len > INPUT_AUDIO_LENGTH:
+        if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (KEEP_ORIGINAL_SAMPLE_RATE):
+            stride_step = shape_value_out
         num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
         total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
         pad_amount = total_length_needed - audio_len
@@ -516,11 +519,11 @@ def align_audio(audio, audio_len):
         white_noise = (np.sqrt(np.mean(audio_float * audio_float, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
         audio = np.concatenate((audio, white_noise), axis=-1)
     aligned_len = audio.shape[-1]
-    return audio, aligned_len
+    return audio, aligned_len, stride_step
 
 
-near_end_audio, _ = align_audio(near_end_audio, min_len)
-far_end_audio, aligned_len = align_audio(far_end_audio, min_len)
+near_end_audio, _, _ = align_audio(near_end_audio, min_len)
+far_end_audio, aligned_len, stride_step = align_audio(far_end_audio, min_len)
 
 if SAMPLE_RATE != 16000 and not KEEP_ORIGINAL_SAMPLE_RATE:
     SAMPLE_RATE = 16000

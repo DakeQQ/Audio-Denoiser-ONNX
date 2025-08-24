@@ -9,7 +9,7 @@ import torchaudio
 import soundfile as sf
 from pydub import AudioSegment
 from concurrent.futures import ThreadPoolExecutor
-from STFT_Process import STFT_Process                                    # The custom STFT/ISTFT can be exported in ONNX format.
+from STFT_Process import STFT_Process                                      # The custom STFT/ISTFT can be exported in ONNX format.
 
 
 project_path_A = "/home/DakeQQ/Downloads/speech_dfsmn_aec_psm_16k"         # The DFSMN AEC download path.
@@ -21,9 +21,10 @@ save_aec_output = "./aec.wav"                                              # The
 
 
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-MAX_SIGNAL_LENGTH = 2048 if DYNAMIC_AXES else 192  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
+KEEP_ORIGINAL_SAMPLE_RATE = False       # If False, the model outputs audio at 16kHz; otherwise, it uses the original sample rate.
+SAMPLE_RATE = 16000                     # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 INPUT_AUDIO_LENGTH = 16001              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
-SAMPLE_RATE = 16000                     # The models parameter, do not edit the value.
+MAX_SIGNAL_LENGTH = 2048 if DYNAMIC_AXES else 256  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
 
 # DFSMN_AEC
@@ -41,6 +42,8 @@ NFFT_B = 319                            # Number of FFT components for the STFT 
 WINDOW_LENGTH_B = 319                   # Length of windowing, edit it carefully.
 HOP_LENGTH_B = 160                      # Number of samples between successive frames in the STFT
 ALPHA_K = 10                            # The SDAEC parameter, do not edit the value.
+
+SAMPLE_RATE_SCALE = float(16000.0 / SAMPLE_RATE)
 
 
 shutil.copyfile('./modeling_modified/uni_deep_fsmn.py', site.getsitepackages()[-1] + '/modelscope/models/audio/aec/layers/uni_deep_fsmn.py')
@@ -300,6 +303,7 @@ class DFSMN_AEC(torch.nn.Module):
         self.pre_emphasis = torch.tensor(pre_emphasis, dtype=torch.float32)
         self.fbank = (torchaudio.functional.melscale_fbanks(nfft_A // 2 + 1, 20, sample_rate // 2, n_mels, sample_rate, None,'htk')).transpose(0, 1).unsqueeze(0)
         self.factor = float(1.15)  # Experiment value
+        self.sample_rate = sample_rate
 
     def onnx_friendly_unfold(self, input_tensor):
         num_frames = input_tensor.shape[-1] - self.k_minus
@@ -308,10 +312,44 @@ class DFSMN_AEC(torch.nn.Module):
         return unfolded
 
     def forward(self, near_end_audio, far_end_audio):
-        near_end_audio = near_end_audio.float() * self.inv_int16
-        far_end_audio = far_end_audio.float() * self.inv_int16
-        near_end_audio = near_end_audio - torch.mean(near_end_audio)
-        far_end_audio = far_end_audio - torch.mean(far_end_audio)
+        near_end_audio = near_end_audio.float()
+        far_end_audio = far_end_audio.float()
+        if SAMPLE_RATE_SCALE < 1.0:
+            near_end_audio *= self.inv_int16
+            far_end_audio *= self.inv_int16
+            near_end_audio = near_end_audio - torch.mean(near_end_audio)
+            far_end_audio = far_end_audio - torch.mean(far_end_audio)
+            if self.sample_rate != 16000:
+                near_end_audio = torch.nn.functional.interpolate(
+                    near_end_audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+                far_end_audio = torch.nn.functional.interpolate(
+                    far_end_audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+        else:
+            if self.sample_rate != 16000:
+                near_end_audio = torch.nn.functional.interpolate(
+                    near_end_audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+                far_end_audio = torch.nn.functional.interpolate(
+                    far_end_audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+            near_end_audio *= self.inv_int16
+            far_end_audio *= self.inv_int16
+            near_end_audio = near_end_audio - torch.mean(near_end_audio)
+            far_end_audio = far_end_audio - torch.mean(far_end_audio)
         near_real_part_B, near_imag_part_B = self.custom_stft_B(near_end_audio, 'constant')
         far_real_part, far_imag_part = self.custom_stft_B(far_end_audio, 'constant')
         mix_comp = torch.cat([near_real_part_B, near_imag_part_B], dim=0).unsqueeze(0)
@@ -348,8 +386,26 @@ class DFSMN_AEC(torch.nn.Module):
         masks = masks.transpose(1, 2)
         temp_aec_real_part_A2 *= masks
         temp_aec_imag_part_A2 *= masks
-        aec_audio = custom_istft_A2(temp_aec_real_part_A2, temp_aec_imag_part_A2)
-        return (aec_audio.clamp(min=-1.0, max=1.0) * 32767).to(torch.int16)
+        audio = custom_istft_A2(temp_aec_real_part_A2, temp_aec_imag_part_A2)
+        if SAMPLE_RATE_SCALE < 1.0:
+            audio *= 32767.0
+            if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 16000:
+                audio = torch.nn.functional.interpolate(
+                    audio,
+                    scale_factor=1.0 / SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+        else:
+            if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 16000:
+                audio = torch.nn.functional.interpolate(
+                    audio,
+                    scale_factor=1.0 / SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+            audio *= 32767.0
+        return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 
 print('Export start ...')
@@ -436,23 +492,18 @@ far_nd_audio_len = len(far_end_audio)
 min_len = min(near_end_audio_len, far_nd_audio_len)
 near_end_audio = normalize_to_int16(near_end_audio[:min_len])
 far_end_audio = normalize_to_int16(far_end_audio[:min_len])
-inv_audio_len = float(100.0 / min_len)
 near_end_audio = near_end_audio.reshape(1, 1, -1)
 far_end_audio = far_end_audio.reshape(1, 1, -1)
 
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
-shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
 if isinstance(shape_value_in, str):
-    INPUT_AUDIO_LENGTH = min(20 * SAMPLE_RATE, min_len)  # Default to slice in 20 seconds. You can adjust it.
+    INPUT_AUDIO_LENGTH = max(20 * SAMPLE_RATE, min_len)  # Default to slice in 20 seconds. You can adjust it.
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
-
+stride_step = INPUT_AUDIO_LENGTH
 
 def align_audio(audio, audio_len):
-    stride_step = INPUT_AUDIO_LENGTH
     if audio_len > INPUT_AUDIO_LENGTH:
-        if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int):
-            stride_step = shape_value_out
         num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
         total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
         pad_amount = total_length_needed - audio_len
@@ -464,11 +515,16 @@ def align_audio(audio, audio_len):
         white_noise = (np.sqrt(np.mean(audio_float * audio_float, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
         audio = np.concatenate((audio, white_noise), axis=-1)
     aligned_len = audio.shape[-1]
-    return audio, aligned_len, stride_step
+    return audio, aligned_len
 
 
-near_end_audio, _, _ = align_audio(near_end_audio, min_len)
-far_end_audio, aligned_len, stride_step = align_audio(far_end_audio, min_len)
+near_end_audio, _ = align_audio(near_end_audio, min_len)
+far_end_audio, aligned_len = align_audio(far_end_audio, min_len)
+
+if SAMPLE_RATE != 16000 and not KEEP_ORIGINAL_SAMPLE_RATE:
+    SAMPLE_RATE = 16000
+    min_len = int(min_len * SAMPLE_RATE_SCALE)
+inv_audio_len = float(100.0 / min_len)
 
 
 def process_segment(_inv_audio_len, _slice_start, _slice_end, _near_end_audio, _far_end_audio):
@@ -499,4 +555,3 @@ print(f"Complete: 100.00%")
 # Save the denoised wav.
 sf.write(save_aec_output, denoised_wav, SAMPLE_RATE, format='WAVEX')
 print(f"\nAEC Process Complete.\n\nSaving to: {save_aec_output}.\n\nTime Cost: {end_time - start_time:.3f} Seconds")
-

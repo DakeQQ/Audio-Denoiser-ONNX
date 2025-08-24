@@ -15,20 +15,24 @@ from STFT_Process import STFT_Process                                           
 project_path = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main"                        # The Mel-Band-Roformer GitHub project path.
 model_path = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main/MelBandRoformer.ckpt"     # The model download path.
 onnx_model_A = "/home/DakeQQ/Downloads/MelBandRoformer_ONNX/MelBandRoformer.onnx"                 # The exported onnx model path.
-test_noisy_audio = "./test.wav"                                                                 # The noisy audio path.
-save_denoised_audio = "./test_denoised.wav"                                                     # The output denoised audio path.
+test_noisy_audio = "./test.wav"                                                                   # The noisy audio path.
+save_denoised_audio = "./test_denoised.wav"                                                       # The output denoised audio path.
 
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
+KEEP_ORIGINAL_SAMPLE_RATE = True        # If False, the model outputs audio at 16kHz; otherwise, it uses the original sample rate.
+SAMPLE_RATE = 44100                     # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 INPUT_AUDIO_LENGTH = 44100              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 22050 and less than 362800. Higher values yield better quality but time consume. It is better to set an integer multiple of the HOP_LENGTH value.
-MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else (INPUT_AUDIO_LENGTH // 100 + 1)  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
+MAX_SIGNAL_LENGTH = 2048 if DYNAMIC_AXES else (INPUT_AUDIO_LENGTH // 50 + 1)  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
 WINDOW_TYPE = 'hann'                    # Type of window function used in the STFT
 NFFT = 2048                             # Number of FFT components for the STFT process
-WINDOW_LENGTH = 1920                     # Length of windowing, edit it carefully.
+WINDOW_LENGTH = 2048                    # Length of windowing, edit it carefully.
 HOP_LENGTH = 441                        # Number of samples between successive frames in the STFT
-SAMPLE_RATE = 44100                     # The MelBandRoformer parameter, do not edit the value.
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
+
+
+SAMPLE_RATE_SCALE = float(44100.0 / SAMPLE_RATE)
 
 
 def normalize_to_int16(audio):
@@ -38,16 +42,35 @@ def normalize_to_int16(audio):
   
 
 class MelBandRoformer_Modified(torch.nn.Module):
-    def __init__(self, mel_band_roformer, stft_model, istft_model, nfft, max_signal_len):
+    def __init__(self, mel_band_roformer, stft_model, istft_model, nfft, max_signal_len, sample_rate):
         super(MelBandRoformer_Modified, self).__init__()
         self.mel_band_roformer = mel_band_roformer
         self.stft_model = stft_model
         self.istft_model = istft_model
         self.inv_int16 = float(1.0 / 32768.0)
         self.zeros = torch.zeros((1, 1, (nfft // 2 + 1) * 2, max_signal_len, 2), dtype=torch.int8)
+        self.sample_rate = sample_rate
 
     def forward(self, audio):
-        audio = audio * self.inv_int16
+        audio = audio.float()
+        if SAMPLE_RATE_SCALE < 1.0:
+            audio *= self.inv_int16
+            if self.sample_rate != 44100:
+                audio = torch.nn.functional.interpolate(
+                    audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+        else:
+            if self.sample_rate != 44100:
+                audio = torch.nn.functional.interpolate(
+                    audio,
+                    scale_factor=SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+            audio *= self.inv_int16
         audio_L, audio_R = torch.split(audio, [1, 1], dim=1)
         real_L, imag_L = self.stft_model(audio_L, 'constant')
         real_R, imag_R = self.stft_model(audio_R, 'constant')
@@ -60,7 +83,25 @@ class MelBandRoformer_Modified(torch.nn.Module):
         audio_L = custom_istft(real_L, imag_L)
         audio_R = custom_istft(real_R, imag_R)
         audio = torch.cat((audio_L, audio_R), dim=1)
-        return (audio.clamp(min=-1.0, max=1.0) * 32767.0).to(torch.int16)
+        if SAMPLE_RATE_SCALE < 1.0:
+            audio *= 32767.0
+            if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 44100:
+                audio = torch.nn.functional.interpolate(
+                    audio,
+                    scale_factor=1.0 / SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+        else:
+            if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 44100:
+                audio = torch.nn.functional.interpolate(
+                    audio,
+                    scale_factor=1.0 / SAMPLE_RATE_SCALE,
+                    mode='linear',
+                    align_corners=True
+                )
+            audio *= 32767.0
+        return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 
 print('Export start ...')
@@ -71,7 +112,7 @@ with torch.inference_mode():
       config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
     model = MelBandRoformer(**dict(config.model))
     model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-    mel_band_roformer = MelBandRoformer_Modified(model.eval(), custom_stft, custom_istft, NFFT, MAX_SIGNAL_LENGTH)
+    mel_band_roformer = MelBandRoformer_Modified(model.eval(), custom_stft, custom_istft, NFFT, MAX_SIGNAL_LENGTH, SAMPLE_RATE)
     audio = torch.ones((1, 2, INPUT_AUDIO_LENGTH), dtype=torch.int16)
     torch.onnx.export(
         mel_band_roformer,
@@ -97,7 +138,7 @@ print('\nExport done!\n\nStart to run MelBandRoformer by ONNX Runtime.\n\nNow, l
 
 # ONNX Runtime settings
 session_opts = onnxruntime.SessionOptions()
-session_opts.log_severity_level = 3         # error level, it an adjustable value.
+session_opts.log_severity_level = 4         # Fatal level, it an adjustable value.
 session_opts.inter_op_num_threads = 0       # Run different nodes with num_threads. Set 0 for auto.
 session_opts.intra_op_num_threads = 0       # Under the node, execute the operators with num_threads. Set 0 for auto.
 session_opts.enable_cpu_mem_arena = True    # True for execute speed; False for less memory usage.
@@ -128,7 +169,6 @@ if audio_channels == 1:
 else:
     audio = audio.reshape(1, -1, 2).transpose(0, 2, 1)
 audio_len = audio.shape[-1]
-inv_audio_len = float(100.0 / audio_len)
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 shape_value_in_channel = ort_session_A._inputs_meta[0].shape[1]
 shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
@@ -138,7 +178,7 @@ else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
 if audio_len > INPUT_AUDIO_LENGTH:
-    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int):
+    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (KEEP_ORIGINAL_SAMPLE_RATE):
         stride_step = shape_value_out
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
@@ -151,6 +191,11 @@ elif audio_len < INPUT_AUDIO_LENGTH:
     white_noise = (np.sqrt(np.mean(audio_float * audio_float, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(1, shape_value_in_channel, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
     audio = np.concatenate((audio, white_noise), axis=-1)
 aligned_len = audio.shape[-1]
+inv_audio_len = float(100.0 / aligned_len)
+
+if SAMPLE_RATE != 44100 and not KEEP_ORIGINAL_SAMPLE_RATE:
+    SAMPLE_RATE = 44100
+    audio_len = int(audio_len * SAMPLE_RATE_SCALE)
 
 
 def process_segment(_inv_audio_len, _slice_start, _slice_end, _audio):
@@ -174,7 +219,7 @@ with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:  # Parallel denois
         print(f"Complete: {results[-1][0]:.3f}%")
 results.sort(key=lambda x: x[0])
 saved = [result[1] for result in results]
-denoised_wav = np.concatenate(saved, axis=-1)[0, :, :audio_len].transpose()
+denoised_wav = np.concatenate(saved, axis=-1).reshape(2, -1).transpose()[:audio_len]
 end_time = time.time()
 print(f"Complete: 100.00%")
 

@@ -80,7 +80,7 @@ class MOSSFORMER_SE(torch.nn.Module):
 
     def forward(self, audio):
         audio = audio.float()
-        if SAMPLE_RATE_SCALE > 0.0:
+        if SAMPLE_RATE_SCALE < 0.0:
             audio = audio - torch.mean(audio)
             if self.sample_rate != 48000:
                 audio = torch.nn.functional.interpolate(

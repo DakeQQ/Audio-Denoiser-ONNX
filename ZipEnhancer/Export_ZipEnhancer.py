@@ -182,7 +182,7 @@ elif audio_len < INPUT_AUDIO_LENGTH:
     white_noise = (np.sqrt(np.mean(audio_float * audio_float, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(1, 1, INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
     audio = np.concatenate((audio, white_noise), axis=-1)
 aligned_len = audio.shape[-1]
-inv_audio_len = float(100.0 / audio_len)
+inv_audio_len = float(100.0 / aligned_len)
 
 
 if SAMPLE_RATE != 16000 and not KEEP_ORIGINAL_SAMPLE_RATE:

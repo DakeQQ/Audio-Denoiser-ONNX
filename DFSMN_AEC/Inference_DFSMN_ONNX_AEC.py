@@ -15,7 +15,8 @@ ORT_Accelerate_Providers = []           # If you have accelerate devices for : [
                                         # else keep empty.
 MAX_THREADS = 4                         # Number of parallel threads for audio denoising.
 DEVICE_ID = 0                           # The GPU id, default to 0.
-SAMPLE_RATE = 16000                     # The SDAEC parameter, do not edit the value.
+SAMPLE_RATE = 16000                     # Keep the same value as the exported model.
+KEEP_ORIGINAL_SAMPLE_RATE = True       # Keep the same value as the exported model.
 
 
 if "OpenVINOExecutionProvider" in ORT_Accelerate_Providers:
@@ -111,7 +112,6 @@ far_nd_audio_len = len(far_end_audio)
 min_len = min(near_end_audio_len, far_nd_audio_len)
 near_end_audio = normalize_to_int16(near_end_audio[:min_len])
 far_end_audio = normalize_to_int16(far_end_audio[:min_len])
-inv_audio_len = float(100.0 / min_len)
 near_end_audio = near_end_audio.reshape(1, 1, -1)
 far_end_audio = far_end_audio.reshape(1, 1, -1)
 
@@ -126,7 +126,7 @@ else:
 def align_audio(audio, audio_len):
     stride_step = INPUT_AUDIO_LENGTH
     if audio_len > INPUT_AUDIO_LENGTH:
-        if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int):
+        if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (KEEP_ORIGINAL_SAMPLE_RATE):
             stride_step = shape_value_out
         num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
         total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
@@ -144,6 +144,13 @@ def align_audio(audio, audio_len):
 
 near_end_audio, _, _ = align_audio(near_end_audio, min_len)
 far_end_audio, aligned_len, stride_step = align_audio(far_end_audio, min_len)
+
+
+if SAMPLE_RATE != 16000 and not KEEP_ORIGINAL_SAMPLE_RATE:
+    SAMPLE_RATE_SCALE = float(16000.0 / SAMPLE_RATE)
+    min_len = int(min_len * SAMPLE_RATE_SCALE)
+    SAMPLE_RATE = 16000
+inv_audio_len = float(100.0 / min_len)
 
 
 def process_segment(_inv_audio_len, _slice_start, _slice_end, _near_end_audio, _far_end_audio):

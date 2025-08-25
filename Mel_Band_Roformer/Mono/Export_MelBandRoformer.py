@@ -86,23 +86,23 @@ class MelBandRoformer_Modified(torch.nn.Module):
         real_m, imag_m = self.mel_band_roformer(stft_repr, self.zeros)
 
         # iSTFT for mono
-        audio_m = self.istft_model(real_m, imag_m)       # (B, 1, T)
+        audio = self.istft_model(real_m, imag_m)       # (B, 1, T)
 
         # Resample back to original rate if needed and scale back to int16 range
         if SAMPLE_RATE_SCALE < 1.0:
-            audio_m *= 32767.0
+            audio *= 32767.0
             if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 44100:
-                audio_m = torch.nn.functional.interpolate(
-                    audio_m, scale_factor=1.0 / SAMPLE_RATE_SCALE, mode='linear', align_corners=True
+                audio = torch.nn.functional.interpolate(
+                    audio, scale_factor=1.0 / SAMPLE_RATE_SCALE, mode='linear', align_corners=True
                 )
         else:
             if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 44100:
-                audio_m = torch.nn.functional.interpolate(
-                    audio_m, scale_factor=1.0 / SAMPLE_RATE_SCALE, mode='linear', align_corners=True
+                audio = torch.nn.functional.interpolate(
+                    audio, scale_factor=1.0 / SAMPLE_RATE_SCALE, mode='linear', align_corners=True
                 )
-            audio_m *= 32767.0
+            audio *= 32767.0
 
-        return audio_m.clamp(min=-32768.0, max=32767.0).to(torch.int16)
+        return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 
 def _unwrap_state_dict(state):

@@ -10,14 +10,14 @@ import torch.nn as nn
 import soundfile as sf
 from pydub import AudioSegment
 from modeling_modified.mel_band_roformer import MelBandRoformer
-from STFT_Process import STFT_Process  # The custom STFT/ISTFT can be exported in ONNX format.
+from STFT_Process import STFT_Process                                                             # The custom STFT/ISTFT can be exported in ONNX format.
 
 
-project_path = "/home/iamj/Downloads/Mel-Band-Roformer-Vocal-Model-main"                        # The Mel-Band-Roformer GitHub project path.
-model_path = "/home/iamj/Downloads/Mel-Band-Roformer-Vocal-Model-main/MelBandRoformer.ckpt"     # The model download path.
-onnx_model_A = "/home/iamj/Downloads/MelBandRoformer_ONNX/MelBandRoformer.onnx"                 # The exported onnx model path.
-test_noisy_audio = "./test.wav"                                                                  # The noisy audio path.
-save_denoised_audio = "./test_denoised.wav"                                                      # The output denoised audio path.
+project_path = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main"                        # The Mel-Band-Roformer GitHub project path.
+model_path = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main/MelBandRoformer.ckpt"     # The model download path.
+onnx_model_A = "/home/DakeQQ/Downloads/MelBandRoformer_ONNX/MelBandRoformer.onnx"                 # The exported onnx model path.
+test_noisy_audio = "./test.wav"                                                                   # The noisy audio path.
+save_denoised_audio = "./test_denoised.wav"                                                       # The output denoised audio path.
 
 ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.

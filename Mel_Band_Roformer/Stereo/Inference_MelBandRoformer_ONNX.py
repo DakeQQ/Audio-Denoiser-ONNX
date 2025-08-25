@@ -40,7 +40,7 @@ elif "CUDAExecutionProvider" in ORT_Accelerate_Providers:
             'device_id': DEVICE_ID,
             'gpu_mem_limit': 24 * 1024 * 1024 * 1024,     # 24 GB
             'arena_extend_strategy': 'kNextPowerOfTwo',   # ["kNextPowerOfTwo", "kSameAsRequested"]
-            'cudnn_conv_algo_search': 'EXHAUSTIVE',       # ["DEFAULT", "HEURISTIC", "EXHAUSTIVE"]   The MossFormer_SE must using DEFAULT.
+            'cudnn_conv_algo_search': 'EXHAUSTIVE',       # ["DEFAULT", "HEURISTIC", "EXHAUSTIVE"] 
             'sdpa_kernel': '2',                           # ["0", "1", "2"]
             'use_tf32': '1',
             'fuse_conv_bias': '0',                        # Set to '0' to avoid potential errors when enabled.

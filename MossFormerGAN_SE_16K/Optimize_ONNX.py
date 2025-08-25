@@ -37,7 +37,7 @@ slim(
 # transformers.optimizer
 model = optimize_model(optimized_model_path,
                        use_gpu=use_gpu_fp16,
-                       opt_level=2,
+                       opt_level=1 if use_gpu_fp16 else 2,
                        num_heads=4,
                        hidden_size=128,
                        provider=provider,

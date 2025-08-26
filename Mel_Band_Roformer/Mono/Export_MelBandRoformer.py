@@ -122,10 +122,10 @@ def _unwrap_state_dict(state):
 
 def convert_stereo_to_mono_weights(stereo_model: MelBandRoformer, mono_model: MelBandRoformer):
     """
-    Fold a stereo checkpoint loaded in stereo_model into mono_model:
-    - BandSplit RMSNorm gamma: sum L and R per (real, imag) -> keep (real, imag)
-    - BandSplit Linear: sum corresponding L/R columns; bias copied
-    - MaskEstimator MLP last Linear (pre-GLU): sum corresponding L/R rows per (real, imag) in both GLU halves; bias summed similarly
+    Fold a stereo checkpoint loaded in stereo_model into mono_model by averaging weights:
+    - BandSplit RMSNorm gamma: average L and R per (real, imag) -> keep (real, imag)
+    - BandSplit Linear: average corresponding L/R columns; bias copied
+    - MaskEstimator MLP last Linear (pre-GLU): average corresponding L/R rows per (real, imag) in both GLU halves; bias averaged similarly
     All other matching-shaped params are copied directly.
     """
     with torch.no_grad():
@@ -143,12 +143,12 @@ def convert_stereo_to_mono_weights(stereo_model: MelBandRoformer, mono_model: Me
             mo_feat = mono_model.band_split.to_features[b]
             fi = int(mono_model.num_freqs_per_band[b].item())  # frequencies in this band
 
-            # RMSNorm gamma: (4fi,) -> (2fi,) by summing L/R for real,imag
+            # RMSNorm gamma: (4fi,) -> (2fi,) by averaging L/R for real,imag
             gamma_st = st_feat[0].gamma.data  # (4fi,)
             gamma_st_v = gamma_st.view(fi, 4)  # [real_L, imag_L, real_R, imag_R]
             gamma_m = torch.stack([
-                gamma_st_v[:, 0] + gamma_st_v[:, 2],  # real
-                gamma_st_v[:, 1] + gamma_st_v[:, 3],  # imag
+                (gamma_st_v[:, 0] + gamma_st_v[:, 2]) * 0.5,  # real
+                (gamma_st_v[:, 1] + gamma_st_v[:, 3]) * 0.5,  # imag
             ], dim=-1).reshape(-1)
             mo_feat[0].gamma.data.copy_(gamma_m)
 
@@ -157,8 +157,8 @@ def convert_stereo_to_mono_weights(stereo_model: MelBandRoformer, mono_model: Me
             dim_out = Wst.shape[0]
             Wst_v = Wst.view(dim_out, fi, 4)
             Wm_v = torch.empty((dim_out, fi, 2), dtype=Wst.dtype, device=Wst.device)
-            Wm_v[:, :, 0] = Wst_v[:, :, 0] + Wst_v[:, :, 2]  # real L+R
-            Wm_v[:, :, 1] = Wst_v[:, :, 1] + Wst_v[:, :, 3]  # imag L+R
+            Wm_v[:, :, 0] = (Wst_v[:, :, 0] + Wst_v[:, :, 2]) * 0.5  # real L+R
+            Wm_v[:, :, 1] = (Wst_v[:, :, 1] + Wst_v[:, :, 3]) * 0.5  # imag L+R
             mo_feat[1].weight.data.copy_(Wm_v.reshape(dim_out, 2 * fi))
             mo_feat[1].bias.data.copy_(st_feat[1].bias.data)
 
@@ -183,16 +183,16 @@ def convert_stereo_to_mono_weights(stereo_model: MelBandRoformer, mono_model: Me
                 bst_v = bst.view(2, 4 * fi)
 
                 def fold_rows(W_part):
-                    # (4fi, hidden) -> (2fi, hidden) by summing L/R in each (real, imag)
+                    # (4fi, hidden) -> (2fi, hidden) by averaging L/R in each (real, imag)
                     Wp = W_part.view(fi, 4, hidden)  # [real_L, imag_L, real_R, imag_R]
                     out = torch.empty(fi, 2, hidden, dtype=W_part.dtype, device=W_part.device)
-                    out[:, 0] = Wp[:, 0] + Wp[:, 2]  # real
-                    out[:, 1] = Wp[:, 1] + Wp[:, 3]  # imag
+                    out[:, 0] = (Wp[:, 0] + Wp[:, 2]) * 0.5  # real
+                    out[:, 1] = (Wp[:, 1] + Wp[:, 3]) * 0.5  # imag
                     return out.view(2 * fi, hidden)
 
                 def fold_bias(b_part):
                     bp = b_part.view(fi, 4)
-                    out = torch.stack([bp[:, 0] + bp[:, 2], bp[:, 1] + bp[:, 3]], dim=-1)
+                    out = torch.stack([(bp[:, 0] + bp[:, 2]) * 0.5, (bp[:, 1] + bp[:, 3]) * 0.5], dim=-1)
                     return out.view(2 * fi)
 
                 W_A_new = fold_rows(Wst_v[0])

@@ -397,7 +397,7 @@ class MelBandRoformer(Module):
             b_t, t_t, f_t, d_t = x.shape
             x = x.permute(0, 2, 1, 3).reshape(-1, t_t, d_t)
             x = time_transformer(x, rotary_cos, rotary_sin)
-            x = x.reshape(b_t, f_t, t_t, d_t).permute(0, 2, 1, 3)
+            x = x.reshape(b_t, f_t, t_t, d_t).transpose(1, 2)
 
             b_f, t_f, f_f, d_f = x.shape
             x = x.reshape(-1, f_f, d_f)
@@ -406,7 +406,7 @@ class MelBandRoformer(Module):
 
         masks = torch.cat([fn(x) for fn in self.mask_estimators], dim=1)  # (b, n, t, selected_freqs * c)
         n_m, _ = masks.shape
-        masks = masks.view(n_m, -1, 2).transpose(0, 1).unsqueeze(0)   # (b, n, selected_freqs, t, 2)
+        masks = masks.view(1, n_m, -1, 2).transpose(1, 2)  # (b, n, selected_freqs, t, 2)
 
         time_dim = stft_repr.shape[-2]
         scatter_indices = self.scatter_indices.expand(-1, -1, time_dim, 2)

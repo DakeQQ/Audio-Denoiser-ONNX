@@ -1,4 +1,6 @@
 import gc
+import os
+import glob
 import time
 import yaml
 from ml_collections import ConfigDict
@@ -14,7 +16,7 @@ from STFT_Process import STFT_Process                                           
 
 
 project_path = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main"                        # The Mel-Band-Roformer GitHub project path.
-model_path = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main/MelBandRoformer.ckpt"     # The model download path.
+model_path = project_path + "/MelBandRoformer.ckpt"                                               # The downloaded model.
 onnx_model_A = "/home/DakeQQ/Downloads/MelBandRoformer_ONNX/MelBandRoformer.onnx"                 # The exported onnx model path.
 test_noisy_audio = "./test.wav"                                                                   # The noisy audio path.
 save_denoised_audio = "./test_denoised.wav"                                                       # The output denoised audio path.
@@ -215,9 +217,18 @@ with torch.inference_mode():
     custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
 
     # Load config
-    with open(project_path + "/configs/config_vocals_mel_band_roformer.yaml") as f:
-        config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
+    search_pattern = os.path.join(project_path, "**", "*.yaml")
+    yaml_files = glob.glob(search_pattern, recursive=True)
+    if not yaml_files:
+        raise FileNotFoundError(f"No YAML configuration file (.yaml) found anywhere in {project_path}")
+    elif len(yaml_files) > 1:
+        print(f"Warning: Multiple YAML files found in project. Using the first one found: {yaml_files[0]}")
+    config_path = yaml_files[0]
+    print(f"Loading configuration from: {config_path}")
 
+    with open(config_path) as f:
+        config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
+      
     # Build and load a temporary stereo model strictly from checkpoint
     stereo_cfg = dict(config.model)
     stereo_cfg['stereo'] = True

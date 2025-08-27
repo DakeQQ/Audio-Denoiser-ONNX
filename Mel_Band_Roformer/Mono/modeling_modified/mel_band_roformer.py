@@ -383,10 +383,10 @@ class MelBandRoformer(Module):
         # stft_repr: (b, s, f, t, c), c=2 complex
         b, s_in, f, t, c = stft_repr.shape
 
-        stft_repr = stft_repr.permute(0, 2, 1, 3, 4).reshape(b, -1, t, c)  # (b, f*s_in, t, c)
+        stft_repr = stft_repr.transpose(1, 2).reshape(b, -1, t, c)  # (b, f*s_in, t, c)
 
         x = stft_repr[:, self.freq_indices_eff]            # (b, selected_freqs, t, c)
-        x = x.permute(0, 2, 1, 3).reshape(b, t, -1)        # (b, t, selected_freqs * c)
+        x = x.transpose(1, 2).reshape(b, t, -1)        # (b, t, selected_freqs * c)
 
         x = self.band_split(x)                             # (b, t, num_bands, dim)
 
@@ -395,7 +395,7 @@ class MelBandRoformer(Module):
 
         for time_transformer, freq_transformer in self.layers:
             b_t, t_t, f_t, d_t = x.shape
-            x = x.permute(0, 2, 1, 3).reshape(-1, t_t, d_t)
+            x = x.transpose(1, 2).reshape(-1, t_t, d_t)
             x = time_transformer(x, rotary_cos, rotary_sin)
             x = x.reshape(b_t, f_t, t_t, d_t).transpose(1, 2)
 

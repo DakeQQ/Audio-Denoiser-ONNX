@@ -63,7 +63,7 @@ if use_gpu_fp16:
         keep_io_types=False,
         force_fp16_initializers=True,
         use_symbolic_shape_infer=True,
-        op_block_list=['DynamicQuantizeLinear', 'DequantizeLinear', 'DynamicQuantizeMatMul', 'Range', 'MatMulIntegerToFloat', 'ScatterElements']
+        op_block_list=['DynamicQuantizeLinear', 'DequantizeLinear', 'DynamicQuantizeMatMul', 'Range', 'MatMulIntegerToFloat']
     )
 model.save_model_to_file(optimized_model_path, use_external_data_format=False)
 del model

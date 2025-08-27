@@ -218,7 +218,7 @@ class MaskEstimator(Module):
             self.to_freqs.append(mlp)
 
     def forward(self, x):
-        x = x.squeeze(0).unbind(dim=-2)
+        x = x.unbind(dim=-2)
         outs = []
         for band_features, mlp in zip(x, self.to_freqs):
             outs.append(mlp(band_features))
@@ -386,23 +386,18 @@ class MelBandRoformer(Module):
         stft_repr = stft_repr.transpose(1, 2).reshape(b, -1, t, c)  # (b, f*s_in, t, c)
 
         x = stft_repr[:, self.freq_indices_eff]            # (b, selected_freqs, t, c)
-        x = x.transpose(1, 2).reshape(b, t, -1)        # (b, t, selected_freqs * c)
+        x = x.transpose(1, 2).reshape(t, -1)        # (b, t, selected_freqs * c)
 
-        x = self.band_split(x)                             # (b, t, num_bands, dim)
+        x = self.band_split(x)                         # (b, t, num_bands, dim)
 
         rotary_cos = self.cos_rotary_pos_emb[:, :, :t].float()
         rotary_sin = self.sin_rotary_pos_emb[:, :, :t].float()
 
         for time_transformer, freq_transformer in self.layers:
-            b_t, t_t, f_t, d_t = x.shape
-            x = x.transpose(1, 2).reshape(-1, t_t, d_t)
+            x = x.transpose(0, 1)
             x = time_transformer(x, rotary_cos, rotary_sin)
-            x = x.reshape(b_t, f_t, t_t, d_t).transpose(1, 2)
-
-            b_f, t_f, f_f, d_f = x.shape
-            x = x.reshape(-1, f_f, d_f)
+            x = x.transpose(0, 1)
             x = freq_transformer(x, self.rotary_cos_freq, self.rotary_sin_freq)
-            x = x.reshape(b_f, t_f, f_f, d_f)
 
         masks = torch.cat([fn(x) for fn in self.mask_estimators], dim=1)  # (b, n, t, selected_freqs * c)
         n_m, _ = masks.shape
@@ -417,3 +412,4 @@ class MelBandRoformer(Module):
         output_stft = stft_repr * masks_averaged
 
         return output_stft[..., 0], output_stft[..., 1]
+        

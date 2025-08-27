@@ -218,7 +218,7 @@ class MaskEstimator(Module):
             self.to_freqs.append(mlp)
 
     def forward(self, x):
-        x = x.unbind(dim=-2)
+        x = x.squeeze(0).unbind(dim=-2)
         outs = []
         for band_features, mlp in zip(x, self.to_freqs):
             outs.append(mlp(band_features))
@@ -358,8 +358,8 @@ class MelBandRoformer(Module):
         self._mono_freq_indices = None
 
         self.freq_indices_eff = self._get_mono_freq_indices()
-        self.denom_eff = (1.0 / self.num_bands_per_freq.clamp(min=1e-8)).view(1, 1, -1, 1, 1)
-        self.scatter_indices = self.freq_indices_eff.view(1, 1, -1, 1, 1)
+        self.denom_eff = (1.0 / self.num_bands_per_freq.clamp(min=1e-8)).view(1, -1, 1, 1)
+        self.scatter_indices = self.freq_indices_eff.view(1, -1, 1, 1)
 
         position_ids = torch.arange(1024, dtype=torch.float32).unsqueeze(-1)  # [L, 1]; 1024 is about 10 seconds audio
         inv_freq = 10000.0 ** -(torch.arange(0, dim_head, 2, dtype=torch.float32) / dim_head)
@@ -404,20 +404,16 @@ class MelBandRoformer(Module):
             x = freq_transformer(x, self.rotary_cos_freq, self.rotary_sin_freq)
             x = x.reshape(b_f, t_f, f_f, d_f)
 
-        masks = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)  # (b, n, t, selected_freqs * c)
-        b_m, n_m, t_m, _ = masks.shape
-        masks = masks.view(b_m, n_m, t_m, -1, 2).transpose(3, 2)     # (b, n, selected_freqs, t, 2)
+        masks = torch.cat([fn(x) for fn in self.mask_estimators], dim=1)  # (b, n, t, selected_freqs * c)
+        n_m, _ = masks.shape
+        masks = masks.view(n_m, -1, 2).transpose(0, 1).unsqueeze(0)   # (b, n, selected_freqs, t, 2)
 
-        stft_repr = stft_repr.unsqueeze(1)                                   # (b, n, f*s_in, t, c)
         time_dim = stft_repr.shape[-2]
-        scatter_indices = self.scatter_indices.expand(-1, -1, -1, time_dim, 2)
+        scatter_indices = self.scatter_indices.expand(-1, -1, time_dim, 2)
 
-        masks_summed = zeros[:, :, :, :time_dim].to(stft_repr.dtype).scatter_add_(2, scatter_indices, masks)
+        masks_summed = zeros[:, :, :time_dim].to(stft_repr.dtype).scatter_add_(1, scatter_indices, masks)
 
         masks_averaged = masks_summed * self.denom_eff
-        masked_stft = stft_repr * masks_averaged
-
-        _, _, _, t_o, c_o = masked_stft.shape
-        output_stft = masked_stft.transpose(1, 2).reshape(-1, self.num_freqs, t_o, c_o)
+        output_stft = stft_repr * masks_averaged
 
         return output_stft[..., 0], output_stft[..., 1]

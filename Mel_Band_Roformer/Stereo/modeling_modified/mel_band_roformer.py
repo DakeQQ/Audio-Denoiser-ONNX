@@ -429,20 +429,19 @@ class MelBandRoformer(Module):
 
         masks = torch.cat([fn(x) for fn in self.mask_estimators], dim=1)
 
-        n_m, _ = masks.shape
-        masks = masks.view(1, n_m, -1, 2).transpose(1, 2)
-
         time_dim = stft_repr.shape[-2]
+        
+        masks = masks.view(1, time_dim, -1, 2).transpose(1, 2)
+        
         scatter_indices = self.scatter_indices.expand(-1, -1, time_dim, 2)
 
         masks_summed = zeros[:, :, :time_dim].to(stft_repr.dtype).scatter_add_(1, scatter_indices, masks)
 
         masks_averaged = masks_summed * self.denom
+        
         masked_stft = stft_repr * masks_averaged
 
-        _, _, t_o, c_o = masked_stft.shape
-
-        output_stft = masked_stft.view(self.num_freqs, self.audio_channels, t_o, c_o).transpose(0, 1)
+        output_stft = masked_stft.view(self.num_freqs, self.audio_channels, time_dim, 2).transpose(0, 1)
 
         return output_stft[..., 0], output_stft[..., 1]
         

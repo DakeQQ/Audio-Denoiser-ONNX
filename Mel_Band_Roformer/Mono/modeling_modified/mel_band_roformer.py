@@ -257,6 +257,7 @@ class MelBandRoformer(Module):
             multi_stft_normalized=False,
             multi_stft_window_fn: Callable = torch.hann_window,
             match_input_audio_length=False,
+            mlp_expansion_factor=1
     ):
         super().__init__()
 
@@ -357,7 +358,7 @@ class MelBandRoformer(Module):
         self._mono_freq_indices = None
 
         self.freq_indices_eff = self._get_mono_freq_indices()
-        self.denom_eff = (1.0 / self.num_bands_per_freq.clamp(min=1e-8)).view(-1, 1, 1)
+        self.denom_eff = (1.0 / self.num_bands_per_freq.clamp(min=1e-8)).view(1, 1, -1, 1, 1)
         self.scatter_indices = self.freq_indices_eff.view(1, 1, -1, 1, 1)
 
         position_ids = torch.arange(1024, dtype=torch.float32).unsqueeze(-1)  # [L, 1]; 1024 is about 10 seconds audio
@@ -405,7 +406,7 @@ class MelBandRoformer(Module):
 
         masks = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)  # (b, n, t, selected_freqs * c)
         b_m, n_m, t_m, _ = masks.shape
-        masks = masks.view(b_m, n_m, t_m, -1, 2).permute(0, 1, 3, 2, 4)     # (b, n, selected_freqs, t, 2)
+        masks = masks.view(b_m, n_m, t_m, -1, 2).transpose(3, 2)     # (b, n, selected_freqs, t, 2)
 
         stft_repr = stft_repr.unsqueeze(1)                                   # (b, n, f*s_in, t, c)
         time_dim = stft_repr.shape[-2]
@@ -416,7 +417,7 @@ class MelBandRoformer(Module):
         masks_averaged = masks_summed * self.denom_eff
         masked_stft = stft_repr * masks_averaged
 
-        b_o, n_o, _, t_o, c_o = masked_stft.shape
-        output_stft = masked_stft.view(b_o, n_o, self.num_freqs, s_in, t_o, c_o).permute(0, 1, 3, 2, 4, 5).reshape(-1, self.num_freqs, t_o, c_o)
+        _, _, _, t_o, c_o = masked_stft.shape
+        output_stft = masked_stft.transpose(1, 2).reshape(-1, self.num_freqs, t_o, c_o)
 
         return output_stft[..., 0], output_stft[..., 1]

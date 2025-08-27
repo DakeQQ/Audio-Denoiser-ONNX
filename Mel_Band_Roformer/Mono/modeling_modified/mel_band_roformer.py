@@ -400,10 +400,11 @@ class MelBandRoformer(Module):
             x = freq_transformer(x, self.rotary_cos_freq, self.rotary_sin_freq)
 
         masks = torch.cat([fn(x) for fn in self.mask_estimators], dim=1)  # (b, n, t, selected_freqs * c)
-        n_m, _ = masks.shape
-        masks = masks.view(1, n_m, -1, 2).transpose(1, 2)  # (b, n, selected_freqs, t, 2)
-
+        
         time_dim = stft_repr.shape[-2]
+        
+        masks = masks.view(1, time_dim, -1, 2).transpose(1, 2)  # (b, n, selected_freqs, t, 2)
+        
         scatter_indices = self.scatter_indices.expand(-1, -1, time_dim, 2)
 
         masks_summed = zeros[:, :, :time_dim].to(stft_repr.dtype).scatter_add_(1, scatter_indices, masks)

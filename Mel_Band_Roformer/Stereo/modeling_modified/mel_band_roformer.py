@@ -247,7 +247,7 @@ class MaskEstimator(Module):
             self.to_freqs.append(mlp)
 
     def forward(self, x):
-        x = x.unbind(dim=-2)
+        x = x.squeeze(0).unbind(dim=-2)
 
         outs = []
 
@@ -357,7 +357,8 @@ class MelBandRoformer(Module):
         self.register_buffer('num_freqs_per_band', num_freqs_per_band, persistent=False)
         self.register_buffer('num_bands_per_freq', num_bands_per_freq, persistent=False)
 
-        denom = self.num_bands_per_freq.repeat_interleave(self.audio_channels).view(1, 1, -1, 1, 1)
+        denom = self.num_bands_per_freq.repeat_interleave(self.audio_channels).view(1, -1, 1, 1)
+        self.scatter_indices = self.freq_indices.view(1, -1, 1, 1)
         self.register_buffer('denom', 1.0 / denom.clamp(min=1e-8), persistent=False)
 
         freqs_per_bands_with_complex = tuple(2 * f * self.audio_channels for f in num_freqs_per_band.tolist())
@@ -409,11 +410,11 @@ class MelBandRoformer(Module):
     ):
         b, s, f, t, c = stft_repr.shape
 
-        stft_repr = stft_repr.permute(0, 2, 1, 3, 4).reshape(b, -1, t, c)
+        stft_repr = stft_repr.transpose(1, 2).reshape(b, -1, t, c)
 
         x = stft_repr[:, self.freq_indices]
 
-        x = x.permute(0, 2, 1, 3).reshape(b, t, -1)
+        x = x.transpose(1, 2).reshape(b, t, -1)
 
         x = self.band_split(x)
 
@@ -422,31 +423,31 @@ class MelBandRoformer(Module):
 
         for time_transformer, freq_transformer in self.layers:
             b_t, t_t, f_t, d_t = x.shape
-            x = x.permute(0, 2, 1, 3).reshape(-1, t_t, d_t)
+            x = x.transpose(1, 2).reshape(-1, t_t, d_t)
             x = time_transformer(x, rotary_cos, rotary_sin)
-            x = x.reshape(b_t, f_t, t_t, d_t).permute(0, 2, 1, 3)
+            x = x.reshape(b_t, f_t, t_t, d_t).transpose(1, 2)
 
             b_f, t_f, f_f, d_f = x.shape
             x = x.reshape(-1, f_f, d_f)
             x = freq_transformer(x, self.rotary_cos_freq, self.rotary_sin_freq)
             x = x.reshape(b_f, t_f, f_f, d_f)
 
-        masks = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)
+        masks = torch.cat([fn(x) for fn in self.mask_estimators], dim=1)
 
-        b_m, n_m, t_m, _ = masks.shape
-        masks = masks.view(b_m, n_m, t_m, -1, 2).transpose(3, 2)
-
-        stft_repr = stft_repr.unsqueeze(1)
+        n_m, _ = masks.shape
+        masks = masks.view(1, n_m, -1, 2).transpose(1, 2)
 
         time_dim = stft_repr.shape[-2]
-        scatter_indices = self.freq_indices.view(1, 1, -1, 1, 1).expand(-1, -1, -1, time_dim, 2)
+        scatter_indices = self.scatter_indices.expand(-1, -1, time_dim, 2)
 
-        masks_summed = zeros[:, :, :, :time_dim].to(stft_repr.dtype).scatter_add_(2, scatter_indices, masks)
+        masks_summed = zeros[:, :, :time_dim].to(stft_repr.dtype).scatter_add_(1, scatter_indices, masks)
 
         masks_averaged = masks_summed * self.denom
         masked_stft = stft_repr * masks_averaged
 
-        _, _, _, t_o, c_o = masked_stft.shape
-        output_stft = masked_stft.transpose(1, 2).reshape(-1, self.num_freqs, t_o, c_o)
+        _, _, t_o, c_o = masked_stft.shape
+
+        output_stft = masked_stft.view(self.num_freqs, self.audio_channels, t_o, c_o).transpose(0, 1)
 
         return output_stft[..., 0], output_stft[..., 1]
+        

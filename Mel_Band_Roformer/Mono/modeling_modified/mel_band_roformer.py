@@ -115,10 +115,10 @@ class Attention(Module):
 
         gates = self.to_gates(x)
 
-        gated_mask = gates.permute(0, 2, 1).unsqueeze(-1).sigmoid()
+        gated_mask = gates.transpose(1, 2).unsqueeze(-1).sigmoid()
         out = out * gated_mask
 
-        out = out.permute(0, 2, 1, 3).reshape(b, n, -1)
+        out = out.transpose(1, 2).reshape(b, n, -1)
 
         return self.to_out(out)
 

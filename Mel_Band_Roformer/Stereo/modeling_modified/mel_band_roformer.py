@@ -357,7 +357,7 @@ class MelBandRoformer(Module):
         self.register_buffer('num_freqs_per_band', num_freqs_per_band, persistent=False)
         self.register_buffer('num_bands_per_freq', num_bands_per_freq, persistent=False)
 
-        denom = self.num_bands_per_freq.repeat_interleave(self.audio_channels).view(-1, 1, 1)
+        denom = self.num_bands_per_freq.repeat_interleave(self.audio_channels).view(1, 1, -1, 1, 1)
         self.register_buffer('denom', 1.0 / denom.clamp(min=1e-8), persistent=False)
 
         freqs_per_bands_with_complex = tuple(2 * f * self.audio_channels for f in num_freqs_per_band.tolist())
@@ -434,7 +434,7 @@ class MelBandRoformer(Module):
         masks = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)
 
         b_m, n_m, t_m, _ = masks.shape
-        masks = masks.view(b_m, n_m, t_m, -1, 2).permute(0, 1, 3, 2, 4)
+        masks = masks.view(b_m, n_m, t_m, -1, 2).transpose(3, 2)
 
         stft_repr = stft_repr.unsqueeze(1)
 
@@ -446,8 +446,7 @@ class MelBandRoformer(Module):
         masks_averaged = masks_summed * self.denom
         masked_stft = stft_repr * masks_averaged
 
-        b_o, n_o, _, t_o, c_o = masked_stft.shape
-
-        output_stft = masked_stft.view(b_o, n_o, self.num_freqs, self.audio_channels, t_o, c_o).permute(0, 1, 3, 2, 4, 5).reshape(-1, self.num_freqs, t_o, c_o)
+        _, _, _, t_o, c_o = masked_stft.shape
+        output_stft = masked_stft.transpose(1, 2).reshape(-1, self.num_freqs, t_o, c_o)
 
         return output_stft[..., 0], output_stft[..., 1]

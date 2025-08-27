@@ -50,7 +50,7 @@ class MelBandRoformer_Modified(torch.nn.Module):
         self.stft_model = stft_model
         self.istft_model = istft_model
         self.inv_int16 = float(1.0 / 32768.0)
-        self.zeros = torch.zeros((1, 1, (nfft // 2 + 1) * 2, max_signal_len, 2), dtype=torch.int8)
+        self.zeros = torch.zeros((1, (nfft // 2 + 1) * 2, max_signal_len, 2), dtype=torch.int8)
         self.sample_rate = sample_rate
 
     def forward(self, audio):

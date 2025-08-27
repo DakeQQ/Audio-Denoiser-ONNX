@@ -58,7 +58,7 @@ class MelBandRoformer_Modified(torch.nn.Module):
         self.istft_model = istft_model
         self.inv_int16 = float(1.0 / 32768.0)
         # Mono zeros buffer over frequency bins (complex last dim size 2: real/imag)
-        self.zeros = torch.zeros((1, 1, (nfft // 2 + 1), max_signal_len, 2), dtype=torch.int8)
+        self.zeros = torch.zeros((1, (nfft // 2 + 1), max_signal_len, 2), dtype=torch.int8)
         self.sample_rate = sample_rate
 
     def forward(self, audio):

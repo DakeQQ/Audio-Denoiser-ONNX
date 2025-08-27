@@ -74,6 +74,7 @@ class Attention(Module):
         super().__init__()
         self.heads = heads
         self.dim_head = dim_head
+        self.dim_head_half = dim_head // 2
         self.scale = dim_head ** -0.5
         dim_inner = heads * dim_head
 
@@ -91,7 +92,15 @@ class Attention(Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x):
+        self.neg_mask = torch.tensor([-1.0, 1.0], dtype=torch.float32)
+
+    def rotate_half(self, x):
+        x_reshaped = x.view(*x.shape[:-1], -1, 2)
+        x_flipped = torch.flip(x_reshaped, dims=[-1])
+        x_rotated = x_flipped * self.neg_mask
+        return x_rotated.flatten(start_dim=-2)
+
+    def forward(self, x, rotary_cos, rotary_sin):
         x = self.norm(x)
 
         b, n, _ = x.shape
@@ -99,9 +108,8 @@ class Attention(Module):
         qkv = self.to_qkv(x).reshape(b, n, 3, self.heads, self.dim_head).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(dim=0)
 
-        if exists(self.rotary_embed):
-            q = self.rotary_embed.rotate_queries_or_keys(q)
-            k = self.rotary_embed.rotate_queries_or_keys(k)
+        q = q * rotary_cos + self.rotate_half(q) * rotary_sin
+        k = k * rotary_cos + self.rotate_half(k) * rotary_sin
 
         out = self.attend(q, k, v)
 
@@ -142,9 +150,9 @@ class Transformer(Module):
 
         self.norm = RMSNorm(dim) if norm_output else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, rotary_cos, rotary_sin):
         for attn, ff in self.layers:
-            x = attn(x) + x
+            x = attn(x, rotary_cos, rotary_sin) + x
             x = ff(x) + x
         return self.norm(x)
 
@@ -352,6 +360,16 @@ class MelBandRoformer(Module):
         self.denom_eff = (1.0 / self.num_bands_per_freq.clamp(min=1e-8)).view(-1, 1, 1)
         self.scatter_indices = self.freq_indices_eff.view(1, 1, -1, 1, 1)
 
+        position_ids = torch.arange(1024, dtype=torch.float32).unsqueeze(-1)  # [L, 1]; 1024 is about 10 seconds audio
+        inv_freq = 10000.0 ** -(torch.arange(0, dim_head, 2, dtype=torch.float32) / dim_head)
+        freqs = position_ids * inv_freq
+        freqs = torch.repeat_interleave(freqs, repeats=2, dim=-1).unsqueeze(0).unsqueeze(0)  # [L, D]
+        self.cos_rotary_pos_emb = torch.cos(freqs)  # [1, D, L]
+        self.sin_rotary_pos_emb = torch.sin(freqs)  # [1, D, L]
+        self.rotary_cos_freq = self.cos_rotary_pos_emb[:, :, :60]
+        self.rotary_sin_freq = self.sin_rotary_pos_emb[:, :, :60]
+        self.cos_rotary_pos_emb = self.cos_rotary_pos_emb.half()
+        self.sin_rotary_pos_emb = self.sin_rotary_pos_emb.half()
 
     def _get_mono_freq_indices(self, device='cpu'):
         if (self._mono_freq_indices is None) or (self._mono_freq_indices.device != device):
@@ -366,20 +384,23 @@ class MelBandRoformer(Module):
 
         stft_repr = stft_repr.permute(0, 2, 1, 3, 4).reshape(b, -1, t, c)  # (b, f*s_in, t, c)
 
-        x = stft_repr[:, self.freq_indices_eff]                 # (b, selected_freqs, t, c)
+        x = stft_repr[:, self.freq_indices_eff]            # (b, selected_freqs, t, c)
         x = x.permute(0, 2, 1, 3).reshape(b, t, -1)        # (b, t, selected_freqs * c)
 
         x = self.band_split(x)                             # (b, t, num_bands, dim)
 
+        rotary_cos = self.cos_rotary_pos_emb[:, :, :t].float()
+        rotary_sin = self.sin_rotary_pos_emb[:, :, :t].float()
+
         for time_transformer, freq_transformer in self.layers:
             b_t, t_t, f_t, d_t = x.shape
             x = x.permute(0, 2, 1, 3).reshape(-1, t_t, d_t)
-            x = time_transformer(x)
+            x = time_transformer(x, rotary_cos, rotary_sin)
             x = x.reshape(b_t, f_t, t_t, d_t).permute(0, 2, 1, 3)
 
             b_f, t_f, f_f, d_f = x.shape
             x = x.reshape(-1, f_f, d_f)
-            x = freq_transformer(x)
+            x = freq_transformer(x, self.rotary_cos_freq, self.rotary_sin_freq)
             x = x.reshape(b_f, t_f, f_f, d_f)
 
         masks = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)  # (b, n, t, selected_freqs * c)

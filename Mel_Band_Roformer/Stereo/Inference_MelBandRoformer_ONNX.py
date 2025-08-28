@@ -91,7 +91,7 @@ session_opts.add_session_config_entry("optimization.minimal_build_optimizations"
 session_opts.add_session_config_entry("session.use_device_allocator_for_initializers", "1")
 
 
-ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=ORT_Accelerate_Providers)
+ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=ORT_Accelerate_Providers, provider_options=provider_options)
 print(f"\nUsable Providers: {ort_session_A.get_providers()}")
 in_name_A = ort_session_A.get_inputs()
 out_name_A = ort_session_A.get_outputs()

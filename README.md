@@ -51,6 +51,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 ---
 
 ### To-Do List  
+- [ ] [vocal-remover](https://github.com/tsurumeso/vocal-remover)
 - [ ] [SCNet](https://github.com/starrytong/SCNet)
 - [ ] [ExNet-BF-PF](https://github.com/AdiCohen501/ExNet-BF-PF)
 - [ ] [MP-SENet](https://github.com/yxlu-0102/MP-SENet)

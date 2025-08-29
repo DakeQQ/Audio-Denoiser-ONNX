@@ -17,6 +17,7 @@ ORT_Accelerate_Providers = []           # If you have accelerate devices for : [
 MAX_THREADS = 4                         # Number of parallel threads for audio denoising.
 SAMPLE_RATE = 48000                     # Keep the same value as the exported model.
 KEEP_ORIGINAL_SAMPLE_RATE = True        # Keep the same value as the exported model.
+DEVICE_ID = 0
 
 
 # ONNX Runtime settings

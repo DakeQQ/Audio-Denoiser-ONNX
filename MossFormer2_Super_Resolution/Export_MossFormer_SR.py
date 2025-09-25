@@ -71,7 +71,7 @@ class MOSSFORMER_SR(torch.nn.Module):
             )
         real_part, imag_part = self.pre_stft(audio, 'reflect')
         real_a, imag_a = self.post_stft(audio, 'reflect')
-        mel_features = torch.matmul(self.fbank, torch.sqrt(real_part * real_part + imag_part * imag_part)).clamp(min=1e-6).log()
+        mel_features = torch.matmul(self.fbank, torch.sqrt(real_part * real_part + imag_part * imag_part)).clamp(min=1e-5).log()
         mossformer_output = self.mossformer_sr[0](mel_features)
         generated_wav = self.mossformer_sr[1](mossformer_output)
         generated_wav = generated_wav[..., :audio.shape[-1]]

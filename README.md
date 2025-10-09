@@ -45,7 +45,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 | Ubuntu-24.04 | Desktop      | OpenVINO-CPU <br> i3-12300 | MossFormerGAN_SE_16K <br> f32 | 0.95                            |
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | MossFormer2-SR <br> f32 | 1.49                                           |
 | Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | SDAEC <br> f32 | 0.105                                                  |
-| Ubuntu-24.04 | Desktop      | OpenVINO-CPU <br> i7-1165G7 | SDAEC <br> f32 | 0.095                                         |
+| Ubuntu-24.04 | Laptop       | OpenVINO-CPU <br> i7-1165G7 | SDAEC <br> f32 | 0.095                                         |
 | Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | DFSMN_AEC <br> f32 | 0.11                                               |
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | MossFormer2_SE_48K <br> f32 | 0.09                                       |
 | Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | MossFormer2_SS_16K <br> f32 | 2.63                                      |

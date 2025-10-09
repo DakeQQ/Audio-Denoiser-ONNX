@@ -85,7 +85,7 @@ class MOSSFORMER_SS(torch.nn.Module):
                     align_corners=True
                 )
             audio, scale = self.norm_audio(audio)
-        rms_in = torch.sqrt((audio ** 2).mean()) * (scale * 32767.0)
+        rms_in = torch.sqrt((audio ** 2).mean()) * scale * 32767.0
         x = self.mossformer_ss.enc(audio)
         mask = self.mossformer_ss.mask_net.norm(x)
         mask = self.mossformer_ss.mask_net.conv1d_encoder(mask)

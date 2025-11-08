@@ -119,7 +119,8 @@ with torch.inference_mode():
             'original_audio': {2: 'audio_len'},
             'super_resolution_audio': {2: 'audio_len'}
         } if DYNAMIC_AXES else None,
-        opset_version=17
+        opset_version=17,
+        dynamo=False
     )
     del mossformer
     del audio

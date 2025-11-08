@@ -386,7 +386,8 @@ with torch.inference_mode():
             'far_end_audio': {2: 'audio_len'},
             'aec_audio': {2: 'audio_len'}
         } if DYNAMIC_AXES else None,
-        opset_version=17
+        opset_version=17,
+        dynamo=False
     )
     del sdaec
     del iccrn

@@ -139,7 +139,8 @@ with torch.inference_mode():
             'noisy_audio': {2: 'audio_len'},
             'denoised_audio': {2: 'audio_len'}
         } if DYNAMIC_AXES else None,
-        opset_version=17
+        opset_version=17,
+        dynamo=False
     )
     del mel_band_roformer
     del model

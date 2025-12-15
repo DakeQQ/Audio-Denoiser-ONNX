@@ -10,9 +10,9 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
    - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
    - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
-   - [MossFormer2-48K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K)
+   - [MossFormer2-SE-48K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K)
    - [MossFormer2-Super-Resolution](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SR_48K)
-   - [MossFormer2-SS-16K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SS_16K)
+   - [MossFormer2-SS-16K - Separates Mixed-Speaker Speeches](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SS_16K)
    - [SDAEC - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/SDAEC)
    - [DFSMN - Acoustic Echo Cancellation](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k)
 
@@ -69,9 +69,9 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
    - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
    - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
-   - [MossFormer2-48K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K)
+   - [MossFormer2-SE-48K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K)
    - [MossFormer2-Super-Resolution](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SR_48K)
-   - [MossFormer2-SS-16K](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SS_16K)
+   - [MossFormer2-SS-16K - Separates Mixed-Speaker Speeches](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SS_16K)
    - [SDAEC - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/SDAEC)
    - [DFSMN - Acoustic Echo Cancellation](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k)
 

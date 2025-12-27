@@ -56,21 +56,19 @@ class GTCRN_CUSTOM(torch.nn.Module):
         if SAMPLE_RATE_SCALE < 1.0:
             audio = audio * self.inv_int16
             audio = audio - torch.mean(audio)  # Remove DC Offset
-            if self.sample_rate != 16000:
-                audio = torch.nn.functional.interpolate(
-                    audio,
-                    scale_factor=SAMPLE_RATE_SCALE,
-                    mode='linear',
-                    align_corners=True
-                )
+            audio = torch.nn.functional.interpolate(
+                audio,
+                scale_factor=SAMPLE_RATE_SCALE,
+                mode='linear',
+                align_corners=True
+            )
         else:
-            if self.sample_rate != 16000:
-                audio = torch.nn.functional.interpolate(
-                    audio,
-                    scale_factor=SAMPLE_RATE_SCALE,
-                    mode='linear',
-                    align_corners=True
-                )
+            audio = torch.nn.functional.interpolate(
+                audio,
+                scale_factor=SAMPLE_RATE_SCALE,
+                mode='linear',
+                align_corners=True
+            )
             audio = audio * self.inv_int16
             audio = audio - torch.mean(audio)  # Remove DC Offset
         real_part, imag_part = self.stft_model(audio, 'constant')

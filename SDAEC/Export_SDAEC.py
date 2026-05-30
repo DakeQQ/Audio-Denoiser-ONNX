@@ -11,8 +11,8 @@ from pydub import AudioSegment
 from STFT_Process import STFT_Process
 
 
-project_path        = "/home/iamj/Downloads/SDAEC-main"               # The SDAEC github project download path. https://github.com/ZhaoF-i/SDAEC
-onnx_model_A        = "/home/iamj/Downloads/SDAEC_ONNX/SDAEC.onnx"    # The exported onnx model path.
+project_path        = "/home/DakeQQ/Downloads/SDAEC-main"               # The SDAEC github project download path. https://github.com/ZhaoF-i/SDAEC
+onnx_model_A        = "/home/DakeQQ/Downloads/SDAEC_ONNX/SDAEC.onnx"    # The exported onnx model path.
 test_near_end_audio = "./examples/nearend_mic1.wav"                     # The near end audio path.
 test_far_end_audio  = "./examples/farend_speech1.wav"                   # The far end audio path.
 save_aec_output     = "./aec.wav"                                       # The output Acoustic Echo Cancellation audio path.
@@ -112,10 +112,10 @@ class CepsUnit(torch.nn.Module):
 
     def forward(self, x0):
         # --- Fused STFT: single conv1d with combined cos+sin kernel ---
-        x_reshaped = x0.permute(0, 1, 3, 2).contiguous().view(-1, 1, self.n_fft)
+        x_reshaped = x0.transpose(2, 3).contiguous().view(-1, 1, self.n_fft)
         stft_out = torch.nn.functional.conv1d(x_reshaped, self.stft_kernel, stride=self.hop_len)
-        stft_out = stft_out.view(self.ch, -1, self.f2).permute(0, 2, 1).contiguous()
-        stft_pair = stft_out.view(self.ch, 2, self.f, -1).permute(1, 0, 2, 3).contiguous()
+        stft_out = stft_out.view(self.ch, -1, self.f2).transpose(1, 2).contiguous()
+        stft_pair = stft_out.view(self.ch, 2, self.f, -1).transpose(0, 1).contiguous()
         stft_real, stft_imag = stft_pair.split(1, dim=0)
 
         # --- CepsUnit Logic (single reshape replaces slice+cat re-packing) ---
@@ -128,7 +128,7 @@ class CepsUnit(torch.nn.Module):
         out_pair = torch.stack([out_real, out_imag], dim=2)
         inp = out_pair.permute(0, 1, 4, 2, 3).contiguous().view(-1, self.f2, 1)
         inv = torch.nn.functional.conv_transpose1d(inp, self.inverse_basis, stride=self.hop_len)
-        x_out = inv.view(1, self.ch, -1, self.n_fft).permute(0, 1, 3, 2).contiguous()
+        x_out = inv.view(1, self.ch, -1, self.n_fft).transpose(2, 3).contiguous()
         return x_out
 
 
@@ -231,10 +231,10 @@ class CH_LSTM_F(torch.nn.Module):
 
     def forward(self, x):
         self.lstm2.flatten_parameters()
-        x = x.permute(0, 3, 2, 1).contiguous().view(-1, self.f, self.lstm2.input_size)
+        x = x.transpose(1, 3).contiguous().view(-1, self.f, self.lstm2.input_size)
         x, _ = self.lstm2(x)
         x = self.linear(x)
-        x = x.view(1, -1, self.f, self.out_ch).permute(0, 3, 2, 1).contiguous()
+        x = x.view(1, -1, self.f, self.out_ch).transpose(1, 3).contiguous()
         return x
 
 

@@ -11,7 +11,7 @@ from pydub import AudioSegment
 from STFT_Process import STFT_Process
 
 
-project_path        = "/home/DakeQQ/Downloads/SDAEC-main"               # The SDAEC github project download path. https://github.com/ZhaoF-i/SDAEC
+project_path        = "/home/DakeQQ/Downloads/SDAEC-main"               # The SDAEC GitHub project download path. https://github.com/ZhaoF-i/SDAEC
 onnx_model_A        = "/home/DakeQQ/Downloads/SDAEC_ONNX/SDAEC.onnx"    # The exported onnx model path.
 test_near_end_audio = "./examples/nearend_mic1.wav"                     # The near end audio path.
 test_far_end_audio  = "./examples/farend_speech1.wav"                   # The far end audio path.
@@ -22,7 +22,7 @@ DYNAMIC_AXES       = False                          # The default dynamic_axes i
 IN_SAMPLE_RATE     = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 OUT_SAMPLE_RATE    = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 INPUT_AUDIO_LENGTH = 16001                          # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
-MAX_SIGNAL_LENGTH  = 2048 if DYNAMIC_AXES else 256  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
+MAX_SIGNAL_LENGTH  = 2048 if DYNAMIC_AXES else 128  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
 WINDOW_TYPE        = 'hamming'                      # Type of window function used in the STFT
 NFFT               = 319                            # Number of FFT components for the STFT process
 WINDOW_LENGTH      = 319                            # Length of windowing, edit it carefully.

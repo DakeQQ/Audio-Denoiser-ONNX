@@ -12,7 +12,7 @@ test_far_end_audio  = "./examples/farend_speech1.wav"                       # Th
 save_aec_output     = "./aec.wav"                                           # The output Acoustic Echo Cancellation audio path.
 
 
-ORT_Accelerate_Providers = []        # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
+ORT_Accelerate_Providers = []        # If you have accelerated devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                      # else keep empty.
 MAX_THREADS     = 4                  # Number of parallel threads for audio denoising.
 DEVICE_ID       = 0                  # The GPU id, default to 0.

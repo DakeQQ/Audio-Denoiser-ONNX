@@ -6,18 +6,19 @@ import onnxruntime
 import soundfile as sf
 from pydub import AudioSegment
 
-onnx_model_A = "/home/DakeQQ/Downloads/SDAEC_Optimized/SDAEC.onnx"   # The exported onnx model path.
-test_near_end_audio = "./examples/nearend_mic1.wav"                  # The near end audio path.
-test_far_end_audio = "./examples/farend_speech1.wav"                 # The far end audio path.
-save_aec_output = "./aec.wav"                                        # The output Acoustic Echo Cancellation audio path.
+onnx_model_A        = "/home/DakeQQ/Downloads/SDAEC_Optimized/SDAEC.onnx"   # The exported onnx model path.
+test_near_end_audio = "./examples/nearend_mic1.wav"                         # The near end audio path.
+test_far_end_audio  = "./examples/farend_speech1.wav"                       # The far end audio path.
+save_aec_output     = "./aec.wav"                                           # The output Acoustic Echo Cancellation audio path.
 
 
-ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
-                                        # else keep empty.
-MAX_THREADS = 8                         # Number of parallel threads for audio denoising.
-DEVICE_ID = 0                           # The GPU id, default to 0.
-SAMPLE_RATE = 16000                     # Keep the same value as the exported model.
-KEEP_ORIGINAL_SAMPLE_RATE = True        # Keep the same value as the exported model.
+ORT_Accelerate_Providers = []        # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
+                                     # else keep empty.
+MAX_THREADS     = 4                  # Number of parallel threads for audio denoising.
+DEVICE_ID       = 0                  # The GPU id, default to 0.
+IN_SAMPLE_RATE  = 16000              # Keep the same value as the exported model.
+OUT_SAMPLE_RATE = 16000              # Keep the same value as the exported model.
+NORMALIZE_AUDIO = False              # Normalize the input audio to a target RMS level (e.g., 8192) before processing. It can help improve the performance of the model, especially for low-volume audio. Set it to True if you want to enable it.
 
 
 if "OpenVINOExecutionProvider" in ORT_Accelerate_Providers:
@@ -71,10 +72,15 @@ else:
     provider_options = None
 
 
-def normalize_to_int16(audio):
-    max_val = np.max(np.abs(audio))
-    scaling_factor = 32767.0 / max_val if max_val > 0 else 1.0
-    return (audio * float(scaling_factor)).astype(np.int16)
+def normalise_audio(audio: np.ndarray, target_rms: float = 8192.0) -> np.ndarray:
+    _audio = audio.astype(np.float32)
+    rms = np.sqrt(np.mean(_audio * _audio, dtype=np.float32), dtype=np.float32)
+    if rms > 0:
+        _audio *= (target_rms / (rms + 1e-7))
+        np.clip(_audio, -32768.0, 32767.0, out=_audio)
+        return _audio.astype(np.int16)
+    else:
+        return audio
 
 
 # ONNX Runtime settings
@@ -107,19 +113,22 @@ out_name_A0 = out_name_A[0].name
 
 # Load the input audio
 print(f"\nTest Input Near_End Audio: {test_near_end_audio}\nTest Input Far_End Audio: {test_far_end_audio}")
-near_end_audio = np.array(AudioSegment.from_file(test_near_end_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples(), dtype=np.float32)
-far_end_audio = np.array(AudioSegment.from_file(test_far_end_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples(), dtype=np.float32)
+near_end_audio = np.array(AudioSegment.from_file(test_near_end_audio).set_channels(1).set_frame_rate(IN_SAMPLE_RATE).get_array_of_samples(), dtype=np.int16)
+far_end_audio = np.array(AudioSegment.from_file(test_far_end_audio).set_channels(1).set_frame_rate(IN_SAMPLE_RATE).get_array_of_samples(), dtype=np.int16)
 near_end_audio_len = len(near_end_audio)
 far_nd_audio_len = len(far_end_audio)
 min_len = min(near_end_audio_len, far_nd_audio_len)
-near_end_audio = normalize_to_int16(near_end_audio[:min_len])
-far_end_audio = normalize_to_int16(far_end_audio[:min_len])
+if NORMALIZE_AUDIO:
+    near_end_audio = normalise_audio(near_end_audio)
+    far_end_audio = normalise_audio(far_end_audio)
+near_end_audio = near_end_audio[:min_len]
+far_end_audio = far_end_audio[:min_len]
 near_end_audio = near_end_audio.reshape(1, 1, -1)
 far_end_audio = far_end_audio.reshape(1, 1, -1)
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
 if isinstance(shape_value_in, str):
-    INPUT_AUDIO_LENGTH = max(30 * SAMPLE_RATE, min_len)  # Default to slice in 30 seconds. You can adjust it.
+    INPUT_AUDIO_LENGTH = max(30 * IN_SAMPLE_RATE, min_len)  # Default to slice in 30 seconds. You can adjust it.
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
 
@@ -127,7 +136,7 @@ else:
 def align_audio(audio, audio_len):
     stride_step = INPUT_AUDIO_LENGTH
     if audio_len > INPUT_AUDIO_LENGTH:
-        if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (KEEP_ORIGINAL_SAMPLE_RATE):
+        if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (IN_SAMPLE_RATE != OUT_SAMPLE_RATE):
             stride_step = shape_value_out
         num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
         total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
@@ -147,10 +156,7 @@ near_end_audio, _, _ = align_audio(near_end_audio, min_len)
 far_end_audio, aligned_len, stride_step = align_audio(far_end_audio, min_len)
 
 
-if SAMPLE_RATE != 16000 and not KEEP_ORIGINAL_SAMPLE_RATE:
-    SAMPLE_RATE_SCALE = float(16000.0 / SAMPLE_RATE)
-    min_len = int(min_len * SAMPLE_RATE_SCALE)
-    SAMPLE_RATE = 16000
+min_len = int(min_len * OUT_SAMPLE_RATE / IN_SAMPLE_RATE)
 inv_audio_len = float(100.0 / min_len)
 
 
@@ -180,5 +186,5 @@ end_time = time.time()
 print(f"Complete: 100.00%")
 
 # Save the denoised wav.
-sf.write(save_aec_output, denoised_wav, SAMPLE_RATE, format='WAVEX')
+sf.write(save_aec_output, denoised_wav, OUT_SAMPLE_RATE, format='WAVEX')
 print(f"\nAEC Process Complete.\n\nSaving to: {save_aec_output}.\n\nTime Cost: {end_time - start_time:.3f} Seconds")

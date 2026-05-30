@@ -11,8 +11,8 @@ from pydub import AudioSegment
 from STFT_Process import STFT_Process
 
 
-project_path        = "/home/DakeQQ/Downloads/SDAEC-main"               # The SDAEC github project download path. https://github.com/ZhaoF-i/SDAEC
-onnx_model_A        = "/home/DakeQQ/Downloads/SDAEC_ONNX/SDAEC.onnx"    # The exported onnx model path.
+project_path        = "/home/iamj/Downloads/SDAEC-main"               # The SDAEC github project download path. https://github.com/ZhaoF-i/SDAEC
+onnx_model_A        = "/home/iamj/Downloads/SDAEC_ONNX/SDAEC.onnx"    # The exported onnx model path.
 test_near_end_audio = "./examples/nearend_mic1.wav"                     # The near end audio path.
 test_far_end_audio  = "./examples/farend_speech1.wav"                   # The far end audio path.
 save_aec_output     = "./aec.wav"                                       # The output Acoustic Echo Cancellation audio path.
@@ -30,6 +30,7 @@ HOP_LENGTH         = 160                            # Number of samples between 
 ALPHA_K            = 10                             # The SDAEC parameter, do not edit the value.
 MAX_THREADS        = 4                              # Number of parallel threads for test audio denoising.
 NORMALIZE_AUDIO    = False                          # Normalize the input audio to a target RMS level (e.g., 8192) before processing. It can help improve the performance of the model, especially for low-volume audio. Set it to True if you want to enable it.
+OPSET              = 18                             # ONNX opset.
 
 
 def normalise_audio(audio: np.ndarray, target_rms: float = 8192.0) -> np.ndarray:
@@ -337,13 +338,12 @@ with torch.inference_mode():
         onnx_model_A,
         input_names=['near_end_audio', 'far_end_audio'],
         output_names=['aec_audio'],
-        do_constant_folding=True,
         dynamic_axes={
             'near_end_audio': {2: 'audio_len'},
             'far_end_audio': {2: 'audio_len'},
             'aec_audio': {2: 'audio_len'}
         } if DYNAMIC_AXES else None,
-        opset_version=17,
+        opset_version=OPSET,
         dynamo=False
     )
     del sdaec
@@ -459,5 +459,8 @@ end_time = time.time()
 print(f"Complete: 100.00%")
 
 # Save the denoised wav.
+elapsed = end_time - start_time
+audio_duration = min_len / OUT_SAMPLE_RATE
+rtf = elapsed / audio_duration
 sf.write(save_aec_output, denoised_wav, OUT_SAMPLE_RATE, format='WAVEX')
-print(f"\nAEC Process Complete.\n\nSaving to: {save_aec_output}.\n\nTime Cost: {end_time - start_time:.3f} Seconds")
+print(f"\nAEC Process Complete.\n\nSaving to: {save_aec_output}.\n\nTime Cost: {elapsed:.3f} Seconds\nAudio Duration: {audio_duration:.3f} Seconds\nRTF: {rtf:.4f}")

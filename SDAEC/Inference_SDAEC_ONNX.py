@@ -186,5 +186,8 @@ end_time = time.time()
 print(f"Complete: 100.00%")
 
 # Save the denoised wav.
+elapsed = end_time - start_time
+audio_duration = min_len / OUT_SAMPLE_RATE
+rtf = elapsed / audio_duration
 sf.write(save_aec_output, denoised_wav, OUT_SAMPLE_RATE, format='WAVEX')
-print(f"\nAEC Process Complete.\n\nSaving to: {save_aec_output}.\n\nTime Cost: {end_time - start_time:.3f} Seconds")
+print(f"\nAEC Process Complete.\n\nSaving to: {save_aec_output}.\n\nTime Cost: {elapsed:.3f} Seconds\nAudio Duration: {audio_duration:.3f} Seconds\nRTF: {rtf:.4f}")

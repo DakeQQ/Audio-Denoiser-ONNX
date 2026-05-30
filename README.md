@@ -15,6 +15,8 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [MossFormer2-SS-16K - Separates Mixed-Speaker Speeches](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SS_16K)
    - [SDAEC - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/SDAEC)
    - [DFSMN - Acoustic Echo Cancellation](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k)
+   - [NKF - Acoustic Echo Cancellation](https://github.com/fjiang9/NKF-AEC)
+   - [Deep Echo - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/Deep-echo-path-modeling-for-acoustic-echo-cancellation)
 
 2. **Dynamic Quantization**:  
    - Dynamic quantization is **not recommended** for Denoiser as it significantly reduces performance due to increased computational overhead. Except, Mel-Band-Roformer. 
@@ -32,7 +34,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 ---
 
 ### 性能 Performance  
-| OS           | Device       | Backend           | Model        | Real-Time Factor <br> (Chunk Size: 8000 or 500ms) |
+| OS           | Device       | Backend           | Model        | Real-Time Factor <br> (Chunk Size: 16000 or 1000ms) |
 |:------------:|:------------:|:-----------------:|:------------:|:------------------------------------------------:|
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | ZipEnhancer <br> f32 | 0.32                                              |
 | Ubuntu-24.04 | Desktop      | OpenVINO-CPU <br> i3-12300 | ZipEnhancer <br> f32 | 0.25                                     |
@@ -40,7 +42,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | GTCRN <br> f32       | 0.0036                                            |
 | macOS 15     | MacBook Air  | CPU <br> M3       | GTCRN <br> f32       | 0.0013 ~<br> 0.0019                               |  
 | Ubuntu-24.04 | Laptop       | CPU <br> i5-7300HQ | DFSMN <br> f32      | 0.0068 ~<br> 0.012                                |
-| Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | MelBandRofomer <br> q8f32 | 1.40 <br> (Chunk Size: 1000ms)              |
+| Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | MelBandRofomer <br> q8f32 | 1.40 <br>                                   |
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | MossFormerGAN_SE_16K <br> f32 | 1.085                                    |
 | Ubuntu-24.04 | Desktop      | OpenVINO-CPU <br> i3-12300 | MossFormerGAN_SE_16K <br> f32 | 0.95                            |
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | MossFormer2-SR <br> f32 | 1.49                                           |
@@ -49,6 +51,9 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 | Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | DFSMN_AEC <br> f32 | 0.11                                               |
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | MossFormer2_SE_48K <br> f32 | 0.09                                       |
 | Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | MossFormer2_SS_16K <br> f32 | 2.63                                      |
+| Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | MossFormer2_SE_48K <br> f32 | 0.09                                       |
+| Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | NKF-AEC <br> f32 | 0.018  (Chunk Size: 2000ms)                           |
+| Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | Deep_Echo-AEC <br> f32 | 0.024                                           |
 
 ---
 
@@ -74,6 +79,8 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [MossFormer2-SS-16K - Separates Mixed-Speaker Speeches](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SS_16K)
    - [SDAEC - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/SDAEC)
    - [DFSMN - Acoustic Echo Cancellation](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k)
+   - [NKF - Acoustic Echo Cancellation](https://github.com/fjiang9/NKF-AEC)
+   - [Deep Echo - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/Deep-echo-path-modeling-for-acoustic-echo-cancellation)
 
 
 2. **动态量化**：  

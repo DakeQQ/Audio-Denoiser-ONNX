@@ -7,6 +7,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 1. **Supported Models**:  
    - [ZipEnhancer](https://modelscope.cn/models/iic/speech_zipenhancer_ans_multiloss_16k_base)  
    - [GTCRN](https://github.com/Xiaobin-Rong/gtcrn)
+   - [H-GTCRN](https://github.com/max1wz/h-gtcrn)
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
    - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
    - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)
@@ -54,6 +55,8 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | MossFormer2_SE_48K <br> f32 | 0.09                                       |
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | NKF-AEC <br> f32 | 0.018  (Chunk Size: 2000ms)                           |
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | Deep_Echo-AEC <br> f32 | 0.024                                           |
+| Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | H-GTCRN <br> f32 | 0.03                                                 |
+
 
 ---
 
@@ -71,6 +74,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 1. **支持的模型**：  
    - [ZipEnhancer](https://modelscope.cn/models/iic/speech_zipenhancer_ans_multiloss_16k_base)
    - [GTCRN](https://github.com/Xiaobin-Rong/gtcrn)
+   - [H-GTCRN](https://github.com/max1wz/h-gtcrn)
    - [DFSMN](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary)
    - [Mel-Band-Roformer](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model)
    - [MossFormerGAN-SE-16K](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K)

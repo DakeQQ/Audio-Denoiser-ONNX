@@ -1,6 +1,5 @@
 import gc
 import os
-import subprocess
 
 import onnx.version_converter
 import onnxruntime
@@ -12,9 +11,8 @@ original_folder_path = "/home/DakeQQ/Downloads/GTCRN_ONNX"                      
 optimized_folder_path = "/home/DakeQQ/Downloads/GTCRN_Optimized"                  # The optimized folder.
 model_path = os.path.join(original_folder_path, "GTCRN.onnx")                     # The original fp32 model name.
 optimized_model_path = os.path.join(optimized_folder_path, "GTCRN.onnx")          # The optimized model name.
-use_gpu_fp16 = False                                                              # If true, the transformers.optimizer will remain the FP16 processes.
-provider = 'CPUExecutionProvider'                                                 # ['CPUExecutionProvider', 'CUDAExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider']
-target_platform = "amd64"                                                         # ['arm', 'amd64']; The 'amd64' means x86_64 desktop, not means the AMD chip.
+use_fp16 = False                                                                  # If true, the transformers.optimizer will remain the FP16 processes.
+target_opset = 0                                                                  # Upgrade the ONNX Opset version. Set it to 0 to keep the same version as the exported model.
 
 
 # Check model
@@ -38,14 +36,13 @@ slim(
 
 # transformers.optimizer
 model = optimize_model(optimized_model_path,
-                       use_gpu=use_gpu_fp16,
+                       use_gpu=False,
                        opt_level=2,
                        num_heads=0,
                        hidden_size=0,
-                       provider=provider,
                        verbose=False,
                        model_type='bert')
-if use_gpu_fp16:
+if use_fp16:
     model.convert_float_to_float16(
         keep_io_types=False,
         force_fp16_initializers=True,
@@ -70,18 +67,10 @@ slim(
 
 
 # Upgrade the Opset version. (optional process)
-model = onnx.load(optimized_model_path)
-model = onnx.version_converter.convert_version(model, 18)
-onnx.save(model, optimized_model_path, save_as_external_data=False)
-del model
-gc.collect()
+if target_opset != 0:
+    model = onnx.load(optimized_model_path)
+    model = onnx.version_converter.convert_version(model, target_opset)
+    onnx.save(model, optimized_model_path, save_as_external_data=False)
+    del model
+    gc.collect()
 
-
-if not use_gpu_fp16:
-    # Convert the simplified model to ORT format.
-    if provider == 'CPUExecutionProvider':
-        optimization_style = "Fixed"
-    else:
-        optimization_style = "Runtime"  # ['Runtime', 'Fixed']; Runtime for XNNPACK/NNAPI/QNN/CoreML..., Fixed for CPU provider
-    # Call subprocess may get permission failed on Windows system.
-    subprocess.run([f'python -m onnxruntime.tools.convert_onnx_models_to_ort --output_dir {optimized_folder_path} --optimization_style {optimization_style} --target_platform {target_platform} --enable_type_reduction {optimized_folder_path}'], shell=True)

@@ -8,102 +8,110 @@ import soundfile as sf
 import torch
 from pydub import AudioSegment
 
-from STFT_Process import STFT_Process  # The custom STFT/ISTFT can be exported in ONNX format.
-from modeling_modified.gtcrn import GTCRN
+from STFT_Process import STFT_Process  
+from modeling_modified.gtcrn_optimized import GTCRN
 
 
-model_path = "/home/DakeQQ/Downloads/gtcrn-main"                          # The GTCRN download path.
-onnx_model_A = "/home/DakeQQ/Downloads/GTCRN_ONNX/GTCRN.onnx"             # The exported onnx model path.
-test_noisy_audio =  model_path + "/test_wavs/mix.wav"                     # The noisy audio path.
+model_path          = "/home/DakeQQ/Downloads/gtcrn-main"                 # The GTCRN download path.
+onnx_model_A        = "/home/DakeQQ/Downloads/GTCRN_ONNX/GTCRN.onnx"      # The exported onnx model path.
+test_noisy_audio    = model_path + "/test_wavs/mix.wav"                   # The noisy audio path.
 save_denoised_audio = "./denoised.wav"                                    # The output denoised audio path.
 
 
-ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
-                                        # else keep empty.
-DYNAMIC_AXES = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-KEEP_ORIGINAL_SAMPLE_RATE = True        # If False, the model outputs audio at 16kHz; otherwise, it uses the original sample rate.
-SAMPLE_RATE = 16000                     # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
-INPUT_AUDIO_LENGTH = 31744              # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the HOP_LENGTH value.
-MAX_SIGNAL_LENGTH = 4096 if DYNAMIC_AXES else 256  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
-WINDOW_TYPE = 'hann_sqrt'               # Type of window function used in the STFT
-N_MELS = 100                            # Number of Mel bands to generate in the Mel-spectrogram
-NFFT = 512                              # Number of FFT components for the STFT process
-WINDOW_LENGTH = 512                     # Length of windowing, edit it carefully.
-HOP_LENGTH = 256                        # Number of samples between successive frames in the STFT
-MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
+ORT_Accelerate_Providers = []                       # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
+                                                    # else keep empty.
+DYNAMIC_AXES       = False                          # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
+IN_SAMPLE_RATE     = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
+OUT_SAMPLE_RATE    = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
+INPUT_AUDIO_LENGTH = 31744                          # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the HOP_LENGTH value.
+MAX_SIGNAL_LENGTH  = 4096 if DYNAMIC_AXES else 256  # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
+WINDOW_TYPE        = 'hann_sqrt'                    # Type of window function used in the STFT
+N_MELS             = 100                            # Number of Mel bands to generate in the Mel-spectrogram
+NFFT               = 512                            # Number of FFT components for the STFT process
+WINDOW_LENGTH      = 512                            # Length of windowing, edit it carefully.
+HOP_LENGTH         = 256                            # Number of samples between successive frames in the STFT
+MAX_THREADS        = 4                              # Number of parallel threads for test audio denoising.
+NORMALIZE_AUDIO    = False                          # Normalize the input audio to a target RMS level (e.g., 8192) before processing. It can help improve the performance of the model, especially for low-volume audio. Set it to True if you want to enable it.
 
 
-SAMPLE_RATE_SCALE = float(16000.0 / SAMPLE_RATE)
-
-
-def normalize_to_int16(audio):
-    max_val = np.max(np.abs(audio))
-    scaling_factor = 32767.0 / max_val if max_val > 0 else 1.0
-    return (audio * float(scaling_factor)).astype(np.int16)
+def normalise_audio(audio: np.ndarray, target_rms: float = 8192.0) -> np.ndarray:
+    _audio = audio.astype(np.float32)
+    rms = np.sqrt(np.mean(_audio * _audio, dtype=np.float32), dtype=np.float32)
+    if rms > 0:
+        _audio *= (target_rms / (rms + 1e-7))
+        np.clip(_audio, -32768.0, 32767.0, out=_audio)
+        return _audio.astype(np.int16)
+    else:
+        return audio
   
 
 class GTCRN_CUSTOM(torch.nn.Module):
-    def __init__(self, gtcrn, stft_model, istft_model, sample_rate):
+    def __init__(self, gtcrn, stft_model, istft_model, in_sample_rate, out_sample_rate):
         super(GTCRN_CUSTOM, self).__init__()
         self.gtcrn = gtcrn
         self.stft_model = stft_model
         self.istft_model = istft_model
         self.inv_int16 = float(1.0 / 32768.0)
-        self.sample_rate = sample_rate
+        self.output_pcm_scale = 32767.0
+        self.in_sample_rate = in_sample_rate
+        self.out_sample_rate = out_sample_rate
+        self.in_sample_rate_scale = in_sample_rate / 16000.0
+        self.out_sample_rate_scale = out_sample_rate / 16000.0
+        self.model_rate_scale = 1.0 / self.in_sample_rate_scale
+        self.resample_before_centering = self.in_sample_rate_scale > 1.0
+        self.resample_after_centering = self.in_sample_rate_scale < 1.0
+        self.output_resample_before_pcm = self.out_sample_rate_scale > 1.0
+        self.output_resample_after_pcm = self.out_sample_rate_scale < 1.0
 
     def forward(self, audio):
         audio = audio.float()
-        if SAMPLE_RATE_SCALE < 1.0:
-            audio = audio * self.inv_int16
-            audio = audio - torch.mean(audio)  # Remove DC Offset
+        if self.resample_before_centering:
             audio = torch.nn.functional.interpolate(
                 audio,
-                scale_factor=SAMPLE_RATE_SCALE,
+                scale_factor=self.model_rate_scale,
                 mode='linear',
-                align_corners=True
+                align_corners=False
             )
-        else:
+        audio = audio * self.inv_int16
+        audio = audio - torch.mean(audio) # Remove DC Offset
+        if self.resample_after_centering:
             audio = torch.nn.functional.interpolate(
                 audio,
-                scale_factor=SAMPLE_RATE_SCALE,
+                scale_factor=self.model_rate_scale,
                 mode='linear',
-                align_corners=True
+                align_corners=False
             )
-            audio = audio * self.inv_int16
-            audio = audio - torch.mean(audio)  # Remove DC Offset
-        real_part, imag_part = self.stft_model(audio, 'constant')
-        magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part)
+        real_part, imag_part = self.stft_model(audio)
+        magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part + 1e-12)
         s_real, s_imag = self.gtcrn(magnitude, real_part, imag_part)
         audio = self.istft_model(s_real, s_imag)
-        if SAMPLE_RATE_SCALE < 1.0:
-            audio *= 32767.0
-            if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 16000:
-                audio = torch.nn.functional.interpolate(
-                    audio,
-                    scale_factor=1.0 / SAMPLE_RATE_SCALE,
-                    mode='linear',
-                    align_corners=True
-                )
-        else:
-            if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 16000:
-                audio = torch.nn.functional.interpolate(
-                    audio,
-                    scale_factor=1.0 / SAMPLE_RATE_SCALE,
-                    mode='linear',
-                    align_corners=True
-                )
-            audio *= 32767.0
+        if self.output_resample_before_pcm:
+            audio = torch.nn.functional.interpolate(
+                audio,
+                scale_factor=self.out_sample_rate_scale,
+                mode='linear',
+                align_corners=False
+            )
+        audio *= self.output_pcm_scale
+        if self.output_resample_after_pcm:
+            audio = torch.nn.functional.interpolate(
+                audio,
+                scale_factor=self.out_sample_rate_scale,
+                mode='linear',
+                align_corners=False
+            )
         return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
 
 
 print('Export start ...')
 with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
+    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant").eval()
+    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant").eval()
     gtcrn = GTCRN().eval()
     ckpt = torch.load(model_path + "/checkpoints/model_trained_on_dns3.tar", map_location='cpu')
     gtcrn.load_state_dict(ckpt['model'], strict=False)
-    gtcrn = GTCRN_CUSTOM(gtcrn.float(), custom_stft, custom_istft, SAMPLE_RATE)
+    gtcrn.fuse_bn_()  # Fuse BatchNorm into Conv weights for optimized inference
+    gtcrn = GTCRN_CUSTOM(gtcrn.float(), custom_stft, custom_istft, IN_SAMPLE_RATE, OUT_SAMPLE_RATE)
     audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16)
     torch.onnx.export(
         gtcrn,
@@ -150,19 +158,20 @@ out_name_A0 = out_name_A[0].name
 
 # Load the input audio
 print(f"\nTest Input Audio: {test_noisy_audio}")
-audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(SAMPLE_RATE).get_array_of_samples(), dtype=np.float32)
-audio = normalize_to_int16(audio)
+audio = np.array(AudioSegment.from_file(test_noisy_audio).set_channels(1).set_frame_rate(IN_SAMPLE_RATE).get_array_of_samples(), dtype=np.int16)
+if NORMALIZE_AUDIO:
+    audio = normalise_audio(audio)
 audio_len = len(audio)
 audio = audio.reshape(1, 1, -1)
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
 if isinstance(shape_value_in, str):
-    INPUT_AUDIO_LENGTH = min(30 * SAMPLE_RATE, audio_len)  # Default to slice in 30 seconds. You can adjust it.
+    INPUT_AUDIO_LENGTH = min(30 * IN_SAMPLE_RATE, audio_len)  # Default to slice in 30 seconds. You can adjust it.
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
 stride_step = INPUT_AUDIO_LENGTH
 if audio_len > INPUT_AUDIO_LENGTH:
-    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (KEEP_ORIGINAL_SAMPLE_RATE):
+    if (shape_value_in != shape_value_out) & isinstance(shape_value_in, int) & isinstance(shape_value_out, int) & (OUT_SAMPLE_RATE == IN_SAMPLE_RATE):
         stride_step = shape_value_out
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
@@ -178,9 +187,7 @@ aligned_len = audio.shape[-1]
 inv_audio_len = float(100.0 / aligned_len)
 
 
-if SAMPLE_RATE != 16000 and not KEEP_ORIGINAL_SAMPLE_RATE:
-    SAMPLE_RATE = 16000
-    audio_len = int(audio_len * SAMPLE_RATE_SCALE)
+audio_len = int(audio_len * OUT_SAMPLE_RATE / IN_SAMPLE_RATE)
 
 
 def process_segment(_inv_audio_len, _slice_start, _slice_end, _audio):
@@ -209,5 +216,5 @@ end_time = time.time()
 print(f"Complete: 100.00%")
 
 # Save the denoised wav.
-sf.write(save_denoised_audio, denoised_wav, SAMPLE_RATE, format='WAVEX')
+sf.write(save_denoised_audio, denoised_wav, OUT_SAMPLE_RATE, format='WAVEX')
 print(f"\nDenoise Process Complete.\n\nSaving to: {save_denoised_audio}.\n\nTime Cost: {end_time - start_time:.3f} Seconds")

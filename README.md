@@ -18,6 +18,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [DFSMN - Acoustic Echo Cancellation](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k)
    - [NKF - Acoustic Echo Cancellation](https://github.com/fjiang9/NKF-AEC)
    - [Deep Echo - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/Deep-echo-path-modeling-for-acoustic-echo-cancellation)
+   - [UL-UNAS](https://github.com/Xiaobin-Rong/ul-unas)
 
 2. **Dynamic Quantization**:  
    - Dynamic quantization is **not recommended** for Denoiser as it significantly reduces performance due to increased computational overhead. Except, Mel-Band-Roformer. 
@@ -56,6 +57,8 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | NKF-AEC <br> f32 | 0.018  (Chunk Size: 2000ms)                           |
 | Ubuntu-24.04 | Desktop      | CPU <br> i3-12300 | Deep_Echo-AEC <br> f32 | 0.024                                           |
 | Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | H-GTCRN <br> f32 | 0.03                                                 |
+| Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | UL-UNAS <br> f32 | 0.0064                                               |
+
 
 
 ---
@@ -85,6 +88,7 @@ Audio denoising powered by ONNX Runtime for enhanced clarity.
    - [DFSMN - Acoustic Echo Cancellation](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k)
    - [NKF - Acoustic Echo Cancellation](https://github.com/fjiang9/NKF-AEC)
    - [Deep Echo - Acoustic Echo Cancellation](https://github.com/ZhaoF-i/Deep-echo-path-modeling-for-acoustic-echo-cancellation)
+   - [UL-UNAS](https://github.com/Xiaobin-Rong/ul-unas)
 
 
 2. **动态量化**：  

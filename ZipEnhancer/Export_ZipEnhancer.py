@@ -27,7 +27,7 @@ INPUT_AUDIO_LENGTH = 16000              # Maximum input audio length: the length
 MAX_SIGNAL_LENGTH = 1024 if DYNAMIC_AXES else (INPUT_AUDIO_LENGTH // 50 + 1)  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
 WINDOW_TYPE = 'hamming'                 # Type of window function used in the STFT
 N_MELS = 100                            # Number of Mel bands to generate in the Mel-spectrogram
-NFFT = 512                              # Number of FFT components for the STFT process
+NFFT = 400                              # Number of FFT components for the STFT process
 WINDOW_LENGTH = 400                     # Length of windowing, edit it carefully.
 HOP_LENGTH = 100                        # Number of samples between successive frames in the STFT
 MAX_THREADS = 4                         # Number of parallel threads for test audio denoising.
@@ -71,7 +71,7 @@ class ZipEnhancer(torch.nn.Module):
                     audio,
                     scale_factor=SAMPLE_RATE_SCALE,
                     mode='linear',
-                    align_corners=True
+                    align_corners=False
                 )
         else:
             if self.sample_rate != 16000:
@@ -79,11 +79,11 @@ class ZipEnhancer(torch.nn.Module):
                     audio,
                     scale_factor=SAMPLE_RATE_SCALE,
                     mode='linear',
-                    align_corners=True
+                    align_corners=False
                 )
             norm_factor = torch.sqrt(torch.mean(audio * audio, dim=-1, keepdim=True) + 1e-6)
             audio /= norm_factor
-        real_part, imag_part = self.stft_model(audio, 'constant')
+        real_part, imag_part = self.stft_model(audio)
         magnitude = torch.pow(real_part * real_part + imag_part * imag_part, self.compress_factor_sqrt)
         phase = torch.atan2(imag_part, real_part)
         magnitude, phase = self.zip_enhancer(magnitude, phase)
@@ -95,7 +95,7 @@ class ZipEnhancer(torch.nn.Module):
                     audio,
                     scale_factor=1.0 / SAMPLE_RATE_SCALE,
                     mode='linear',
-                    align_corners=True
+                    align_corners=False
                 )
         else:
             if KEEP_ORIGINAL_SAMPLE_RATE and self.sample_rate != 16000:
@@ -103,7 +103,7 @@ class ZipEnhancer(torch.nn.Module):
                     audio,
                     scale_factor=1.0 / SAMPLE_RATE_SCALE,
                     mode='linear',
-                    align_corners=True
+                    align_corners=False
                 )
             audio *= norm_factor
         return (audio.clamp(min=-32768.0, max=32767.0)).to(torch.int16)
@@ -111,8 +111,8 @@ class ZipEnhancer(torch.nn.Module):
 
 print('Export start ...')
 with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
-    custom_istft = STFT_Process(model_type='istft_A', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
+    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode='constant').eval()
+    custom_istft = STFT_Process(model_type='istft_A', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode='constant').eval()
     zip_enhancer = Model.from_pretrained(model_name_or_path=model_path, device='cpu').model.eval()
     zip_enhancer = ZipEnhancer(zip_enhancer, custom_stft, custom_istft, SAMPLE_RATE)
     audio = torch.ones((1, 1, INPUT_AUDIO_LENGTH), dtype=torch.int16)

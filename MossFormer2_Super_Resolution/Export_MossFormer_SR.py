@@ -69,13 +69,13 @@ class MOSSFORMER_SR(torch.nn.Module):
                 align_corners=True,
                 recompute_scale_factor=False
             )
-        real_part, imag_part = self.pre_stft(audio, 'reflect')
-        real_a, imag_a = self.post_stft(audio, 'reflect')
+        real_part, imag_part = self.pre_stft(audio)
+        real_a, imag_a = self.post_stft(audio)
         mel_features = torch.matmul(self.fbank, torch.sqrt(real_part * real_part + imag_part * imag_part)).clamp(min=1e-5).log()
         mossformer_output = self.mossformer_sr[0](mel_features)
         generated_wav = self.mossformer_sr[1](mossformer_output)
         generated_wav = generated_wav[..., :audio.shape[-1]]
-        real_b, imag_b = self.post_stft(generated_wav, 'reflect')
+        real_b, imag_b = self.post_stft(generated_wav)
         psd = (real_a * real_a + imag_a * imag_a) * self.post_istft.inv_win_sum_for_mossformer
         energy_per_f = psd.sum(dim=-1)     
         cum_energy = energy_per_f.cumsum(dim=1)
@@ -100,9 +100,9 @@ class MOSSFORMER_SR(torch.nn.Module):
 
 print('Export start ...')
 with torch.inference_mode():
-    pre_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
-    post_stft = STFT_Process(model_type='stft_B', n_fft=NFFT_POST, hop_len=HOP_LENGTH_POST, win_length=WINDOW_LENGTH_POST, max_frames=0, window_type=WINDOW_TYPE).eval()
-    post_istft = STFT_Process(model_type='istft_B', n_fft=NFFT_POST, hop_len=HOP_LENGTH_POST, win_length=WINDOW_LENGTH_POST, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
+    pre_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode='reflect').eval()
+    post_stft = STFT_Process(model_type='stft_B', n_fft=NFFT_POST, hop_len=HOP_LENGTH_POST, win_length=WINDOW_LENGTH_POST, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode='reflect').eval()
+    post_istft = STFT_Process(model_type='istft_B', n_fft=NFFT_POST, hop_len=HOP_LENGTH_POST, win_length=WINDOW_LENGTH_POST, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode='reflect').eval()
    
     myClearVoice = ClearVoice(task='speech_super_resolution', model_names=['MossFormer2_SR_48K'], model_path=model_path)
     mossformer = myClearVoice.models[0].model.eval().float().to("cpu")

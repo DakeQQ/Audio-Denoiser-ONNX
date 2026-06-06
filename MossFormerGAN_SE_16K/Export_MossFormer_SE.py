@@ -83,7 +83,7 @@ class MOSSFORMER_SE(torch.nn.Module):
                 )
             norm_factor = torch.sqrt(torch.mean(audio * audio, dim=-1, keepdim=True) + 1e-6)
             audio /= norm_factor
-        real_part, imag_part = self.stft_model(audio, 'constant')
+        real_part, imag_part = self.stft_model(audio)
         power = real_part * real_part + imag_part * imag_part
         magnitude_compress = torch.pow(power, self.compress_factor_sqrt)
         inv_magnitude = torch.pow(power, -0.5) * magnitude_compress
@@ -124,8 +124,8 @@ class MOSSFORMER_SE(torch.nn.Module):
 
 print('Export start ...')
 with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
+    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode='constant').eval()
+    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode='constant').eval()
 
     myClearVoice = ClearVoice(task='speech_enhancement', model_names=['MossFormerGAN_SE_16K'], model_path=model_path)
     mossformer = myClearVoice.models[0].model.eval().float().to("cpu")

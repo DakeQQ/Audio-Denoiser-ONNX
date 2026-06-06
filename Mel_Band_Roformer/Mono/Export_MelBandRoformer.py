@@ -80,7 +80,7 @@ class MelBandRoformer_Modified(torch.nn.Module):
             audio *= self.inv_int16
 
         # STFT for mono
-        real, imag = self.stft_model(audio, 'constant')  # (B, F, T)
+        real, imag = self.stft_model(audio)  # (B, F, T)
         stft_repr = torch.stack((real, imag), dim=-1)    # (B, F, T, 2)
         stft_repr = stft_repr.unsqueeze(1)               # (B, 1, F, T, 2)
 
@@ -213,8 +213,8 @@ def convert_stereo_to_mono_weights(stereo_model: MelBandRoformer, mono_model: Me
 
 print('Export start ...')
 with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
+    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode='constant').eval()
+    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode='constant').eval()
 
     # Load config
     search_pattern = os.path.join(project_path, "**", "*.yaml")

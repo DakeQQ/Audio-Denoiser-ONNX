@@ -74,8 +74,8 @@ class MelBandRoformer_Modified(torch.nn.Module):
                 )
             audio *= self.inv_int16
         audio_L, audio_R = torch.split(audio, [1, 1], dim=1)
-        real_L, imag_L = self.stft_model(audio_L, 'constant')
-        real_R, imag_R = self.stft_model(audio_R, 'constant')
+        real_L, imag_L = self.stft_model(audio_L)
+        real_R, imag_R = self.stft_model(audio_R)
         stft_repr_L = torch.stack((real_L, imag_L), dim=-1)
         stft_repr_R = torch.stack((real_R, imag_R), dim=-1)
         stft_repr = torch.stack((stft_repr_L, stft_repr_R), dim=1)
@@ -108,8 +108,8 @@ class MelBandRoformer_Modified(torch.nn.Module):
 
 print('Export start ...')
 with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
+    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode='constant').eval()
+    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode='constant').eval()
 
     # Load config
     search_pattern = os.path.join(project_path, "**", "*.yaml")

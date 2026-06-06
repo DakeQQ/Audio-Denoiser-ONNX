@@ -71,10 +71,21 @@ else:
     provider_options = None
 
 
-def normalize_to_int16(audio):
+def normalise_audio(audio):
     max_val = np.max(np.abs(audio))
     scaling_factor = 32767.0 / max_val if max_val > 0 else 1.0
     return (audio * float(scaling_factor)).astype(np.int16)
+
+
+def normalise_audio(audio: np.ndarray, target_rms: float = 8192.0) -> np.ndarray:
+    _audio = audio.astype(np.float32)
+    rms = np.sqrt(np.mean(_audio * _audio, dtype=np.float32), dtype=np.float32)
+    if rms > 0:
+        _audio *= (target_rms / (rms + 1e-7))
+        np.clip(_audio, -32768.0, 32767.0, out=_audio)
+        return _audio.astype(np.int16)
+    else:
+        return audio
 
 
 # ONNX Runtime settings
@@ -111,8 +122,11 @@ far_end_audio = np.array(AudioSegment.from_file(test_far_end_audio).set_channels
 near_end_audio_len = len(near_end_audio)
 far_nd_audio_len = len(far_end_audio)
 min_len = min(near_end_audio_len, far_nd_audio_len)
-near_end_audio = normalize_to_int16(near_end_audio[:min_len])
-far_end_audio = normalize_to_int16(far_end_audio[:min_len])
+near_end_audio = near_end_audio[:min_len]
+far_end_audio = far_end_audio[:min_len]
+if NORMALIZE_AUDIO:
+    near_end_audio = normalise_audio(near_end_audio)
+    far_end_audio = normalise_audio(far_end_audio)
 near_end_audio = near_end_audio.reshape(1, 1, -1)
 far_end_audio = far_end_audio.reshape(1, 1, -1)
 

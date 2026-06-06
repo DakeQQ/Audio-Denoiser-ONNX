@@ -77,7 +77,7 @@ class DFSMN(torch.nn.Module):
                     align_corners=True
                 )
             audio = audio - torch.mean(audio)  # Remove DC Offset
-        real_part, imag_part = self.stft_model(audio, 'constant')
+        real_part, imag_part = self.stft_model(audio)
         mel_features = torch.matmul(self.fbank, real_part * real_part + imag_part * imag_part).transpose(1, 2).clamp(min=1e-6).log()
         mask = self.dfsmn(mel_features).transpose(1, 2)
         real_part *= mask
@@ -95,8 +95,8 @@ class DFSMN(torch.nn.Module):
 
 print('Export start ...')
 with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT_STFT, win_length=WINDOW_LENGTH,hop_len=HOP_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT_STFT, win_length=WINDOW_LENGTH, hop_len=HOP_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE).eval()
+    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT_STFT, win_length=WINDOW_LENGTH,hop_len=HOP_LENGTH, max_frames=0, window_type=WINDOW_TYPE, pad_mode='constant').eval()
+    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT_STFT, win_length=WINDOW_LENGTH, hop_len=HOP_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, pad_mode='constant').eval()
     dfsmn = pipeline(
         Tasks.acoustic_noise_suppression,
         model=model_path,

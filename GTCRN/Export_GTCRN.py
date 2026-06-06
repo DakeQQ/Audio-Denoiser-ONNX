@@ -12,8 +12,8 @@ from STFT_Process import STFT_Process
 from modeling_modified.gtcrn_optimized import GTCRN
 
 
-model_path          = "/home/DakeQQ/Downloads/gtcrn-main"                 # The GTCRN download path.
-onnx_model_A        = "/home/DakeQQ/Downloads/GTCRN_ONNX/GTCRN.onnx"      # The exported onnx model path.
+model_path          = "/home/iamj/Downloads/gtcrn-main"                 # The GTCRN download path.
+onnx_model_A        = "/home/iamj/Downloads/GTCRN_ONNX/GTCRN.onnx"      # The exported onnx model path.
 test_noisy_audio    = model_path + "/test_wavs/mix.wav"                   # The noisy audio path.
 save_denoised_audio = "./denoised.wav"                                    # The output denoised audio path.
 

@@ -39,6 +39,12 @@ ORT_Accelerate_Providers = []               # If you have accelerated devices fo
                                             # else keep empty.
 ORT_LOG                     = False         # Enable ONNX Runtime logging for debugging. Set to False for best performance.
 ORT_FP16                    = False         # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.
+CPU_DISABLE_MATMUL_ADD_FUSION = True  # ORT 1.27 wraps rank-3 MatMul+Add in costly Reshape/Gemm/Reshape chains.
+CPU_DISABLE_NCHWC = True              # NCHWc reorders regress mean/tail latency on the target i7-1165G7.
+CPU_EXTRA_DISABLED_OPTIMIZERS = [     # Individually benchmarked on the same CPU / ORT build.
+    "ConvAddActivationFusion",
+    "MatmulTransposeFusion",
+]
 MAX_THREADS                 = 0             # Number of ONNX Runtime/OpenVINO worker threads. Set 0 for auto.
 DEVICE_ID                   = 0             # The GPU id, default to 0.
 NORMALIZE_AUDIO             = False         # Set True to RMS-normalize input audio before inference.
@@ -238,10 +244,17 @@ def _make_session(path: str) -> onnxruntime.InferenceSession:
 
 session_opts_ort = _build_session_opts_ort()
 run_options = _build_run_options(silent=not ORT_LOG)
-disabled_opts = (
-    ["CastFloat16Transformer", "FuseFp16InitializerToFp32NodeTransformer"]
-    if ORT_FP16 else None
-)
+_CPU_EP_ONLY = not ORT_Accelerate_Providers or set(ORT_Accelerate_Providers) == {"CPUExecutionProvider"}
+disabled_opts = []
+if ORT_FP16:
+    disabled_opts.extend(["CastFloat16Transformer", "FuseFp16InitializerToFp32NodeTransformer"])
+if _CPU_EP_ONLY and CPU_DISABLE_MATMUL_ADD_FUSION:
+    disabled_opts.append("MatMulAddFusion")
+if _CPU_EP_ONLY and CPU_DISABLE_NCHWC:
+    disabled_opts.append("NchwcTransformer")
+if _CPU_EP_ONLY:
+    disabled_opts.extend(CPU_EXTRA_DISABLED_OPTIMIZERS)
+disabled_opts = disabled_opts or None
 _packed = {
     'sess_options': session_opts_ort,
     'providers': ORT_Accelerate_Providers or ["CPUExecutionProvider"],

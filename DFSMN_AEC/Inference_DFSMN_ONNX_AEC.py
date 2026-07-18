@@ -36,10 +36,10 @@ def _resolve_onnx_model_path(default_model_path: str) -> str:
 onnx_model_A = _resolve_onnx_model_path(onnx_model_A)
 
 
-ORT_Accelerate_Providers  = []          # If you have accelerated devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
+ORT_Accelerate_Providers  = []  # The mixed FP16/FP32 graph is validated on CUDA. Use [] for CPU fallback.
                                         # else keep empty.
 ORT_LOG                    = False      # Enable ONNX Runtime logging for debugging. Set to False for best performance.
-ORT_FP16                   = False      # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.
+ORT_FP16                   = False      # Preserve the exported mixed-precision policy and disable runtime FP16 recasting passes.
 MAX_THREADS                = 0          # Number of ONNX Runtime/OpenVINO worker threads. Set 0 for auto.
 DEVICE_ID                  = 0          # The GPU id, default to 0.
 NORMALIZE_AUDIO            = False      # Set True to RMS-normalize input audio before inference.
@@ -72,7 +72,7 @@ elif "CUDAExecutionProvider" in ORT_Accelerate_Providers:
             'arena_extend_strategy':                'kNextPowerOfTwo',        # ["kNextPowerOfTwo", "kSameAsRequested"]
             'cudnn_conv_algo_search':               'EXHAUSTIVE',            # ["DEFAULT", "HEURISTIC", "EXHAUSTIVE"]
             'sdpa_kernel':                          '2',                     # ["0", "1", "2"]
-            'use_tf32':                             '1',
+            'use_tf32':                             '0',                     # Match the mixed-precision CUDA validation profile.
             'fuse_conv_bias':                       '0',                     # Set to '0' to avoid potential errors when enabled.
             'cudnn_conv_use_max_workspace':         '1',
             'cudnn_conv1d_pad_to_nc1d':             '0',

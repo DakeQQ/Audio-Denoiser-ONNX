@@ -2,8 +2,9 @@ import gc
 import subprocess
 import sys
 import os
-import glob
+import tempfile
 import yaml
+from itertools import groupby
 from pathlib import Path
 
 from beartype import beartype
@@ -24,14 +25,15 @@ for _candidate in Path(__file__).resolve().parents:
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
 
 
-project_path          = "/home/DakeQQ/Downloads/Mel-Band-Roformer-Vocal-Model-main"       # The Mel-Band-Roformer GitHub project path.
-model_path            = project_path + "/MelBandRoformer.ckpt"                          # The downloaded model.
-parent_path           = Path(__file__).resolve().parent                                  # The folder that contains this script.
-onnx_model_A          = str(parent_path / "MelBandRoformer_ONNX" / "MelBandRoformer.onnx") # The exported onnx model path.
-onnx_model_Metadata   = str(metadata_path_for_model(onnx_model_A))                       # The metadata carrier onnx model path.
+project_path          = str(Path.home() / "Downloads" / "Mel-Band-Roformer-Vocal-Model-main")            # The Mel-Band-Roformer GitHub project path.
+model_path            = str(Path(project_path) / "MelBandRoformer.ckpt")                                # The downloaded model.
+config_path           = str(Path(project_path) / "configs" / "config_vocals_mel_band_roformer.yaml")    # The model configuration.
+parent_path           = Path(__file__).resolve().parent                                                 # The folder that contains this script.
+onnx_model_A          = str(parent_path / "MelBandRoformer_ONNX" / "MelBandRoformer.onnx")              # The exported onnx model path.
+onnx_model_Metadata   = str(metadata_path_for_model(onnx_model_A))                                      # The metadata carrier onnx model path.
 
 DYNAMIC_AXES          = False       # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-OPSET                 = 18
+OPSET                 = 20          # Opset 20 exports exact GELU as one standard ONNX Gelu operator.
 MODEL_SAMPLE_RATE     = 44100       # Mel-Band Roformer runs at 44.1kHz internally.
 IN_SAMPLE_RATE        = 44100       # [8000, 16000, 22500, 24000, 44000, 48000]; input audio sample rate.
 OUT_SAMPLE_RATE       = 44100       # [8000, 16000, 22500, 24000, 44000, 48000]; output audio sample rate.
@@ -50,6 +52,8 @@ MAX_SIGNAL_LENGTH     = 2048 if DYNAMIC_AXES else (((FOLD_WINDOW_LENGTH if USE_B
 INPUT_TO_MODEL_SCALE  = float(MODEL_SAMPLE_RATE / IN_SAMPLE_RATE)
 MODEL_TO_OUTPUT_SCALE = float(OUT_SAMPLE_RATE / MODEL_SAMPLE_RATE)
 INPUT_TO_OUTPUT_SCALE = float(OUT_SAMPLE_RATE / IN_SAMPLE_RATE)
+MODEL_AUDIO_LENGTH    = int(round(EXPORT_AUDIO_LENGTH * INPUT_TO_MODEL_SCALE))
+OUTPUT_AUDIO_LENGTH   = int(round(EXPORT_AUDIO_LENGTH * INPUT_TO_OUTPUT_SCALE))
 
 IN_AUDIO_DTYPE        = 'INT16'     # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
 OUT_AUDIO_DTYPE       = 'INT16'     # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
@@ -62,6 +66,11 @@ def exists(val):
 
 def default(v, d):
     return v if exists(v) else d
+
+
+def l2_normalize(x):
+    """Exact F.normalize lowering without exporter-generated Shape/Expand nodes."""
+    return x / torch.linalg.vector_norm(x, ord=2, dim=-1, keepdim=True).clamp_min(1e-12)
 
 
 def hz_to_mel(frequencies, htk=False):
@@ -374,10 +383,11 @@ class MelBandRoformer(torch.nn.Module):
         super().__init__()
         self.stft_model = stft_model
         self.istft_model = istft_model
-        self.inv_int16 = torch.tensor([INV_INT16], dtype=torch.float16 if OUT_AUDIO_DTYPE == 'F16' else torch.float32)
         self.dynamic = DYNAMIC_AXES
         self.use_batch_fold = use_batch_fold          # Fold long audio into fixed windows and batch-process them together
         self.fold_window = fold_window                # Per-window length (model-rate samples) used when folding
+        if "int" in IN_AUDIO_DTYPE.lower():
+            self.stft_model.stft_kernel.mul_(INV_INT16)
 
         # ---- This is the MONO export. The trained checkpoint is STEREO; the mono
         # weights are FOLDED from it by averaging the L/R channels of the BandSplit
@@ -405,10 +415,7 @@ class MelBandRoformer(torch.nn.Module):
                 ]))
             return layers
 
-        num_freqs = torch.stft(
-            torch.randn(1, 4096), n_fft=stft_n_fft, hop_length=stft_hop_length,
-            win_length=stft_win_length, normalized=stft_normalized, return_complex=True
-        ).shape[1]
+        num_freqs = stft_n_fft // 2 + 1
 
         mel_filter_bank = torch.from_numpy(
             create_mel_filter_bank(sr=sample_rate, n_fft=stft_n_fft, n_mels=num_bands)
@@ -442,17 +449,18 @@ class MelBandRoformer(torch.nn.Module):
             MaskEstimator(dim=dim, dim_inputs=stereo_dim_inputs, depth=mask_estimator_depth)
             for _ in range(num_stems)
         ])
-        st.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')), strict=False)
+        st.load_state_dict(torch.load(model_path, map_location=torch.device('cpu'), weights_only=True), strict=False)
 
         fold_stereo_to_mono(st, layers, band_split, mask_estimators, num_freqs_per_band)
 
-        position_ids = torch.arange(1024, dtype=torch.float32).unsqueeze(-1)
+        rotary_length = max(1024, int(max_signal_len), int(num_bands))
+        position_ids = torch.arange(rotary_length, dtype=torch.float32).unsqueeze(-1)
         inv_freq = 10000.0 ** -(torch.arange(0, dim_head, 2, dtype=torch.float32) / dim_head)
         rotary = torch.repeat_interleave(position_ids * inv_freq, repeats=2, dim=-1).unsqueeze(0).unsqueeze(0)
         cos_rotary_pos_emb = torch.cos(rotary)
         sin_rotary_pos_emb = torch.sin(rotary)
-        rotary_cos_freq = cos_rotary_pos_emb[:, :, :60]
-        rotary_sin_freq = sin_rotary_pos_emb[:, :, :60]
+        rotary_cos_freq = cos_rotary_pos_emb[:, :, :num_bands]
+        rotary_sin_freq = sin_rotary_pos_emb[:, :, :num_bands]
 
         m = nn.Module()
         m.audio_channels = audio_channels
@@ -483,25 +491,42 @@ class MelBandRoformer(torch.nn.Module):
         self.dim_inputs = tuple(int(d) for d in m.band_split.dim_inputs)
         self.n_bands = len(self.dim_inputs)
         self.static_frames = int(max_signal_len)
+        self.fold_batch = int(EXPORT_AUDIO_LENGTH // fold_window) if use_batch_fold else 1
+        if use_batch_fold and EXPORT_AUDIO_LENGTH % fold_window:
+            raise ValueError("EXPORT_AUDIO_LENGTH must be divisible by fold_window")
+        if self.dynamic and use_batch_fold:
+            raise ValueError("Dynamic axes and batch folding cannot be enabled together")
 
-        # ---- Frequency gather / scatter buffers ----
-        # int32 indices for the (Gather) frequency selection; scatter_add still needs
-        # int64 indices (torch requirement). The all-zero scatter base is kept as int8
-        # so its initializer stays tiny; the .to(float) below makes the fresh copy the
-        # scatter accumulates into. The per-output-frequency averaging (denom) is
-        # folded into the MaskEstimator GLU value branch below, so there is no trailing
-        # multiply and no denom buffer.
+        # ---- Frequency gather / reconstruction buffers ----
+        # The per-output-frequency averaging is folded into the MaskEstimator GLU value
+        # branch. In the static graph each output bin receives at most two source masks,
+        # so a tiny inverse Gather replaces ScatterElements and its multi-megabyte indices.
         self.register_buffer('freq_indices', m.freq_indices.to(torch.int32).contiguous())
-        self.register_buffer('scatter_indices', m.freq_indices.view(1, -1, 1, 1).to(torch.int64).contiguous())
-        self.register_buffer('scatter_base', torch.zeros((1, self.freq_complex, self.static_frames, 2), dtype=torch.int8))
+        if self.dynamic:
+            self.register_buffer('scatter_indices', m.freq_indices.view(1, -1, 1, 1).to(torch.int64).contiguous())
+            self.register_buffer('scatter_base', torch.zeros((1, self.freq_complex, self.static_frames, 2), dtype=torch.float32))
+        else:
+            source_positions = [torch.nonzero(m.freq_indices == i, as_tuple=False).flatten() for i in range(self.freq_complex)]
+            self.max_band_overlap = max(len(positions) for positions in source_positions)
+            inverse_indices = torch.full(
+                (self.max_band_overlap, self.freq_complex),
+                self.num_selected,
+                dtype=torch.int32,
+            )
+            for i, positions in enumerate(source_positions):
+                inverse_indices[:len(positions), i] = positions.to(torch.int32)
+            self.register_buffer('inverse_freq_indices', inverse_indices.flatten().contiguous())
+            self.register_buffer('zero_mask', torch.zeros((self.fold_batch, 1, self.static_frames, 2), dtype=torch.float32))
 
-        # ---- Rotary tables (time = fp16 like the original; freq = fp32) ----
+        # ---- Rotary tables ----
         # The GPT-J alternating sign [-1, +1, ...] is folded into the sin tables so
-        # the runtime rotate_half is a plain flip() (no neg / stack / concat).
+        # rotate_half is one fixed int32 Gather rather than flip's large Slice subgraph.
         rot_sign = torch.ones(self.dim_head, dtype=torch.float32)
         rot_sign[0::2] = -1.0
-        self.register_buffer('time_cos', m.cos_rotary_pos_emb.contiguous())
-        self.register_buffer('time_sin', (m.sin_rotary_pos_emb.float() * rot_sign).half().contiguous())
+        rotary_indices = torch.arange(self.dim_head, dtype=torch.int32).reshape(-1, 2).flip(1).reshape(-1)
+        self.register_buffer('rotary_indices', rotary_indices.contiguous())
+        self.register_buffer('time_cos', m.cos_rotary_pos_emb[:, :, :self.static_frames].float().contiguous())
+        self.register_buffer('time_sin', (m.sin_rotary_pos_emb[:, :, :self.static_frames].float() * rot_sign).half().float().contiguous())
         self.register_buffer('freq_cos', m.rotary_cos_freq.float().contiguous())
         self.register_buffer('freq_sin', (m.rotary_sin_freq.float() * rot_sign).contiguous())
 
@@ -514,6 +539,20 @@ class MelBandRoformer(torch.nn.Module):
             self.register_buffer(f'bs_b_{i}', lin.bias.detach().float().contiguous())
             self._bs_w.append(getattr(self, f'bs_w_{i}'))
             self._bs_b.append(getattr(self, f'bs_b_{i}'))
+
+        # Consecutive equal-width bands share one batched MatMul. This preserves the
+        # original band order without padding narrow bands to the 260-wide maximum.
+        self._band_runs = []
+        start = 0
+        for run_index, (dim_in, grouped_dims) in enumerate(groupby(self.dim_inputs)):
+            run_count = len(tuple(grouped_dims))
+            self._band_runs.append((start, run_count, dim_in))
+            if run_count > 1:
+                run_w = torch.stack([self._bs_w[i].transpose(0, 1) for i in range(start, start + run_count)], dim=0).unsqueeze(1)
+                run_b = torch.stack([self._bs_b[i] for i in range(start, start + run_count)], dim=0).unsqueeze(1).unsqueeze(1)
+                self.register_buffer(f'bs_run_w_{run_index}', run_w.contiguous())
+                self.register_buffer(f'bs_run_b_{run_index}', run_b.contiguous())
+            start += run_count
 
         # ---- Transformer layers: fuse norm + qkv + gates, fold attention scale ----
         self._time_tf = [self._fuse_transformer(m.layers[i][0], f'time{i}') for i in range(self.depth)]
@@ -583,14 +622,8 @@ class MelBandRoformer(torch.nn.Module):
             refs[key] = getattr(self, name)
         return refs
 
-    @staticmethod
-    def _rotate_half(x):
-        # GPT-J interleaved rotation via flip(): swaps each adjacent pair (a, b) -> (b, a).
-        # The negation is folded into the sin tables, so flip() alone is cheaper in ORT.
-        return x.unflatten(-1, (-1, 2)).flip(-1).flatten(-2)
-
     def _attention(self, x, p, rcos, rsin, b):
-        normed = F.normalize(x, dim=-1)
+        normed = l2_normalize(x)
         qkvg = F.linear(normed, p['in_w'], p['in_b'])
         di = self.dim_inner
         # One Split separates the fused projection into the qkv block and the gates.
@@ -598,7 +631,7 @@ class MelBandRoformer(torch.nn.Module):
         # (3, b, heads, n, dim_head); split q/k (one batched rotary) from v.
         qkv = qkv_flat.reshape(b, -1, 3, self.heads, self.dim_head).permute(2, 0, 3, 1, 4)
         qk, v = qkv.split([2, 1], dim=0)                                # (2, b, heads, n, dim_head), (1, ...)
-        qk = qk * rcos + self._rotate_half(qk) * rsin                   # one batched rotary for q and k
+        qk = qk * rcos + torch.index_select(qk, -1, self.rotary_indices) * rsin # one batched rotary for q and k
         q, k = qk.split(1, dim=0)                                       # each (1, b, heads, n, dim_head)
         attn = torch.matmul(q, k.transpose(-1, -2)).softmax(dim=-1)
         # Transpose heads out first so the gate (b, n, heads, 1) needs no transpose,
@@ -609,18 +642,29 @@ class MelBandRoformer(torch.nn.Module):
         return F.linear(out, p['out_w'])
 
     def _feedforward(self, x, p):
-        h = F.gelu(F.linear(F.normalize(x, dim=-1), p['ff1_w'], p['ff1_b']))
+        h = F.gelu(F.linear(l2_normalize(x), p['ff1_w'], p['ff1_b']))
         return F.linear(h, p['ff2_w'], p['ff2_b'])
 
     def _transformer(self, x, p, rcos, rsin, b):
         x = x + self._attention(x, p, rcos, rsin, b)
         x = x + self._feedforward(x, p)
-        return F.normalize(x, dim=-1) * p['out_g']
+        return l2_normalize(x) * p['out_g']
 
     def _band_split(self, x):
-        parts = x.split(self.dim_inputs, dim=-1)
-        outs = [F.linear(F.normalize(parts[i], dim=-1), self._bs_w[i], self._bs_b[i]) for i in range(self.n_bands)]
-        return torch.stack(outs, dim=0)                                  # (n_bands, t, dim): band axis already first
+        run_sizes = [run_count * dim_in for _, run_count, dim_in in self._band_runs]
+        parts = x.split(run_sizes, dim=-1)
+        outs = []
+        for run_index, (part, (start, run_count, dim_in)) in enumerate(zip(parts, self._band_runs)):
+            if run_count == 1:
+                outs.append(F.linear(l2_normalize(part), self._bs_w[start], self._bs_b[start]).unsqueeze(0))
+                continue
+            if self.dynamic:
+                run_x = part.reshape(part.shape[0], part.shape[1], run_count, dim_in).permute(2, 0, 1, 3)
+            else:
+                run_x = part.reshape(self.fold_batch, self.static_frames, run_count, dim_in).permute(2, 0, 1, 3)
+            run_out = torch.matmul(l2_normalize(run_x), getattr(self, f'bs_run_w_{run_index}'))
+            outs.append(run_out + getattr(self, f'bs_run_b_{run_index}'))
+        return torch.cat(outs, dim=0)                                    # (n_bands, B, t, dim)
 
     def _mask_estimator(self, x):
         # x arrives as (n_bands, t, dim) so the band axis is already the bmm batch (no permute).
@@ -634,15 +678,15 @@ class MelBandRoformer(torch.nn.Module):
         # non-fold path). Each window is an independent clip: the audio-channel axis is interleaved
         # into freq_complex, and the window batch B rides alongside the band / time batch dims.
         t = stft_repr.shape[-2] if self.dynamic else self.static_frames
-        dtype = stft_repr.dtype
-        B = stft_repr.shape[0] // self.audio_channels
-        stft_repr = stft_repr.reshape(B, self.audio_channels, self.num_freqs, t, 2).transpose(1, 2).reshape(B, self.freq_complex, t, 2)
+        B = self.fold_batch if self.use_batch_fold else 1
+        # Mono already arrives in the required (window, frequency, frame, complex)
+        # layout; the generic channel-interleave reshape/transpose round trip is dead.
         x = torch.index_select(stft_repr, 1, self.freq_indices)
         x = x.transpose(1, 2).reshape(B, t, self.num_selected * 2)
         x = self._band_split(x)                                          # (n_bands, B, t, dim)
 
-        tcos = self.time_cos[:, :, :t].float()
-        tsin = self.time_sin[:, :, :t].float()
+        tcos = self.time_cos[:, :, :t] if self.dynamic else self.time_cos
+        tsin = self.time_sin[:, :, :t] if self.dynamic else self.time_sin
         # Axial attention: time attends over t (batch = n_bands*B), freq attends over bands
         # (batch = t*B). Folding B into each batch keeps every window independent.
         nb = self.n_bands
@@ -654,30 +698,32 @@ class MelBandRoformer(torch.nn.Module):
             x = x.reshape(t, B, nb, self.dim).permute(2, 1, 0, 3)
 
         masks = self._mask_estimator(x.reshape(nb, B * t, self.dim)).view(B, t, self.num_selected, 2).transpose(1, 2)
-        scatter_indices = self.scatter_indices.expand(B, -1, t, 2)
-        base = (self.scatter_base if not self.dynamic else self.scatter_base[:, :, :t]).expand(B, -1, -1, -1).to(dtype)
-        masks_averaged = base.scatter_add_(1, scatter_indices, masks)   # denom averaging folded into MaskEstimator GLU
+        if self.dynamic:
+            scatter_indices = self.scatter_indices.expand(B, -1, t, 2)
+            masks_averaged = self.scatter_base[:, :, :t].scatter_add(1, scatter_indices, masks)
+        else:
+            masks_averaged = torch.index_select(
+                torch.cat((masks, self.zero_mask), dim=1),
+                1,
+                self.inverse_freq_indices,
+            ).reshape(B, self.max_band_overlap, self.freq_complex, t, 2).sum(dim=1)
 
-        real_in, imag_in = stft_repr.split(1, dim=-1)
-        mask_real, mask_imag = masks_averaged.split(1, dim=-1)
+        real_in, imag_in = stft_repr[..., 0], stft_repr[..., 1]
+        mask_real, mask_imag = masks_averaged[..., 0], masks_averaged[..., 1]
         masked_real = real_in * mask_real - imag_in * mask_imag
         masked_imag = real_in * mask_imag + imag_in * mask_real
-        real_part = masked_real.reshape(B, self.num_freqs, self.audio_channels, t).permute(0, 2, 1, 3).reshape(B * self.audio_channels, self.num_freqs, t)
-        imag_part = masked_imag.reshape(B, self.num_freqs, self.audio_channels, t).permute(0, 2, 1, 3).reshape(B * self.audio_channels, self.num_freqs, t)
-        return real_part, imag_part
+        return masked_real, masked_imag
 
     def forward(self, audio):
         audio = audio.float()
-        if IN_SAMPLE_RATE > MODEL_SAMPLE_RATE:
+        if INPUT_TO_MODEL_SCALE < 1.0:
             audio = torch.nn.functional.interpolate(
                 audio,
                 scale_factor=INPUT_TO_MODEL_SCALE,
                 mode='linear',
                 align_corners=False
             )
-        if "int" in IN_AUDIO_DTYPE.lower():
-            audio *= self.inv_int16
-        if IN_SAMPLE_RATE < MODEL_SAMPLE_RATE:
+        if INPUT_TO_MODEL_SCALE > 1.0:
             audio = torch.nn.functional.interpolate(
                 audio,
                 scale_factor=INPUT_TO_MODEL_SCALE,
@@ -685,20 +731,17 @@ class MelBandRoformer(torch.nn.Module):
                 align_corners=False
             )
         if self.use_batch_fold:
-            # audio (1, chan, num_window*W) -> (B*chan, 1, W), window-major / channel-minor.
-            channel_batch = audio.squeeze(0).reshape(self.audio_channels, -1, self.fold_window).transpose(0, 1).reshape(-1, 1, self.fold_window).contiguous()
+            channel_batch = audio.reshape(self.fold_batch, 1, self.fold_window)
         else:
-            channel_batch = audio.squeeze(0).unsqueeze(1).contiguous()     # (1, 1, T): single channel treated as batch
+            channel_batch = audio
         real_stft, imag_stft = self.stft_model(channel_batch)
         stft_repr = torch.stack((real_stft, imag_stft), dim=-1)         # (B*chan, freq, t, complex)
         real_part, imag_part = self._core(stft_repr)
         if self.use_batch_fold:
-            # (B*chan, 1, W) -> (1, chan, num_window*W): stitch each channel's windows back.
-            audio = self.istft_model(real_part, imag_part)
-            audio = audio.reshape(-1, self.audio_channels, audio.shape[-1]).permute(1, 0, 2).reshape(1, self.audio_channels, -1).contiguous()
+            audio = self.istft_model(real_part, imag_part).reshape(1, 1, EXPORT_AUDIO_LENGTH)
         else:
-            audio = self.istft_model(real_part, imag_part).transpose(0, 1).contiguous()
-        if OUT_SAMPLE_RATE < MODEL_SAMPLE_RATE:
+            audio = self.istft_model(real_part, imag_part)
+        if MODEL_TO_OUTPUT_SCALE < 1.0:
             audio = torch.nn.functional.interpolate(
                 audio,
                 scale_factor=MODEL_TO_OUTPUT_SCALE,
@@ -707,7 +750,7 @@ class MelBandRoformer(torch.nn.Module):
             )
         if "int" in OUT_AUDIO_DTYPE.lower():
             audio *= 32767.0
-        if OUT_SAMPLE_RATE > MODEL_SAMPLE_RATE:
+        if MODEL_TO_OUTPUT_SCALE > 1.0:
             audio = torch.nn.functional.interpolate(
                 audio,
                 scale_factor=MODEL_TO_OUTPUT_SCALE,
@@ -733,17 +776,14 @@ def _run_inference_demo():
 print('Export start ...')
 Path(onnx_model_A).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
 with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode='reflect').eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode='reflect').eval()
+    static_model_input_length = FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else MODEL_AUDIO_LENGTH
+    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0 if DYNAMIC_AXES else MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode='reflect', precompute_static=not DYNAMIC_AXES, static_input_length=static_model_input_length).eval()
+    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode='reflect', precompute_static=not DYNAMIC_AXES).eval()
 
-    # Load config
-    search_pattern = os.path.join(project_path, "**", "*.yaml")
-    yaml_files = glob.glob(search_pattern, recursive=True)
-    if not yaml_files:
-        raise FileNotFoundError(f"No YAML configuration file (.yaml) found anywhere in {project_path}")
-    elif len(yaml_files) > 1:
-        print(f"Warning: Multiple YAML files found in project. Using the first one found: {yaml_files[0]}")
-    config_path = yaml_files[0]
+    if not Path(config_path).is_file():
+        raise FileNotFoundError(f"Model configuration not found: {config_path}")
+    if not Path(model_path).is_file():
+        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
     print(f"Loading configuration from: {config_path}")
 
     with open(config_path) as f:
@@ -757,31 +797,40 @@ with torch.inference_mode():
     else:
         IN_TORCH_DTYPE = torch.float16
     audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
-    torch.onnx.export(
-        mel_band_roformer,
-        (audio,),
-        onnx_model_A,
-        input_names=['noisy_audio'],
-        output_names=['denoised_audio'],
-        do_constant_folding=True,
-        dynamic_axes={
-            'noisy_audio': {2: 'audio_len'},
-            'denoised_audio': {2: 'out_audio_len'}
-        } if DYNAMIC_AXES else None,
-        opset_version=17,
-        dynamo=False
-    )
+    final_onnx_path = Path(onnx_model_A).expanduser().resolve()
+    temporary_export = tempfile.TemporaryDirectory(prefix=f'.{final_onnx_path.stem}-', dir=final_onnx_path.parent)
+    temporary_onnx_path = Path(temporary_export.name) / final_onnx_path.name
+    try:
+        torch.onnx.export(
+            mel_band_roformer,
+            (audio,),
+            str(temporary_onnx_path),
+            input_names=['noisy_audio'],
+            output_names=['denoised_audio'],
+            dynamic_axes={
+                'noisy_audio': {2: 'audio_len'},
+                'denoised_audio': {2: 'out_audio_len'}
+            } if DYNAMIC_AXES else None,
+            opset_version=OPSET,
+            dynamo=False
+        )
+        os.replace(temporary_onnx_path, final_onnx_path)
+    finally:
+        temporary_export.cleanup()
     del mel_band_roformer
     del audio
     del custom_stft
     del custom_istft
     gc.collect()
+    
 model_metadata = build_audio_metadata_from_globals(
     globals(), producer=Path(__file__).name, model_name="MelBandRoformer_Mono", task="denoise", model_family="mel_band_roformer",
     max_dynamic_audio_seconds=6, normalize_audio_default=False, input_channels=1, output_channels=1,
     num_audio_inputs=1, feature_kind="stft_mel_band", center_pad=True, pad_mode="reflect",
 )
 stamp_export_metadata(onnx_model_A, model_metadata, OPSET)
+# Remove the persistent raw artifact created by older exporter versions.
+Path(onnx_model_A).with_name(f'{Path(onnx_model_A).stem}.raw{Path(onnx_model_A).suffix}').unlink(missing_ok=True)
 print(f"Metadata saved to: {onnx_model_Metadata}")
 print('\nExport done!')
 _run_inference_demo()

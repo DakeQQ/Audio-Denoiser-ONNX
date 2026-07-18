@@ -1,11 +1,13 @@
 import gc
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
 from STFT_Process import STFT_Process
+from Rewrite_ONNX_GRU_Zero_State import rewrite as rewrite_onnx_gru_zero_state
 
 for _candidate in Path(__file__).resolve().parents:
     if (_candidate / "audio_onnx_metadata.py").exists():
@@ -15,7 +17,7 @@ for _candidate in Path(__file__).resolve().parents:
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
 
 
-model_path             = r"/home/DakeQQ/Downloads/ul-unas-main"                # The UL-UNAS download path.
+model_path             = str(Path.home() / "Downloads" / "ul-unas-main")    # The UL-UNAS download path.
 parent_path            = Path(__file__).resolve().parent                     # The folder that contains this script.
 onnx_model_A           = str(parent_path / "UL_UNAS_ONNX" / "UL_UNAS.onnx")  # The exported onnx model path.
 onnx_model_Metadata    = str(metadata_path_for_model(onnx_model_A))           # The metadata carrier onnx model path.
@@ -36,8 +38,10 @@ BATCH_WINDOW_SECONDS  = 1.5                          # When the configured input
 FOLD_WINDOW_LENGTH    = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH  # Per-window length (model-rate samples) for batch folding, rounded up to a multiple of HOP_LENGTH so every window reconstructs exactly through STFT -> ISTFT.
 USE_BATCH_FOLD        = False                         # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
 EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length: in fold mode it is rounded UP to a whole number of windows; the tail is padded OUTSIDE the model (numpy) by the windowing loop, so no padding op is needed inside the graph.
-MAX_SIGNAL_LENGTH     = (FOLD_WINDOW_LENGTH // HOP_LENGTH + 1) if USE_BATCH_FOLD else (4096 if DYNAMIC_AXES else 512)  # Max STFT frames for the ISTFT COLA trim (per-window frame count in fold mode).
-OPSET                 = 18                           # ONNX opset version. Set it to 17 for better performance and compatibility. You can adjust it if you encounter issues with certain providers.
+STATIC_MODEL_BATCH    = None if DYNAMIC_AXES else (EXPORT_AUDIO_LENGTH // FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else 1)
+STATIC_SIGNAL_LENGTH  = None if DYNAMIC_AXES else ((FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else EXPORT_AUDIO_LENGTH) // HOP_LENGTH + 1)
+MAX_SIGNAL_LENGTH     = 4096 if DYNAMIC_AXES else STATIC_SIGNAL_LENGTH  # Exact static frame count lets ISTFT precompute the final trim/normalization instead of carrying an oversized tail.
+OPSET                 = 20                           # Required by this PyTorch exporter and the strict GRU zero-state rewrite; revalidate the rewrite before changing it.
 IN_AUDIO_DTYPE        = 'INT16'                      # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
 OUT_AUDIO_DTYPE       = 'INT16'                      # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16             = float(1.0 / 32768.0)
@@ -97,6 +101,12 @@ class ERB(nn.Module):
         x_erb_low, x_erb_high = x_erb.split([self.erb_subband_1, self.erb_subband_2], dim=-1)
         return torch.cat([x_erb_low, torch.matmul(x_erb_high, self.ierb_weight_t)], dim=-1)
 
+    def prepare_for_export_(self):
+        self.erb_weight_t = self.erb_fc.weight.transpose(0, 1).contiguous().detach()
+        self.ierb_weight_t = self.ierb_fc.weight.transpose(0, 1).contiguous().detach()
+        self.erb_fc = None
+        self.ierb_fc = None
+
 
 class AffinePReLU(nn.Module):
     def __init__(self, channels, width, init=0.25):
@@ -105,11 +115,18 @@ class AffinePReLU(nn.Module):
         self.affine_bias = nn.Parameter(torch.zeros(1, channels, 1, width))
         self.slope_weight = nn.Parameter(torch.empty(1, channels, 1, 1))
         nn.init.constant_(self.slope_weight, init)
+        self.register_buffer('positive_weight', torch.empty(0), persistent=False)
+        self.register_buffer('negative_weight', torch.empty(0), persistent=False)
+
+    def fuse_for_export_(self):
+        self.positive_weight = (self.affine_weight + 1.0).detach()
+        self.negative_weight = (self.affine_weight + self.slope_weight).detach()
+        self.affine_weight = None
+        self.slope_weight = None
 
     def forward(self, x):
-        y = self.affine_weight * x + self.affine_bias
-        y = y + torch.where(x > 0, x, self.slope_weight * x)
-        return y
+        weight = torch.where(x > 0, self.positive_weight, self.negative_weight)
+        return weight * x + self.affine_bias
 
 
 class FA(nn.Module):
@@ -117,7 +134,9 @@ class FA(nn.Module):
         super().__init__()
         self.r = freq_comp_ratio
 
-        self.gru = nn.GRU(self.r, self.r, batch_first=True, bidirectional=True)
+        # ONNX GRU is sequence-first. Keeping that layout here avoids the
+        # exporter's batch-first input/output Transpose pair around every GRU.
+        self.gru = nn.GRU(self.r, self.r, batch_first=False, bidirectional=True)
         self.fc = nn.Linear(2 * self.r, self.r)
         self.nfreq = nfreq
 
@@ -130,25 +149,25 @@ class FA(nn.Module):
         self.F_pad = nfreq + self.pad_len
         self.H = self.F_pad // self.r
 
-    def forward(self, x):
-        """x: (B, C, T, F)"""
-        b = x.shape[0]                     # batch — read once, reused for the final reshape (batch>1 under fold)
-        x = torch.mean(x.square(), dim=1)  # (B, T, F)
+    def forward_power(self, power):
+        """Frequency attention from a shared squared input, ``(B,C,T,F)``."""
+        b = STATIC_MODEL_BATCH if STATIC_MODEL_BATCH is not None else power.shape[0]
+        t = STATIC_SIGNAL_LENGTH if STATIC_SIGNAL_LENGTH is not None else power.shape[2]
+        x = torch.mean(power, dim=1)  # (B, T, F)
 
         x = nn.functional.pad(x, (0, self.pad_len))
-        x = x.view(1, -1, self.H, self.r)
-
-        # Replace einops: 'b t h c -> (b t) h c'
-        x = x.reshape(-1, self.H, self.r)
-        x, _ = self.gru(x)  # (BT, H, 2r)
-        x = self.fc(x)      # (BT, H, r)
-
-        x = x.reshape(b, 1, -1, self.F_pad)  # (B, 1, T, F)
+        x = x.reshape(-1, self.H, self.r).transpose(0, 1)  # (H, B*T, r)
+        x = self.gru(x)[0]                       # (H, B*T, 2r)
+        x = self.fc(x)                           # (H, B*T, r)
+        x = x.transpose(0, 1).reshape(b, 1, t, self.F_pad)
 
         if self.pad_len > 0:
             x = x[..., :self.nfreq]
 
         return x
+
+    def forward(self, x):
+        return self.forward_power(x * x)
 
 
 class cTFA(nn.Module):
@@ -156,38 +175,37 @@ class cTFA(nn.Module):
     def __init__(self, channels, width):
         super().__init__()
         self.channels = channels
-        self.ta_gru = nn.GRU(channels, channels * 2, 1, batch_first=True)
+        self.ta_gru = nn.GRU(channels, channels * 2, 1, batch_first=False)
         self.ta_fc = nn.Linear(channels * 2, channels)
 
         self.fa = FA(width)
 
     def forward(self, x):
         """x: (B,C,T,F)"""
-        zt = torch.mean(x.pow(2), dim=-1)  # (B,C,T)
-        at = self.ta_gru(zt.transpose(1, 2))[0]
-        at = self.ta_fc(at).transpose(1, 2)  # (B,C,T)
+        power = x * x
+        zt = torch.mean(power, dim=-1)  # (B,C,T)
+        at = self.ta_gru(zt.permute(2, 0, 1))[0]
+        at = self.ta_fc(at).permute(1, 2, 0)  # (B,C,T)
         at = torch.sigmoid(at).unsqueeze(-1)
 
-        af = self.fa(x)
+        af = self.fa.forward_power(power)
         af = torch.sigmoid(af)
 
         return at * x * af
 
 
 class Shuffle(nn.Module):
-    def __init__(self):
+    def __init__(self, channels):
         super().__init__()
+        half = channels // 2
+        indices = torch.stack((torch.arange(half), torch.arange(half) + half), dim=1).reshape(-1)
+        # Gather accepts int32 in ONNX and on both target EPs; avoid an int64
+        # index initializer and the Split -> Unsqueeze -> Concat -> Reshape chain.
+        self.register_buffer('indices', indices.to(torch.int32), persistent=False)
 
     def forward(self, x):
         """x: (B,2C,T,F) -> channel shuffle"""
-        b, C2, _, F = x.shape
-        C = C2 // 2
-        x1, x2 = x.split(C, dim=1)
-        # Replace einops: stack then interleave
-        # x1,x2 each (B,C,T,F) -> stack on dim=2 -> (B,C,2,T,F) -> reshape to (B,2C,T,F)
-        x = torch.stack([x1, x2], dim=2)  # (B, C, 2, T, F)
-        x = x.reshape(b, C2, -1, F)
-        return x
+        return torch.index_select(x, 1, self.indices)
 
 
 class XConvBlock(nn.Module):
@@ -209,21 +227,21 @@ class XConvBlock(nn.Module):
         kt = kernel_size[0]
 
         if use_deconv:
-            pt = kt - 1
+            pt = 0
             conv_module = nn.ConvTranspose2d
         else:
-            pt = 0
+            pt = kt - 1
             conv_module = nn.Conv2d
 
         pf = kernel_size[1] // 2
 
-        self.pad = nn.ZeroPad2d([0, 0, kt - 1, 0])
         self.conv = conv_module(in_channels, out_channels, kernel_size,
                                 stride=(1, stride), padding=(pt, pf), groups=groups)
+        self.causal_trim = kt - 1
         self.bn = nn.BatchNorm2d(out_channels)
         self.act = AffinePReLU(out_channels, width) if not is_last else nn.Identity()
         self.ctfa = cTFA(out_channels, width)
-        self.shuffle = Shuffle() if (not is_last and groups == 2) else nn.Identity()
+        self.shuffle = Shuffle(out_channels) if (not is_last and groups == 2) else nn.Identity()
 
     def fuse_bn_(self):
         if isinstance(self.bn, nn.Identity):
@@ -246,8 +264,9 @@ class XConvBlock(nn.Module):
         self.bn = nn.Identity()
 
     def forward(self, x):
-        x = self.pad(x)
         x = self.conv(x)
+        if self.causal_trim:
+            x = x[..., :-self.causal_trim, :]
         x = self.bn(x)
         x = self.act(x)
         x = self.ctfa(x)
@@ -273,10 +292,10 @@ class XDWSBlock(nn.Module):
         kt = kernel_size[0]
 
         if use_deconv:
-            pt = kt - 1
+            pt = 0
             conv_module = nn.ConvTranspose2d
         else:
-            pt = 0
+            pt = kt - 1
             conv_module = nn.Conv2d
 
         pf = kernel_size[1] // 2
@@ -292,11 +311,11 @@ class XDWSBlock(nn.Module):
         self.pconv_conv = nn.Conv2d(in_channels, out_channels, 1, groups=groups)
         self.pconv_bn = nn.BatchNorm2d(out_channels)
         self.pconv_act = AffinePReLU(out_channels, in_width)
-        self.pconv_shuffle = Shuffle() if groups == 2 else nn.Identity()
+        self.pconv_shuffle = Shuffle(out_channels) if groups == 2 else nn.Identity()
 
-        self.dconv_pad = nn.ZeroPad2d([0, 0, kt - 1, 0])
         self.dconv_conv = conv_module(out_channels, out_channels, kernel_size,
                                       stride=(1, stride), padding=(pt, pf), groups=out_channels)
+        self.dconv_causal_trim = kt - 1
         self.dconv_bn = nn.BatchNorm2d(out_channels)
         self.dconv_act = AffinePReLU(out_channels, width) if not is_last else nn.Identity()
         self.dconv_ctfa = cTFA(out_channels, width)
@@ -329,8 +348,9 @@ class XDWSBlock(nn.Module):
         h = self.pconv_act(h)
         h = self.pconv_shuffle(h)
 
-        h = self.dconv_pad(h)
         h = self.dconv_conv(h)
+        if self.dconv_causal_trim:
+            h = h[..., :-self.dconv_causal_trim, :]
         h = self.dconv_bn(h)
         h = self.dconv_act(h)
         h = self.dconv_ctfa(h)
@@ -355,10 +375,10 @@ class XMBBlocks(nn.Module):
         kt = kernel_size[0]
 
         if use_deconv:
-            pt = kt - 1
+            pt = 0
             conv_module = nn.ConvTranspose2d
         else:
-            pt = 0
+            pt = kt - 1
             conv_module = nn.Conv2d
 
         pf = kernel_size[1] // 2
@@ -374,18 +394,19 @@ class XMBBlocks(nn.Module):
         self.pconv1_conv = nn.Conv2d(in_channels, out_channels, 1, groups=groups)
         self.pconv1_bn = nn.BatchNorm2d(out_channels)
         self.pconv1_act = AffinePReLU(out_channels, in_width)
-        self.pconv1_shuffle = Shuffle() if groups == 2 else nn.Identity()
+        self.pconv1_shuffle = Shuffle(out_channels) if groups == 2 else nn.Identity()
 
-        self.dconv_pad = nn.ZeroPad2d([0, 0, kt - 1, 0])
         self.dconv_conv = conv_module(out_channels, out_channels, kernel_size,
                                       stride=(1, stride), padding=(pt, pf), groups=out_channels)
+        self.dconv_causal_trim = kt - 1
         self.dconv_bn = nn.BatchNorm2d(out_channels)
         self.dconv_act = AffinePReLU(out_channels, width)
 
         self.pconv2_conv = nn.Conv2d(out_channels, out_channels, 1, groups=groups)
         self.pconv2_bn = nn.BatchNorm2d(out_channels)
         self.pconv2_ctfa = cTFA(out_channels, width)
-        self.shuffle = Shuffle() if (not is_last and groups == 2) else nn.Identity()
+        self.shuffle = Shuffle(out_channels) if (not is_last and groups == 2) else nn.Identity()
+        self.use_residual = in_channels == out_channels and stride == 1
 
     def fuse_bn_(self):
         for conv_attr, bn_attr in [('pconv1_conv', 'pconv1_bn'), ('dconv_conv', 'dconv_bn'), ('pconv2_conv', 'pconv2_bn')]:
@@ -415,8 +436,9 @@ class XMBBlocks(nn.Module):
         x = self.pconv1_act(x)
         x = self.pconv1_shuffle(x)
 
-        x = self.dconv_pad(x)
         x = self.dconv_conv(x)
+        if self.dconv_causal_trim:
+            x = x[..., :-self.dconv_causal_trim, :]
         x = self.dconv_bn(x)
         x = self.dconv_act(x)
 
@@ -424,7 +446,7 @@ class XMBBlocks(nn.Module):
         x = self.pconv2_bn(x)
         x = self.pconv2_ctfa(x)
 
-        if x.shape == input_x.shape:
+        if self.use_residual:
             x = x + input_x
 
         x = self.shuffle(x)
@@ -433,42 +455,73 @@ class XMBBlocks(nn.Module):
 
 class GRNN(nn.Module):
     """Grouped RNN"""
-    def __init__(self, input_size, hidden_size, num_layers=1, batch_first=True, bidirectional=False, max_batch_size=1):
+    def __init__(self, input_size, hidden_size, num_layers=1, bidirectional=False):
         super().__init__()
         self.hidden_size = hidden_size
         self.half_hidden = hidden_size // 2
         self.half_input = input_size // 2
         self.num_layers = num_layers
         self.bidirectional = bidirectional
-        self.h_dim = num_layers * (2 if bidirectional else 1)
-        self.max_batch_size = max_batch_size
-        self.register_buffer(
-            'hidden_buffer',
-            torch.zeros([self.h_dim, max_batch_size, hidden_size], dtype=torch.int8),
-            persistent=False,
+        self.rnn1 = nn.GRU(input_size // 2, hidden_size // 2, num_layers, batch_first=False, bidirectional=bidirectional)
+        self.rnn2 = nn.GRU(input_size // 2, hidden_size // 2, num_layers, batch_first=False, bidirectional=bidirectional)
+        self.fused_rnn = None
+
+    def fuse_for_export_(self):
+        if self.num_layers != 1:
+            raise ValueError("Grouped-GRU fusion currently requires num_layers=1")
+        fused = nn.GRU(
+            self.half_input * 2,
+            self.hidden_size,
+            self.num_layers,
+            batch_first=False,
+            bidirectional=self.bidirectional,
         )
-        self.rnn1 = nn.GRU(input_size // 2, hidden_size // 2, num_layers, batch_first=batch_first, bidirectional=bidirectional)
-        self.rnn2 = nn.GRU(input_size // 2, hidden_size // 2, num_layers, batch_first=batch_first, bidirectional=bidirectional)
+        with torch.no_grad():
+            for suffix in ('', '_reverse') if self.bidirectional else ('',):
+                for kind in ('weight_ih_l0', 'weight_hh_l0'):
+                    source1 = getattr(self.rnn1, kind + suffix)
+                    source2 = getattr(self.rnn2, kind + suffix)
+                    target = getattr(fused, kind + suffix)
+                    target.zero_()
+                    source_width = source1.shape[1]
+                    for gate in range(3):
+                        dst = gate * self.hidden_size
+                        src = gate * self.half_hidden
+                        target[dst:dst + self.half_hidden, :source_width].copy_(
+                            source1[src:src + self.half_hidden]
+                        )
+                        target[dst + self.half_hidden:dst + self.hidden_size, source_width:].copy_(
+                            source2[src:src + self.half_hidden]
+                        )
+                for kind in ('bias_ih_l0', 'bias_hh_l0'):
+                    source1 = getattr(self.rnn1, kind + suffix)
+                    source2 = getattr(self.rnn2, kind + suffix)
+                    target = getattr(fused, kind + suffix)
+                    for gate in range(3):
+                        dst = gate * self.hidden_size
+                        src = gate * self.half_hidden
+                        target[dst:dst + self.half_hidden].copy_(source1[src:src + self.half_hidden])
+                        target[dst + self.half_hidden:dst + self.hidden_size].copy_(source2[src:src + self.half_hidden])
+        self.fused_rnn = fused.eval()
+        if self.bidirectional:
+            indices = torch.cat((
+                torch.arange(self.half_hidden),
+                torch.arange(self.hidden_size, self.hidden_size + self.half_hidden),
+                torch.arange(self.half_hidden, self.hidden_size),
+                torch.arange(self.hidden_size + self.half_hidden, self.hidden_size * 2),
+            ))
+            self.fused_output_indices = indices
+        self.rnn1 = None
+        self.rnn2 = None
 
-    def forward(self, x, h=None):
-        """
-        x: (B, seq_length, input_size)
-        h: (h_dim, B, hidden_size)
-        """
-        if h is None:
-            batch_size = x.shape[0]
-            if batch_size > self.hidden_buffer.shape[1]:
-                self.hidden_buffer = self.hidden_buffer.new_zeros(self.h_dim, batch_size, self.hidden_size)
-            h = self.hidden_buffer[:, :batch_size, :].float()
-            if h.device != x.device or h.dtype != x.dtype:
-                h = h.to(device=x.device, dtype=x.dtype)
-
+    def forward(self, x):
+        """Grouped GRU over sequence-first ``(S,B,C)`` input."""
+        if self.fused_rnn is not None:
+            return self.fused_rnn(x)[0]
         x1, x2 = x.split(self.half_input, dim=-1)
-        h1, h2 = h.split(self.half_hidden, dim=-1)
-
-        y1, h1 = self.rnn1(x1, h1.contiguous())
-        y2, h2 = self.rnn2(x2, h2.contiguous())
-        return torch.cat([y1, y2], dim=-1), torch.cat([h1, h2], dim=-1)
+        y1, _ = self.rnn1(x1)
+        y2, _ = self.rnn2(x2)
+        return torch.cat([y1, y2], dim=-1)
 
 
 class DPGRNN(nn.Module):
@@ -479,32 +532,46 @@ class DPGRNN(nn.Module):
         self.width = width
         self.hidden_size = hidden_size
 
-        self.intra_rnn = GRNN(input_size=input_size, hidden_size=hidden_size // 2, bidirectional=True)
+        self.intra_rnn = GRNN(
+            input_size=input_size,
+            hidden_size=hidden_size // 2,
+            bidirectional=True,
+        )
         self.intra_fc = nn.Linear(hidden_size, input_size)
         self.intra_ln = nn.LayerNorm((width, input_size), eps=1e-8)
 
-        self.inter_rnn = GRNN(input_size=input_size, hidden_size=hidden_size, bidirectional=False)
+        self.inter_rnn = GRNN(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            bidirectional=False,
+        )
         self.inter_fc = nn.Linear(hidden_size, input_size)
         self.inter_ln = nn.LayerNorm((width, input_size), eps=1e-8)
 
+    def fold_fused_intra_order_(self):
+        inverse = torch.argsort(self.intra_rnn.fused_output_indices)
+        self.intra_fc.weight = nn.Parameter(
+            self.intra_fc.weight[:, inverse].contiguous().detach()
+        )
+
     def forward(self, x):
-        """x: (B, C, T, F)"""
-        t = x.shape[2]                                    # time frames — read once, reused for every reshape (batch dim uses -1)
+        """Dual-path processing in canonical ``(B,T,F,C)`` layout."""
+        b = STATIC_MODEL_BATCH if STATIC_MODEL_BATCH is not None else x.shape[0]
+        t = STATIC_SIGNAL_LENGTH if STATIC_SIGNAL_LENGTH is not None else x.shape[1]
 
         ## Intra RNN
-        x_perm = x.permute(0, 2, 3, 1)  # (B, T, F, C)
-        intra_in = x_perm.reshape(-1, self.width, self.input_size)  # (B*T, F, C)
-        intra_x = self.intra_fc(self.intra_rnn(intra_in)[0])       # (B*T, F, C)
-        intra_x = self.intra_ln(intra_x.reshape(-1, t, self.width, self.input_size))  # (B, T, F, C) — batch via -1 (reshape: intra_x is contiguous but keep parity with permuted path)
-        intra_out = x_perm + intra_x  # (B, T, F, C)
+        intra_in = x.permute(2, 0, 1, 3).reshape(self.width, -1, self.input_size)
+        intra_x = self.intra_fc(self.intra_rnn(intra_in))
+        intra_x = intra_x.reshape(self.width, b, -1, self.input_size).permute(1, 2, 0, 3)
+        intra_x = self.intra_ln(intra_x)
+        intra_out = x + intra_x
 
         ## Inter RNN
-        inter_in = intra_out.transpose(1, 2).reshape(-1, t, self.input_size)  # (B*F, T, C) — reshape: transposed (non-contiguous)
-        inter_x = self.inter_fc(self.inter_rnn(inter_in)[0])  # (B*F, T, C)
-        inter_x = self.inter_ln(inter_x.reshape(-1, self.width, t, self.input_size).transpose(1, 2))  # (B, T, F, C) — batch via -1
-        inter_out = intra_out + inter_x  # (B, T, F, C)
-
-        return inter_out.permute(0, 3, 1, 2)  # (B, C, T, F)
+        inter_in = intra_out.permute(1, 0, 2, 3).reshape(-1, b * self.width, self.input_size)
+        inter_x = self.inter_fc(self.inter_rnn(inter_in))
+        inter_x = inter_x.reshape(-1, b, self.width, self.input_size).permute(1, 0, 2, 3)
+        inter_x = self.inter_ln(inter_x)
+        return intra_out + inter_x
 
 
 class Encoder(nn.Module):
@@ -613,38 +680,64 @@ class ULUNAS(nn.Module):
         )
 
         self.decoder = Decoder(types, channels, widths, kernels, strides, groups, final_width=erb_low + erb_high)
+        self._export_prepared = False
 
     def fuse_bn_(self):
         """Fuse all BatchNorm layers into Conv weights for inference."""
         self.encoder.fuse_bn_()
         self.decoder.fuse_bn_()
 
-    def forward(self, magnitude):
+    def prepare_for_export_(self):
+        if self._export_prepared:
+            return
+        self.fuse_bn_()
+        self.erb.prepare_for_export_()
+        for module in self.modules():
+            if isinstance(module, AffinePReLU):
+                module.fuse_for_export_()
+        first_conv = self.encoder.en_convs[0].conv
+        first_conv.weight = nn.Parameter(
+            (first_conv.weight * float(0.5 / np.log(10.0))).detach()
+        )
+        for module in list(self.modules()):
+            if isinstance(module, GRNN):
+                module.fuse_for_export_()
+        for module in self.dpgrnn:
+            module.fold_fused_intra_order_()
+        self._export_prepared = True
+
+    def forward(self, power):
         """
         Modified forward for ONNX export.
         STFT/ISTFT handled externally by STFT_Process.
 
         Args:
-            magnitude: (1, F, T) from external STFT, where F = n_fft//2 + 1
+            power: squared magnitude (1, F, T) from the external STFT
 
         Returns:
-            mask: (1, F, T) sigmoid mask to apply to real and imag parts
+            mask: (B, 1, F, T) sigmoid mask to broadcast over real/imag channels
         """
-        # magnitude: (1, F, T) -> (1, 1, T, F) for 2D conv processing
-        feat = torch.log10(magnitude.unsqueeze(1).transpose(-1, -2))  # (1, 1, T, F=257)
+        # log10(sqrt(power).clamp_min(1e-12)) equals
+        # log(clamp_min(power, 1e-24)) * 0.5/ln(10).  The constant scale is
+        # folded into encoder.en_convs[0].conv by prepare_for_export_().
+        feat = torch.log(power.clamp_min(1e-24).unsqueeze(1).transpose(-1, -2))
 
         feat = self.erb.bm(feat)  # (1, 1, T, 129)
 
         feat, en_outs = self.encoder(feat)
 
-        feat = self.dpgrnn(feat)  # (1, 16, T, 33)
+        # Keep both dual-path blocks in (B,T,F,C); this removes the inverse
+        # NCHW <-> BTFC permutation between adjacent DPGRNN blocks.
+        feat = feat.permute(0, 2, 3, 1)
+        for block in self.dpgrnn:
+            feat = block(feat)
+        feat = feat.permute(0, 3, 1, 2)
 
         m_feat = self.decoder(feat, en_outs)  # (1, 1, T, 129) with sigmoid already applied
 
         m = self.erb.bs(m_feat)  # (1, 1, T, 257)
 
-        # Transpose mask back to (1, F, T) to match external real/imag shape
-        return m.squeeze(1).transpose(-1, -2)  # (1, 257, T) = (1, F, T)
+        return m.transpose(-1, -2)  # (B, 1, F, T)
 
 def convert_state_dict(original_sd, types):
     """
@@ -731,15 +824,15 @@ def convert_state_dict(original_sd, types):
 
 
 class ULUNAS_CUSTOM(torch.nn.Module):
-    def __init__(self, ulunas, stft_model, istft_model, in_sample_rate, out_sample_rate, remove_dc_offset=False, use_batch_fold=False, fold_window=0):
+    def __init__(self, ulunas, stft_model, istft_model, in_sample_rate, out_sample_rate, remove_dc_offset=False, use_batch_fold=False, fold_window=0, input_scale_folded=False, output_scale_folded=False):
         super(ULUNAS_CUSTOM, self).__init__()
         self.ulunas = ulunas
         self.stft_model = stft_model
         self.istft_model = istft_model
-        self.inv_int16 = torch.tensor([INV_INT16], dtype=torch.float16 if OUT_AUDIO_DTYPE == 'F16' else torch.float32)
-        self.output_pcm_scale = 32767.0
         self.in_sample_rate = in_sample_rate
         self.out_sample_rate = out_sample_rate
+        self.input_scale_folded = input_scale_folded
+        self.output_scale_folded = output_scale_folded
         self.in_sample_rate_scale = in_sample_rate / 16000.0
         self.out_sample_rate_scale = out_sample_rate / 16000.0
         self.model_rate_scale = 1.0 / self.in_sample_rate_scale
@@ -763,8 +856,8 @@ class ULUNAS_CUSTOM(torch.nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        if "int" in IN_AUDIO_DTYPE.lower():
-            audio = audio * self.inv_int16      # int16 PCM -> [-1, 1]; F16/F32 inputs already arrive normalized.
+        if "int" in IN_AUDIO_DTYPE.lower() and not self.input_scale_folded:
+            audio = audio * INV_INT16      # int16 PCM -> [-1, 1]; F16/F32 inputs already arrive normalized.
         if self.resample_after_centering:
             audio = torch.nn.functional.interpolate(
                 audio,
@@ -779,17 +872,21 @@ class ULUNAS_CUSTOM(torch.nn.Module):
             # the model, in numpy, by the windowing loop), so fold (1, 1, num_window*W) ->
             # (num_window, 1, W) and run the whole batch at once. No padding op inside the graph.
             audio = audio.reshape(-1, 1, self.fold_window)              # (num_window, 1, W)
-        real_part, imag_part = self.stft_model(audio)
-        magnitude = torch.sqrt(real_part * real_part + imag_part * imag_part + 1e-12)
+        packed_spectrum = self.stft_model._stft_B_packed_forward(audio)
+        batch = STATIC_MODEL_BATCH if STATIC_MODEL_BATCH is not None else packed_spectrum.shape[0]
+        frames = STATIC_SIGNAL_LENGTH if STATIC_SIGNAL_LENGTH is not None else packed_spectrum.shape[2]
+        packed_spectrum = packed_spectrum.reshape(batch, 2, NFFT // 2 + 1, frames)
+        power = torch.sum(packed_spectrum * packed_spectrum, dim=1)
         # UL-UNAS returns a real-valued sigmoid mask (1, F, T)
-        mask = self.ulunas(magnitude)
-        # Apply mask to both real and imag (simple magnitude masking)
-        s_real = real_part * mask
-        s_imag = imag_part * mask
-        audio = self.istft_model(s_real, s_imag)
+        mask = self.ulunas(power)
+        packed_spectrum = packed_spectrum * mask
+        audio = self.istft_model._istft_B_packed_forward(
+            packed_spectrum.reshape(batch, NFFT + 2, frames)
+        )
         if self.use_batch_fold:
             audio = audio.reshape(1, 1, -1)                             # stitch windows back
-        audio = audio[..., :audio_len]
+        if DYNAMIC_AXES:
+            audio = audio[..., :audio_len]
         if self.output_resample_before_pcm:
             audio = torch.nn.functional.interpolate(
                 audio,
@@ -797,8 +894,8 @@ class ULUNAS_CUSTOM(torch.nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        if "int" in OUT_AUDIO_DTYPE.lower():
-            audio = audio * self.output_pcm_scale      # [-1, 1] -> int16 PCM; F16/F32 outputs stay normalized.
+        if "int" in OUT_AUDIO_DTYPE.lower() and not self.output_scale_folded:
+            audio = audio * 32767.0      # [-1, 1] -> int16 PCM; F16/F32 outputs stay normalized.
         if self.output_resample_after_pcm:
             audio = torch.nn.functional.interpolate(
                 audio,
@@ -806,7 +903,8 @@ class ULUNAS_CUSTOM(torch.nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        audio = torch.nan_to_num(audio, nan=0.0, posinf=32767.0, neginf=-32768.0)
+        if "int" not in IN_AUDIO_DTYPE.lower():
+            audio = torch.nan_to_num(audio, nan=0.0, posinf=32767.0, neginf=-32768.0)
         if "int" in OUT_AUDIO_DTYPE.lower():
             return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
         if "32" in OUT_AUDIO_DTYPE:
@@ -822,48 +920,97 @@ def _run_inference_demo():
 
 
 print('Export start ...')
-Path(onnx_model_A).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode=STFT_PAD_MODE).eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode=STFT_PAD_MODE).eval()
-    ulunas = ULUNAS().eval()
-    ckpt = torch.load(model_path + "/checkpoints/model_trained_on_dns3.tar", map_location='cpu', weights_only=False)
-    converted_sd = convert_state_dict(ckpt['model'], types=[0, 2, 1, 2, 1])
-    ulunas.load_state_dict(converted_sd, strict=False)
-    ulunas.fuse_bn_()  # Fuse BatchNorm into Conv weights for optimized inference
-    ulunas = ULUNAS_CUSTOM(ulunas.float(), custom_stft, custom_istft, IN_SAMPLE_RATE, OUT_SAMPLE_RATE, remove_dc_offset=REMOVE_DC_OFFSET, use_batch_fold=USE_BATCH_FOLD, fold_window=FOLD_WINDOW_LENGTH)
-    if "32" in IN_AUDIO_DTYPE:
-        IN_TORCH_DTYPE = torch.float32
-    elif "int" in IN_AUDIO_DTYPE.lower():
-        IN_TORCH_DTYPE = torch.int16
-    else:
-        IN_TORCH_DTYPE = torch.float16
-    audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
-    torch.onnx.export(
-        ulunas,
-        (audio,),
+export_dir = Path(onnx_model_A).expanduser().resolve().parent
+export_dir.mkdir(parents=True, exist_ok=True)
+for stale_artifact in (
+    export_dir / "UL_UNAS.raw.onnx",
+    export_dir / "UL_UNAS.raw_Metadata.onnx",
+    Path(f"{onnx_model_A}.rewrite.json"),
+):
+    stale_artifact.unlink(missing_ok=True)
+
+with tempfile.TemporaryDirectory(prefix="ul_unas_onnx_export_") as temp_dir:
+    raw_model_path = str(Path(temp_dir) / "UL_UNAS.raw.onnx")
+    rewrite_report_path = Path(temp_dir) / "UL_UNAS.rewrite.json"
+    with torch.inference_mode():
+        custom_stft = STFT_Process(
+            model_type='stft_B',
+            n_fft=NFFT,
+            hop_len=HOP_LENGTH,
+            win_length=WINDOW_LENGTH,
+            max_frames=0,
+            window_type=WINDOW_TYPE,
+            center_pad=True,
+            pad_mode=STFT_PAD_MODE,
+            input_scale=INV_INT16 if "int" in IN_AUDIO_DTYPE.lower() and IN_SAMPLE_RATE == MODEL_SAMPLE_RATE else 1.0,
+        ).eval()
+        custom_istft = STFT_Process(
+            model_type='istft_B',
+            n_fft=NFFT,
+            hop_len=HOP_LENGTH,
+            win_length=WINDOW_LENGTH,
+            max_frames=MAX_SIGNAL_LENGTH,
+            window_type=WINDOW_TYPE,
+            center_pad=True,
+            pad_mode=STFT_PAD_MODE,
+            output_scale=32767.0 if "int" in OUT_AUDIO_DTYPE.lower() and OUT_SAMPLE_RATE == MODEL_SAMPLE_RATE else 1.0,
+            static_norm=not DYNAMIC_AXES,
+        ).eval()
+        ulunas = ULUNAS().eval()
+        ckpt = torch.load(model_path + "/checkpoints/model_trained_on_dns3.tar", map_location='cpu', weights_only=False)
+        converted_sd = convert_state_dict(ckpt['model'], types=[0, 2, 1, 2, 1])
+        ulunas.load_state_dict(converted_sd, strict=False)
+        ulunas.prepare_for_export_()  # Fuse BatchNorm and learned activation-side constants.
+        ulunas = ULUNAS_CUSTOM(
+            ulunas.float(),
+            custom_stft,
+            custom_istft,
+            IN_SAMPLE_RATE,
+            OUT_SAMPLE_RATE,
+            remove_dc_offset=REMOVE_DC_OFFSET,
+            use_batch_fold=USE_BATCH_FOLD,
+            fold_window=FOLD_WINDOW_LENGTH,
+            input_scale_folded="int" in IN_AUDIO_DTYPE.lower() and IN_SAMPLE_RATE == MODEL_SAMPLE_RATE,
+            output_scale_folded="int" in OUT_AUDIO_DTYPE.lower() and OUT_SAMPLE_RATE == MODEL_SAMPLE_RATE,
+        )
+        if "32" in IN_AUDIO_DTYPE:
+            IN_TORCH_DTYPE = torch.float32
+        elif "int" in IN_AUDIO_DTYPE.lower():
+            IN_TORCH_DTYPE = torch.int16
+        else:
+            IN_TORCH_DTYPE = torch.float16
+        audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
+        torch.onnx.export(
+            ulunas,
+            (audio,),
+            raw_model_path,
+            input_names=['noisy_audio'],
+            output_names=['denoised_audio'],
+            dynamic_axes={
+                'noisy_audio': {2: 'audio_len'},
+                'denoised_audio': {2: 'audio_len'}
+            } if DYNAMIC_AXES else None,
+            opset_version=OPSET,
+            dynamo=False
+        )
+        del ulunas
+        del audio
+        del custom_stft
+        del custom_istft
+        gc.collect()
+    Path(onnx_model_A).unlink(missing_ok=True)
+    rewrite_onnx_gru_zero_state(
+        raw_model_path,
         onnx_model_A,
-        input_names=['noisy_audio'],
-        output_names=['denoised_audio'],
-        dynamic_axes={
-            'noisy_audio': {2: 'audio_len'},
-            'denoised_audio': {2: 'audio_len'}
-        } if DYNAMIC_AXES else None,
-        opset_version=OPSET,
-        dynamo=False
+        report_path=rewrite_report_path,
     )
-    del ulunas
-    del audio
-    del custom_stft
-    del custom_istft
-    gc.collect()
-model_metadata = build_audio_metadata_from_globals(
-    globals(), producer=Path(__file__).name, model_name="UL_UNAS", task="denoise", model_family="ul_unas",
-    max_dynamic_audio_seconds=30, normalize_audio_default=False, input_channels=1, output_channels=1,
-    num_audio_inputs=1, feature_kind="stft_erb", center_pad=True, pad_mode=STFT_PAD_MODE,
-    extra={"n_mels": N_MELS, "remove_dc_offset": REMOVE_DC_OFFSET},
-)
-stamp_export_metadata(onnx_model_A, model_metadata, OPSET)
-print(f"Metadata saved to: {onnx_model_Metadata}")
-print('\nExport done!')
-_run_inference_demo()
+    model_metadata = build_audio_metadata_from_globals(
+        globals(), producer=Path(__file__).name, model_name="UL_UNAS", task="denoise", model_family="ul_unas",
+        max_dynamic_audio_seconds=30, normalize_audio_default=False, input_channels=1, output_channels=1,
+        num_audio_inputs=1, feature_kind="stft_erb", center_pad=True, pad_mode=STFT_PAD_MODE,
+        extra={"n_mels": N_MELS, "remove_dc_offset": REMOVE_DC_OFFSET},
+    )
+    stamp_export_metadata(onnx_model_A, model_metadata, OPSET)
+    print(f"Metadata saved to: {onnx_model_Metadata}")
+    print('\nExport done!')
+    _run_inference_demo()

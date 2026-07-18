@@ -16,8 +16,15 @@ from Optimize_ONNX_Common import OptimizerConfig, Plan, run_optimizer
 ORIGINAL_FOLDER_PATH = str(_SCRIPT_DIR / "NKF_AEC_ONNX")
 OPTIMIZED_FOLDER_PATH = str(_SCRIPT_DIR / "NKF_AEC_Optimized")
 
-ENABLE_FP16 = False  # F16 works and perform well.
+ENABLE_FP16 = False     # F16 works and perform well.
 UPGRADE_OPSET = 0
+
+# Keep raw-PCM centering in FP32. CUDA's FP16 ReduceMean accumulates the 32,000
+# int16-scale samples before dividing, so even a small DC offset can overflow
+# to Inf and turn the final int16 waveform into silence. The centered waveform
+# is cast to FP16 immediately before the STFT; all later model compute remains
+# FP16.
+FP16_WAVEFORM_NODE_BLOCK_LIST = ["/ReduceMean", "/Sub"]
 
 MODEL_PLANS = {
     "NKF_AEC": Plan(
@@ -25,6 +32,8 @@ MODEL_PLANS = {
         num_heads=0,
         hidden_size=0,
         opt_level=1,
+        only_onnxruntime=True,
+        f16_node_block_list=FP16_WAVEFORM_NODE_BLOCK_LIST,
     ),
 }
 

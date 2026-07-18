@@ -19,7 +19,7 @@ ORIGINAL_FOLDER_PATH = str(_SCRIPT_DIR / "MelBandRoformer_ONNX")
 OPTIMIZED_FOLDER_PATH = str(_SCRIPT_DIR / "MelBandRoformer_Optimized")
 
 ENABLE_DYNAMIC_Q8 = True     # For CPU, Works well
-ENABLE_FP16 = False          # Works, but affect quality.
+ENABLE_FP16 = False          # Works, but slightly affect quality.
 UPGRADE_OPSET = 0
 
 MODEL_METHOD = "DYNAMIC_Q8" if ENABLE_DYNAMIC_Q8 else ("F16" if ENABLE_FP16 else "F32")

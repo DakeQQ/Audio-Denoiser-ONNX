@@ -19,7 +19,7 @@ from Example_Audio import model_audio_path
 
 # --- File paths -------------------------------------------------------------
 parent_path         = Path(__file__).resolve().parent                                                                  # The folder that contains this script.
-onnx_model_A        = str(parent_path / "ZipEnhancer_Optimized" / "ZipEnhancer.onnx")                                # The optimized onnx model path.
+onnx_model_A        = str(parent_path / "ZipEnhancer_ONNX" / "ZipEnhancer.onnx")                                # The optimized onnx model path.
 test_noisy_audio    = model_audio_path("zipenhancer")                                                                 # The noisy audio path.
 save_denoised_audio = str(parent_path / "speech_with_noise1_denoised.wav")                                              # The output denoised audio path.
 
@@ -37,14 +37,14 @@ onnx_model_A = _resolve_onnx_model_path(onnx_model_A)
 
 
 # --- ONNX Runtime settings --------------------------------------------------
-ORT_Accelerate_Providers = []     # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'MIGraphXExecutionProvider'']
-                                  # else keep empty.
-ORT_LOG                  = False  # Enable ONNX Runtime logging for debugging. Set to False for best performance.
-ORT_FP16                 = False  # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.
-DEVICE_ID                = 0      # The GPU id, default to 0.
-NORMALIZE_AUDIO          = False  # Set True to RMS-normalize input audio before inference.
-NORMALIZE_TARGET_RMS     = 4096.0 # Target RMS when NORMALIZE_AUDIO is True.
-MAX_THREADS              = 0      # Number of ONNX Runtime/OpenVINO worker threads. Set 0 for auto.
+ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'MIGraphXExecutionProvider'']
+                                        # else keep empty.
+ORT_LOG                  = False        # Enable ONNX Runtime logging for debugging. Set to False for best performance.
+ORT_FP16                 = False        # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.
+DEVICE_ID                = 0            # The GPU id, default to 0.
+NORMALIZE_AUDIO          = False        # Set True to RMS-normalize input audio before inference.
+NORMALIZE_TARGET_RMS     = 4096.0       # Target RMS when NORMALIZE_AUDIO is True.
+MAX_THREADS              = 0            # Number of ONNX Runtime/OpenVINO worker threads. Set 0 for auto.
 
 
 # --- Audio normalization ----------------------------------------------------

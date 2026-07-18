@@ -1,6 +1,7 @@
 import gc
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 import torch
 import torch.nn.functional as F
@@ -8,6 +9,7 @@ import torchaudio
 from modelscope.pipelines import pipeline
 from modelscope.utils.constant import Tasks
 from STFT_Process import STFT_Process                                                      # The custom STFT/ISTFT can be exported in ONNX format.
+from Rewrite_ONNX_Causal_Padding import rewrite_causal_fsmn_padding
 
 for _candidate in Path(__file__).resolve().parents:
     if (_candidate / "audio_onnx_metadata.py").exists():
@@ -17,7 +19,7 @@ for _candidate in Path(__file__).resolve().parents:
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
 
 
-model_path            = "/home/DakeQQ/Downloads/speech_dfsmn_ans_psm_48k_causal"         # The DFSMN download path.
+model_path            = str(Path.home() / "Downloads" / "speech_dfsmn_ans_psm_48k_causal") # The DFSMN download path.
 parent_path           = Path(__file__).resolve().parent                              # The folder that contains this script.
 onnx_model_A          = str(parent_path / "DFSMN_ONNX" / "DFSMN.onnx")              # The exported onnx model path.
 onnx_model_Metadata   = str(metadata_path_for_model(onnx_model_A))                   # The metadata carrier onnx model path.
@@ -40,7 +42,8 @@ if HOP_LENGTH > INPUT_AUDIO_LENGTH:
 
 IN_AUDIO_DTYPE        = 'INT16'                 # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
 OUT_AUDIO_DTYPE       = 'INT16'                 # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
-INV_INT16             = float(1.0 / 32768.0)
+INT16_SCALE           = 32768.0
+INV_INT16             = float(1.0 / INT16_SCALE)
 
 MODEL_AUDIO_LENGTH    = INPUT_AUDIO_LENGTH if DYNAMIC_AXES else int(round(INPUT_AUDIO_LENGTH * MODEL_SAMPLE_RATE / IN_SAMPLE_RATE))
 OUTPUT_AUDIO_LENGTH   = INPUT_AUDIO_LENGTH if DYNAMIC_AXES else int(round(INPUT_AUDIO_LENGTH * OUT_SAMPLE_RATE / IN_SAMPLE_RATE))
@@ -51,6 +54,7 @@ BATCH_WINDOW_SECONDS  = 1.5                     # When the configured input audi
 FOLD_WINDOW_LENGTH    = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH  # Per-window model-rate length, rounded UP to a HOP multiple. center=False needs (W-NFFT)%HOP==0 -> holds since W%HOP==0 and NFFT_STFT%HOP==0.
 USE_BATCH_FOLD        = False                   # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
 EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length rounded up to whole windows; the tail is padded OUTSIDE the model (numpy) by the windowing loop.
+STATIC_MODEL_BATCH    = EXPORT_AUDIO_LENGTH // FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else 1
 
 # ---- Kaldi-fbank (feature extractor) parameters — must match the original pipeline exactly ----
 KALDI_FRAME_LENGTH    = 1920                    # 40 ms @ 48 kHz analysis frame (samples)
@@ -65,10 +69,15 @@ MAX_SIGNAL_LENGTH     = 2048 if DYNAMIC_AXES else STFT_SIGNAL_LENGTH        # IS
 
 
 class DFSMN(torch.nn.Module):
-    def __init__(self, dfsmn, stft_model, istft_model, nfft_stft, n_mels, in_sample_rate, out_sample_rate, use_batch_fold=False, fold_window=0):
+    def __init__(self, dfsmn, stft_model, istft_model, nfft_stft, n_mels, in_sample_rate, out_sample_rate, use_batch_fold=False, fold_window=0, static_batch=1):
         super(DFSMN, self).__init__()
         self.istft_model = istft_model
-        self.inv_int16 = torch.tensor([INV_INT16], dtype=torch.float16 if OUT_AUDIO_DTYPE == 'F16' else torch.float32)
+        self.register_buffer('input_scale', torch.tensor(INV_INT16, dtype=torch.float32))
+        self.register_buffer('input_power_scale', torch.tensor(INT16_SCALE * INT16_SCALE, dtype=torch.float32))
+        if "int" in OUT_AUDIO_DTYPE.lower():
+            self.register_buffer('output_min', torch.tensor(-32768.0, dtype=torch.float32))
+            self.register_buffer('output_max', torch.tensor(32767.0, dtype=torch.float32))
+            self.register_buffer('output_scale', torch.tensor(INT16_SCALE, dtype=torch.float32))
         self.nfft_stft = nfft_stft
         self.in_sample_rate = in_sample_rate
         self.out_sample_rate = out_sample_rate
@@ -76,7 +85,8 @@ class DFSMN(torch.nn.Module):
         self.fold_window = fold_window                # Per-window length (model-rate samples) used when folding
         self.hop_len = KALDI_HOP_LENGTH
         self.kaldi_bins = KALDI_NFFT // 2 + 1                 # one-sided 2048-pt FFT bins (1025)
-        self.log_eps = float(torch.finfo(torch.float32).eps)  # Kaldi log floor (numeric_limits<float>::epsilon)
+        self.register_buffer(
+            'log_eps', torch.tensor(torch.finfo(torch.float32).eps, dtype=torch.float32))  # Kaldi log floor
 
         # ---- Kaldi log-mel-fbank feature extractor, folded into ONE Conv1d ----
         # Exactly reproduces torchaudio.compliance.kaldi.fbank(dither=0, frame_length=40ms,
@@ -86,19 +96,27 @@ class DFSMN(torch.nn.Module):
         # single (2*1025, 1, 1920) convolution kernel (snip-edges == stride=hop, no padding).
         n = KALDI_FRAME_LENGTH
         win = torch.hamming_window(n, periodic=False, alpha=0.54, beta=0.46, dtype=torch.float64)
-        dc_matrix = torch.eye(n, dtype=torch.float64) - (1.0 / n)              # subtract per-frame mean
-        preemph = torch.eye(n, dtype=torch.float64)                           # y[i] = x[i] - c*x[i-1]
-        rng = torch.arange(1, n)
-        preemph[rng, rng - 1] = -PREEMPH_COEFF
-        preemph[0, 0] = 1.0 - PREEMPH_COEFF                                   # replicate-pad first sample
         t = torch.arange(n, dtype=torch.float64).unsqueeze(0)                 # (1, n)
         freq = torch.arange(self.kaldi_bins, dtype=torch.float64).unsqueeze(1)  # (F, 1)
         omega = (2.0 * torch.pi / KALDI_NFFT) * freq * t                      # (F, n) 2048-pt DFT angles
         cos_win = torch.cos(omega) * win.unsqueeze(0)
         sin_win = -torch.sin(omega) * win.unsqueeze(0)
-        preemph_dc = preemph @ dc_matrix                                      # (n, n)
-        weight_real = cos_win @ preemph_dc                                    # (F, n)
-        weight_imag = sin_win @ preemph_dc                                    # (F, n)
+
+        def fold_preemphasis_and_dc(basis):
+            # ``basis @ preemphasis`` is sparse: every output column uses at most
+            # two adjacent basis columns. Right-multiplication by the DC-removal
+            # matrix then subtracts each row mean. This is algebraically identical
+            # to the former dense 1920x1920 matrix products without their cubic
+            # construction cost and large temporary matrices.
+            filtered = torch.cat((
+                (1.0 - PREEMPH_COEFF) * basis[:, :1] - PREEMPH_COEFF * basis[:, 1:2],
+                basis[:, 1:-1] - PREEMPH_COEFF * basis[:, 2:],
+                basis[:, -1:],
+            ), dim=1)
+            return filtered - filtered.mean(dim=1, keepdim=True)
+
+        weight_real = fold_preemphasis_and_dc(cos_win)                        # (F, n)
+        weight_imag = fold_preemphasis_and_dc(sin_win)                        # (F, n)
         fbank_kernel = torch.cat([weight_real, weight_imag], dim=0).unsqueeze(1).float()  # (2*kaldi_bins, 1, n)
 
         # ---- Fuse the Kaldi-fbank analysis and the mask-STFT into ONE Conv1d ----
@@ -119,9 +137,9 @@ class DFSMN(torch.nn.Module):
         self.register_buffer('mel_banks', mel_banks.unsqueeze(0).float())     # (1, 120, 1025)
 
         # Pre-fuse the DfsmnAns mask network into channels-first convolution buffers.
-        self._build_dfsmn_buffers(dfsmn)
+        self._build_dfsmn_buffers(dfsmn, static_batch)
 
-    def _build_dfsmn_buffers(self, dfsmn):
+    def _build_dfsmn_buffers(self, dfsmn, static_batch):
         """Pre-fuse the DfsmnAns mask network (linear1 -> ReLU -> fsmn_depth x UniDeepFsmn ->
         linear2 -> Sigmoid) into channels-first convolution weights so the whole mask path
         runs as 1x1 / depthwise Conv1d with no per-layer unsqueeze/permute/squeeze (the
@@ -137,7 +155,11 @@ class DFSMN(torch.nn.Module):
         uf0 = dfsmn.deepfsmn[0]
         self.fsmn_depth = len(dfsmn.deepfsmn)
         self.fsmn_groups = uf0.output_dim
-        self.register_buffer('fsmn_pad', torch.zeros((1, self.fsmn_groups, uf0.lorder - 1), dtype=torch.float32))
+        if static_batch < 1:
+            raise ValueError("static_batch must be positive.")
+        self.register_buffer(
+            'fsmn_pad',
+            torch.zeros((static_batch, self.fsmn_groups, uf0.lorder - 1), dtype=torch.float32))
         self._uf_lin_w, self._uf_lin_b, self._uf_proj_w, self._uf_conv_w = [], [], [], []
         for i, uf in enumerate(dfsmn.deepfsmn):
             conv_w = uf.conv1.weight.detach().squeeze(-1).clone()   # (256, 1, lorder)
@@ -152,9 +174,12 @@ class DFSMN(torch.nn.Module):
             self._uf_conv_w.append(getattr(self, f'uf_conv_w_{i}'))
 
     def forward(self, audio):
-        audio = audio.float()  # int16 scale (matches original sf.read * 32768); no /32768, no global DC removal
-        if "int" not in IN_AUDIO_DTYPE.lower():
-            audio = audio * 32768.0      # F16/F32 inputs arrive in [-1, 1]; lift them to the int16 amplitude the Kaldi fbank expects.
+        audio = audio.float()
+        if "int" in IN_AUDIO_DTYPE.lower():
+            # Keep the long fused DFT convolution inside FP16's finite range. The power
+            # scale below restores the exact int16-domain fbank expected by the network;
+            # the final output scale likewise restores PCM amplitude after the ISTFT.
+            audio = audio * self.input_scale
         if self.in_sample_rate != MODEL_SAMPLE_RATE:
             audio = torch.nn.functional.interpolate(
                 audio,
@@ -163,7 +188,7 @@ class DFSMN(torch.nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        # One fused analysis conv -> [fbank_real | fbank_imag | stft_real | stft_imag]
+        # One fused analysis conv -> [packed_fbank | packed_stft]
         # (center=False; symmetric-hamming analysis for both the Kaldi fbank and the mask STFT,
         #  periodic-hamming synthesis happens later in the ISTFT).
         if self.use_batch_fold:
@@ -172,11 +197,16 @@ class DFSMN(torch.nn.Module):
             # run the whole conv-only graph batched. No padding op inside the graph.
             audio = audio.reshape(-1, 1, self.fold_window)
         analysis = torch.nn.functional.conv1d(audio, self.analysis_conv_weight, stride=self.hop_len)
-        real_fb, imag_fb, real_part, imag_part = torch.split(
-            analysis, [self.kaldi_bins, self.kaldi_bins, self.stft_bins, self.stft_bins], dim=1)
+        fbank_spectrum, spectrum = torch.split(
+            analysis, [2 * self.kaldi_bins, 2 * self.stft_bins], dim=1)
+        # Keep both fbank halves packed across the FP16 -> FP32 boundary. The
+        # mixed-precision converter can then insert one cast before this Split
+        # instead of separate casts for real_fb and imag_fb.
+        real_fb, imag_fb = torch.split(
+            fbank_spectrum, [self.kaldi_bins, self.kaldi_bins], dim=1)
         # Kaldi log-mel-fbank features kept channels-first (1, 120, frames) so the inlined mask
         # network below runs as 1x1 / depthwise convolutions without any per-frame transpose.
-        power = real_fb * real_fb + imag_fb * imag_fb
+        power = (real_fb * real_fb + imag_fb * imag_fb) * self.input_power_scale
         x = torch.matmul(self.mel_banks, power).clamp(min=self.log_eps).log()      # (1, 120, frames)
 
         # ---- Inlined DfsmnAns mask network (channels-first) ----
@@ -188,15 +218,16 @@ class DFSMN(torch.nn.Module):
         for i in range(self.fsmn_depth):
             f1 = F.relu(F.conv1d(x, self._uf_lin_w[i], self._uf_lin_b[i]))
             p1 = F.conv1d(f1, self._uf_proj_w[i], None)
-            mem = F.conv1d(torch.cat((self.fsmn_pad.expand(p1.shape[0], -1, -1), p1), dim=2), self._uf_conv_w[i], None, groups=self.fsmn_groups)
+            mem = F.conv1d(torch.cat((self.fsmn_pad, p1), dim=2), self._uf_conv_w[i], None, groups=self.fsmn_groups)
             x = x + mem
         mask = torch.sigmoid(F.conv1d(x, self.lin2_w, self.lin2_b))                # (1, 961, frames)
         # ---- end inlined mask network ----
 
         # Apply the mask to the complex STFT and reconstruct.
-        real_part = real_part * mask
-        imag_part = imag_part * mask
-        audio = self.istft_model(real_part, imag_part)
+        # Keep real/imag channels packed: one mask Concat plus one Mul replaces
+        # two independent Mul nodes plus the synthesis-input Concat.
+        audio = self.istft_model.inverse_packed(
+            spectrum * torch.cat((mask, mask), dim=1))
         if self.use_batch_fold:
             audio = audio.reshape(1, 1, -1)                             # stitch windows back
         if self.out_sample_rate != MODEL_SAMPLE_RATE:
@@ -208,8 +239,8 @@ class DFSMN(torch.nn.Module):
                 align_corners=False
             )
         if "int" in OUT_AUDIO_DTYPE.lower():
-            return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
-        audio = audio * self.inv_int16
+            audio = audio * self.output_scale
+            return audio.clamp(min=self.output_min, max=self.output_max).to(torch.int16)
         if "32" in OUT_AUDIO_DTYPE:
             return audio
         return audio.to(torch.float16)
@@ -225,52 +256,71 @@ def _run_inference_demo():
 
 
 print('Export start ...')
-Path(onnx_model_A).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT_STFT, win_length=WINDOW_LENGTH,hop_len=HOP_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=False, pad_mode='constant').eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT_STFT, win_length=WINDOW_LENGTH, hop_len=HOP_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=ISTFT_WINDOW_TYPE, center_pad=False, pad_mode='constant').eval()
-    dfsmn = pipeline(
-        Tasks.acoustic_noise_suppression,
-        model=model_path,
-        device='cpu'
-    ).model
-    dfsmn = DFSMN(dfsmn, custom_stft, custom_istft, NFFT_STFT, N_MELS, IN_SAMPLE_RATE, OUT_SAMPLE_RATE, use_batch_fold=USE_BATCH_FOLD, fold_window=FOLD_WINDOW_LENGTH)
-    if "32" in IN_AUDIO_DTYPE:
-        IN_TORCH_DTYPE = torch.float32
-    elif "int" in IN_AUDIO_DTYPE.lower():
-        IN_TORCH_DTYPE = torch.int16
-    else:
-        IN_TORCH_DTYPE = torch.float16
-    audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
-    torch.onnx.export(
-        dfsmn,
-        (audio,),
-        onnx_model_A,
-        input_names=['noisy_audio'],
-        output_names=['denoised_audio'],
-        dynamic_axes={
-            'noisy_audio': {2: 'audio_len'},
-            'denoised_audio': {2: 'out_audio_len'}
-        } if DYNAMIC_AXES else None,
-        opset_version=OPSET,
-        dynamo=False
+final_path = Path(onnx_model_A).expanduser().resolve()
+final_path.parent.mkdir(parents=True, exist_ok=True)
+
+# Remove persistent raw/report artifacts produced by older exporter versions.
+for legacy_path in (
+    final_path.with_name(f'{final_path.stem}.raw.onnx'),
+    final_path.with_name(f'{final_path.stem}.raw_Metadata.onnx'),
+    final_path.with_name(f'{final_path.stem}.rewrite_report.json'),
+):
+    legacy_path.unlink(missing_ok=True)
+
+with tempfile.TemporaryDirectory(prefix='dfsmn_export_') as temporary_dir:
+    raw_model_path = Path(temporary_dir) / 'DFSMN.raw.onnx'
+    with torch.inference_mode():
+        custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT_STFT, win_length=WINDOW_LENGTH,hop_len=HOP_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=False, pad_mode='constant').eval()
+        custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT_STFT, win_length=WINDOW_LENGTH, hop_len=HOP_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=ISTFT_WINDOW_TYPE, center_pad=False, pad_mode='constant', static_norm=not DYNAMIC_AXES).eval()
+        dfsmn = pipeline(
+            Tasks.acoustic_noise_suppression,
+            model=model_path,
+            device='cpu'
+        ).model
+        dfsmn = DFSMN(dfsmn, custom_stft, custom_istft, NFFT_STFT, N_MELS, IN_SAMPLE_RATE, OUT_SAMPLE_RATE, use_batch_fold=USE_BATCH_FOLD, fold_window=FOLD_WINDOW_LENGTH, static_batch=STATIC_MODEL_BATCH)
+        if "32" in IN_AUDIO_DTYPE:
+            IN_TORCH_DTYPE = torch.float32
+        elif "int" in IN_AUDIO_DTYPE.lower():
+            IN_TORCH_DTYPE = torch.int16
+        else:
+            IN_TORCH_DTYPE = torch.float16
+        audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
+        torch.onnx.export(
+            dfsmn,
+            (audio,),
+            raw_model_path,
+            input_names=['noisy_audio'],
+            output_names=['denoised_audio'],
+            dynamic_axes={
+                'noisy_audio': {2: 'audio_len'},
+                'denoised_audio': {2: 'out_audio_len'}
+            } if DYNAMIC_AXES else None,
+            opset_version=OPSET,
+            do_constant_folding=True,
+            dynamo=False
+        )
+        del dfsmn
+        del audio
+        del custom_stft
+        del custom_istft
+        gc.collect()
+
+    model_metadata = build_audio_metadata_from_globals(
+        globals(), producer=Path(__file__).name, model_name="DFSMN", task="denoise", model_family="dfsmn",
+        max_dynamic_audio_seconds=6, normalize_audio_default=False, input_channels=1, output_channels=1,
+        num_audio_inputs=1, feature_kind="kaldi_fbank_stft", center_pad=False, pad_mode="constant",
+        extra={
+            "n_mels": N_MELS, "nfft_stft": NFFT_STFT, "kaldi_nfft": KALDI_NFFT,
+            "kaldi_frame_length": KALDI_FRAME_LENGTH, "kaldi_hop_length": KALDI_HOP_LENGTH,
+            "preemph_coeff": PREEMPH_COEFF, "istft_window_type": ISTFT_WINDOW_TYPE,
+        },
     )
-    del dfsmn
-    del audio
-    del custom_stft
-    del custom_istft
-    gc.collect()
-model_metadata = build_audio_metadata_from_globals(
-    globals(), producer=Path(__file__).name, model_name="DFSMN", task="denoise", model_family="dfsmn",
-    max_dynamic_audio_seconds=6, normalize_audio_default=False, input_channels=1, output_channels=1,
-    num_audio_inputs=1, feature_kind="kaldi_fbank_stft", center_pad=False, pad_mode="constant",
-    extra={
-        "n_mels": N_MELS, "nfft_stft": NFFT_STFT, "kaldi_nfft": KALDI_NFFT,
-        "kaldi_frame_length": KALDI_FRAME_LENGTH, "kaldi_hop_length": KALDI_HOP_LENGTH,
-        "preemph_coeff": PREEMPH_COEFF, "istft_window_type": ISTFT_WINDOW_TYPE,
-    },
-)
-stamp_export_metadata(onnx_model_A, model_metadata, OPSET)
-print(f"Metadata saved to: {onnx_model_Metadata}")
-print('\nExport done!')
-_run_inference_demo()
+    # The checked matcher validates embedded metadata on the temporary raw model.
+    stamp_export_metadata(raw_model_path, model_metadata, OPSET)
+    rewrite_causal_fsmn_padding(raw_model_path, final_path)
+    stamp_export_metadata(final_path, model_metadata, OPSET)
+    print(f"Metadata saved to: {onnx_model_Metadata}")
+    print('\nExport done!')
+    _run_inference_demo()
+
+print('Temporary raw export and rewrite metadata deleted.')

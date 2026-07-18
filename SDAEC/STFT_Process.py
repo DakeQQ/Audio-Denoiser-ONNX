@@ -26,7 +26,6 @@ Optimization summary vs original:
 import torch
 import numpy as np
 import onnxruntime as ort
-from onnxslim import slim
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1.  Configuration
@@ -151,7 +150,12 @@ class STFT_Process(torch.nn.Module):
         max_frames: int  = STFT_SIGNAL_LENGTH,
         window_type: str = WINDOW_TYPE,
         center_pad: bool = CENTER_PAD,
-        pad_mode: str    = PAD_MODE
+        pad_mode: str    = PAD_MODE,
+        static_norm: bool = False,
+        input_scale: float = 1.0,
+        output_scale: float = 1.0,
+        output_length: int = 0,
+        packed_output: bool = False,
     ):
         super().__init__()
 
@@ -160,6 +164,9 @@ class STFT_Process(torch.nn.Module):
         self.hop_len    = hop_len
         self.half_n_fft = n_fft // 2
         self.n_frames   = max_frames
+        self.input_scale = float(input_scale)
+        self.output_scale = float(output_scale)
+        self.packed_output = packed_output
 
         f_bins = self.half_n_fft + 1
         window = create_padded_window(win_length, n_fft, window_type)
@@ -168,7 +175,7 @@ class STFT_Process(torch.nn.Module):
         raw_len = n_fft + hop_len * (max_frames - 1)
         if center_pad:
             self._out_start = self.half_n_fft
-            self._out_end   = raw_len - self.half_n_fft
+            self._out_end   = self._out_start + output_length if output_length > 0 else raw_len - self.half_n_fft
         else:
             self._out_start = 0
             self._out_end   = raw_len
@@ -187,35 +194,32 @@ class STFT_Process(torch.nn.Module):
 
         # ── STFT: constant zero-padding buffer ────────────────────────────
         if model_type in ('stft_A', 'stft_B'):
-            self._build_stft_kernels(n_fft, f_bins, window, model_type)
-            if center_pad and pad_mode == 'constant':
-                self.register_buffer(
-                    'padding_zero',
-                    torch.zeros(1, 1, self.half_n_fft, dtype=torch.float32)
-                )
+            self._build_stft_kernels(n_fft, f_bins, window, model_type, self.input_scale)
             self._center_pad = center_pad
             self._pad_mode   = pad_mode
 
         # ── ISTFT: inverse kernel + pre-sliced normalization ──────────────
         if model_type in ('istft_A', 'istft_B'):
-            self._build_istft_kernels(n_fft, f_bins, window, hop_len, max_frames)
+            self._build_istft_kernels(
+                n_fft, f_bins, window, hop_len, max_frames, static_norm, self.output_scale
+            )
 
-    def _build_stft_kernels(self, n_fft, f_bins, window, model_type):
+    def _build_stft_kernels(self, n_fft, f_bins, window, model_type, input_scale):
         """Precompute windowed DFT basis as Conv1d kernel weights."""
         omega_factor = 2.0 * torch.pi / n_fft
         t = torch.arange(n_fft, dtype=torch.float32).unsqueeze(0)
         f = torch.arange(f_bins, dtype=torch.float32).unsqueeze(1)
         omega = omega_factor * f * t
 
-        windowed_cos = ( torch.cos(omega) * window.unsqueeze(0)).unsqueeze(1)
-        windowed_sin = (-torch.sin(omega) * window.unsqueeze(0)).unsqueeze(1)
+        windowed_cos = ( torch.cos(omega) * window.unsqueeze(0) * input_scale).unsqueeze(1)
+        windowed_sin = (-torch.sin(omega) * window.unsqueeze(0) * input_scale).unsqueeze(1)
 
         if model_type == 'stft_A':
             self.register_buffer('stft_kernel', windowed_cos)
         else:
             self.register_buffer('stft_kernel', torch.cat([windowed_cos, windowed_sin], dim=0))
 
-    def _build_istft_kernels(self, n_fft, f_bins, window, hop_len, n_frames):
+    def _build_istft_kernels(self, n_fft, f_bins, window, hop_len, n_frames, static_norm, output_scale):
         """Precompute inverse-DFT kernel and window² kernel for COLA normalization."""
         omega_factor = 2.0 * torch.pi / n_fft
         k = torch.arange(f_bins, dtype=torch.float32).unsqueeze(1)
@@ -239,8 +243,16 @@ class STFT_Process(torch.nn.Module):
             torch.cat([ifft_real, ifft_imag], dim=0).unsqueeze(1)
         )
 
-        # Store window² kernel for dynamic COLA normalization in forward.
-        self.register_buffer('win_sq_kernel', window.square().reshape(1, 1, -1))
+        win_sq_kernel = window.square().reshape(1, 1, -1)
+        if static_norm and n_frames > 0:
+            ones = torch.ones(1, 1, n_frames, dtype=torch.float32)
+            win_sum = torch.nn.functional.conv_transpose1d(ones, win_sq_kernel, stride=hop_len)
+            self.register_buffer(
+                'inv_win_sum',
+                output_scale / win_sum[..., self._out_start:self._out_end],
+            )
+        else:
+            self.register_buffer('win_sq_kernel', win_sq_kernel)
 
     # --------------------------------------------------------------------- #
     #  STFT forward variants (no branching, static tensor ops only)         #
@@ -254,11 +266,9 @@ class STFT_Process(torch.nn.Module):
                 right = x[..., -(self.half_n_fft + 1): -1].flip(2)
                 x = torch.cat([left, x, right], dim=2)
             else:
-                if x.shape[0] != 1:
-                    padding_zero = torch.cat([self.padding_zero] * x.shape[0], dim=0)
-                else:
-                    padding_zero = self.padding_zero
-                x = torch.cat([padding_zero, x, padding_zero], dim=2)
+                return torch.nn.functional.conv1d(
+                    x, self.stft_kernel, stride=self.hop_len, padding=self.half_n_fft
+                )
         return torch.nn.functional.conv1d(x, self.stft_kernel, stride=self.hop_len)
 
     def _stft_B_forward(self, x: torch.Tensor):
@@ -269,13 +279,12 @@ class STFT_Process(torch.nn.Module):
                 right = x[..., -(self.half_n_fft + 1): -1].flip(2)
                 x = torch.cat([left, x, right], dim=2)
             else:
-                if x.shape[0] != 1:
-                    padding_zero = torch.cat([self.padding_zero] * x.shape[0], dim=0)
-                else:
-                    padding_zero = self.padding_zero
-                x = torch.cat([padding_zero, x, padding_zero], dim=2)
+                out = torch.nn.functional.conv1d(
+                    x, self.stft_kernel, stride=self.hop_len, padding=self.half_n_fft
+                )
+                return out if self.packed_output else torch.split(out, self.half_n_fft + 1, dim=1)
         out = torch.nn.functional.conv1d(x, self.stft_kernel, stride=self.hop_len)
-        return torch.split(out, self.half_n_fft + 1, dim=1)
+        return out if self.packed_output else torch.split(out, self.half_n_fft + 1, dim=1)
 
     # --------------------------------------------------------------------- #
     #  ISTFT forward variants (static slicing, no Shape/Gather ops)         #
@@ -283,10 +292,15 @@ class STFT_Process(torch.nn.Module):
 
     def _istft_B_forward(self, real: torch.Tensor, imag: torch.Tensor) -> torch.Tensor:
         """ISTFT from rectangular form. Dynamic-length compatible."""
-        inp = torch.cat((real, imag), dim=1)
+        return self.forward_packed(torch.cat((real, imag), dim=1))
+
+    def forward_packed(self, inp: torch.Tensor) -> torch.Tensor:
+        """ISTFT from a pre-packed ``[real, imag]`` channel tensor."""
         inv = torch.nn.functional.conv_transpose1d(inp, self.inverse_kernel, stride=self.hop_len)
+        if hasattr(self, 'inv_win_sum'):
+            return inv[..., self._out_start:self._out_end] * self.inv_win_sum
         # Compute COLA normalization dynamically based on input n_frames.
-        ones = torch.ones(1, 1, real.shape[2], dtype=real.dtype, device=real.device)
+        ones = torch.ones(1, 1, inp.shape[2], dtype=inp.dtype, device=inp.device)
         win_sum = torch.nn.functional.conv_transpose1d(ones, self.win_sq_kernel, stride=self.hop_len)
         inv = inv[..., self._out_start:self._out_end] / win_sum[..., self._out_start:self._out_end]
         return inv
@@ -297,6 +311,8 @@ class STFT_Process(torch.nn.Module):
         imag = magnitude * torch.sin(phase)
         inp = torch.cat((real, imag), dim=1)
         inv = torch.nn.functional.conv_transpose1d(inp, self.inverse_kernel, stride=self.hop_len)
+        if hasattr(self, 'inv_win_sum'):
+            return inv[..., self._out_start:self._out_end] * self.inv_win_sum
         # Compute COLA normalization dynamically based on input n_frames.
         ones = torch.ones(1, 1, magnitude.shape[2], dtype=magnitude.dtype, device=magnitude.device)
         win_sum = torch.nn.functional.conv_transpose1d(ones, self.win_sq_kernel, stride=self.hop_len)
@@ -445,7 +461,6 @@ def main():
             dynamic_axes=dyn_axes_stft if DYNAMIC_AXES else None,
             opset_version=OPSET,
         )
-        slim(model=export_path_stft, output_model=export_path_stft)
         print(f"  Exported: {export_path_stft}")
 
         # ── 5b. Export ISTFT ─────────────────────────────────────────────
@@ -479,7 +494,6 @@ def main():
             dynamic_axes=dyn_axes_istft if DYNAMIC_AXES else None,
             opset_version=OPSET,
         )
-        slim(model=export_path_istft, output_model=export_path_istft)
 
         print(f"  Exported: {export_path_istft}")
 

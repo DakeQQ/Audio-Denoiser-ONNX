@@ -36,10 +36,9 @@ def _resolve_onnx_model_path(default_model_path: str) -> str:
 model_path = _resolve_onnx_model_path(model_path)
 
 
-ORT_Accelerate_Providers  = []      # If you have accelerated devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'MIGraphXExecutionProvider']
-                                     # else keep empty.
+ORT_Accelerate_Providers  = []  # Mixed FP16/FP32 is validated on CUDA; use [] for CPU fallback.
 ORT_LOG                   = False   # Enable ONNX Runtime logging for debugging. Set to False for best performance.
-ORT_FP16                  = False   # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.
+ORT_FP16                  = False   # Model precision is already baked into the optimized ONNX graph; this only changes optional ORT settings.
 MAX_THREADS               = 0       # Number of ONNX Runtime/OpenVINO worker threads. Set 0 for auto.
 DEVICE_ID                 = 0       # The GPU id, default to 0.
 NORMALIZE_AUDIO           = False   # Set True to RMS-normalize input audio before inference.

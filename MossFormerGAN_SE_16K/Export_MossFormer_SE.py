@@ -3,11 +3,13 @@ import gc
 import subprocess
 import sys
 import os
+import tempfile
 from pathlib import Path
 from clearvoice.models.mossformer_gan_se.generator import MossFormerGAN_SE_16K as MossFormerGANModel
 import torch
 import torch.nn.functional as F
 from STFT_Process import STFT_Process  # The custom STFT/ISTFT can be exported in ONNX format.
+from Rewrite_ONNX_Asymmetric_Padding import rewrite_asymmetric_causal_convs
 
 for _candidate in Path(__file__).resolve().parents:
     if (_candidate / "audio_onnx_metadata.py").exists():
@@ -17,7 +19,7 @@ for _candidate in Path(__file__).resolve().parents:
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
 
 
-model_path           = "/home/DakeQQ/Downloads/MossFormerGAN_SE_16K"                           # The MossFormerGAN_SE_16K download folder
+model_path           = str(Path.home() / "Downloads" / "MossFormerGAN_SE_16K")               # The MossFormerGAN_SE_16K download folder
 parent_path          = Path(__file__).resolve().parent                                      # The folder that contains this script.
 onnx_model_A         = str(parent_path / "MossFormer_ONNX" / "MossFormerGAN_SE_16K.onnx")  # The exported onnx model path.
 onnx_model_Metadata  = str(metadata_path_for_model(onnx_model_A))                           # The metadata carrier onnx model path.
@@ -25,7 +27,7 @@ SCRIPT_DIR           = Path(__file__).resolve().parent
 
 
 DYNAMIC_AXES         = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-OPSET                = 18
+OPSET                = 20
 
 
 MODEL_SAMPLE_RATE    = 16000               # MossFormerGAN_SE runs at 16kHz internally.
@@ -132,99 +134,113 @@ def _ffconvm_parts(ff):
     return ff.mdl[0], ff.mdl[1], ff.mdl[3].sequential[1].conv
 
 
-def _mossformer_block(p, x0, Q, BT, rotary_cos, rotary_sin, pos_ids, b=1):
+def _mossformer_block(
+    p, x0, Q, BT, rotary_cos, rotary_sin, rotary_perm,
+    eye_mask, shift_zero, b=1
+):
     # Inlined ``MossFormer`` (GatedFormer) forward + cal_attention, expanded to leaf ops.
-    # ``b`` is the window-fold batch: x0 has leading dim ``b * BT`` and the cross-token (``_c``)
-    # attention is reshaped to (b, BT, ...) so it attends only WITHIN each window's BT tokens
-    # (no cross-window mixing). ``b == 1`` reproduces the original single-window graph exactly.
-    # ``p`` carries the precomputed fused weights (see ``MOSSFORMER_SE._mossformer_params``):
-    # ``to_hidden`` + ``to_qk`` are fused into ONE Linear + ONE grouped depthwise conv (then
-    # split into the value/gate pair v, u and the query/key qk), and ``to_out`` has its
-    # LayerNorm folded into its Linear. The linear-attention ``1 / Q`` scale is folded
-    # into OffsetScale head 3 (lin_k) when Q is static. The triple attention keeps a single group
-    # (``padding_to_multiple_of(n, n) == 0`` always) so ``group_size`` never participates.
-    # The rotary embedding (first ``rot`` query/key channels, GPT-J interleaved, position along
-    # the Q axis) is applied to all four offset-scaled heads at once.
-    # ``x0`` is (BT, Q, C); ``Q`` / ``BT`` are static ints when known, else None (read from x0).
+    # ``b`` is the window-fold batch: x0 has leading dim ``b * BT`` and cross-token attention
+    # is reshaped to (b, BT, ...) so windows remain independent. The attention group count is
+    # always one, so that vestigial dimension is omitted. Value and gate channels stay packed
+    # through all attention MatMuls and are split only before the final gate.
     C = p['C']
     hidden = p['hidden']
     qk_dim = p['qk']
     vdim = p['vdim']
     rot = p['rot']
-    half = rot // 2
     if Q is None:
         Q = x0.shape[1]
     if BT is None:
         BT = x0.shape[0]
-    # token shift
-    x_shift, x_pass = x0.chunk(2, dim=-1)
-    x_shift = F.pad(x_shift, (0, 0, 1, -1))
+
+    # Token shift. Static exports use one shared immutable zero row per path instead of
+    # F.pad, whose legacy-exporter lowering creates Shape/Gather/If/Pad scaffolding.
+    shift_channels = C // 2
+    x_shift, x_pass = x0.split((shift_channels, C - shift_channels), dim=-1)
+    if shift_zero is None:
+        x_shift = F.pad(x_shift, (0, 0, 1, -1))
+    else:
+        x_shift = torch.cat((shift_zero, x_shift[:, :-1]), dim=1)
     normed_x = torch.cat((x_shift, x_pass), dim=-1)
-    # fused to_hidden + to_qk: affine-free LayerNorm -> one Linear -> SiLU -> one grouped conv (+residual)
+
+    # Fused to_hidden + to_qk: shared affine-free LayerNorm, Linear, and depthwise Conv1d.
     base = F.layer_norm(normed_x, (C,), None, None, 1e-5)
     cwi = p['in_cw']
     huv = F.silu(F.linear(base, p['in_w'], p['in_b']))
-    huv = huv + F.conv1d(huv.transpose(1, 2), cwi, None, 1, 15, 1, cwi.shape[0]).transpose(1, 2)
-    v, u, qk = huv.split((vdim, hidden - vdim, qk_dim), dim=-1)
-    # OffsetScale (4 heads) is a broadcast multiply-add; the rotary rotation is then applied to
-    # every head at once (the cos/sin tables broadcast over the head axis), avoiding a 4x loop.
-    scaled = qk.unsqueeze(-2) * p['gamma'] + p['beta']                 # (BT, Q, 4, qk_dim)
+    huv = huv + F.conv1d(
+        huv.transpose(1, 2), cwi, None, 1, 15, 1, cwi.shape[0]
+    ).transpose(1, 2)
+    hidden_state, qk = huv.split((hidden, qk_dim), dim=-1)
+
+    # OffsetScale runs jointly for all four heads. Rotary tables are already expanded to the
+    # interleaved 32-channel convention; signed sine values plus one int32 Gather implement
+    # rotate_half without strided even/odd slices, Stack, Flatten, or a separate Sub.
+    scaled = qk.unsqueeze(-2) * p['gamma'] + p['beta']
     if rotary_cos is not None:
-        cos = rotary_cos[:Q].float().reshape(1, Q, 1, half)
-        sin = rotary_sin[:Q].float().reshape(1, Q, 1, half)
+        cos = rotary_cos
+        sin = rotary_sin
     else:
         inv_freq = p['inv_freq']
-        ang = torch.arange(Q, dtype=inv_freq.dtype, device=x0.device).unsqueeze(-1) * inv_freq
-        cos = ang.cos().reshape(1, Q, 1, half)
-        sin = ang.sin().reshape(1, Q, 1, half)
+        ang = torch.arange(
+            Q, dtype=inv_freq.dtype, device=x0.device
+        ).unsqueeze(-1) * inv_freq
+        cos_half = ang.cos()
+        sin_half = ang.sin()
+        cos = torch.stack(
+            (cos_half, cos_half), dim=-1
+        ).flatten(start_dim=-2).reshape(1, Q, 1, rot)
+        sin = torch.stack(
+            (-sin_half, sin_half), dim=-1
+        ).flatten(start_dim=-2).reshape(1, Q, 1, rot)
     tm = scaled[..., :rot]
     rest = scaled[..., rot:]
-    even = tm[..., 0::2]
-    odd = tm[..., 1::2]
-    rotp = torch.stack((even * cos - odd * sin, odd * cos + even * sin), dim=-1).flatten(start_dim=-2)
-    quad_q, lin_q, quad_k, lin_k = torch.cat((rotp, rest), dim=-1).unbind(dim=-2)
-    # single-group triple attention
-    qq = quad_q.unsqueeze(1)
-    kk = quad_k.unsqueeze(1)
-    lq = lin_q.unsqueeze(1)
-    lk = lin_k.unsqueeze(1)
-    vg = v.unsqueeze(1)
-    ug = u.unsqueeze(1)
+    rotp = tm * cos + torch.index_select(tm, -1, rotary_perm) * sin
+    quad_q, lin_q, quad_k, lin_k = torch.cat(
+        (rotp, rest), dim=-1
+    ).unbind(dim=-2)
+
+    # Single-group triple attention, represented directly as rank-3 MatMuls.
     qq_c = quad_q.reshape(b, BT, Q, qk_dim).transpose(2, 1)
     kk_c = quad_k.reshape(b, BT, Q, qk_dim).transpose(2, 1)
-    vg_c = v.reshape(b, BT, Q, vdim).transpose(2, 1)
-    ug_c = u.reshape(b, BT, Q, vdim).transpose(2, 1)
-    sim = torch.matmul(qq, kk.transpose(-1, -2)) / Q
-    sim_c = torch.matmul(qq_c, kk_c.transpose(-1, -2)) / BT
-    attn = F.relu(sim).pow(2)
-    attn_c = F.relu(sim_c).pow(2)
-    # Zero the diagonal (self-time) of the cross-group attention. The identity mask is built from
-    # an ``arange`` equality (not ``torch.eye``) to avoid the boolean EyeLike op, which the ORT
-    # CPU provider does not implement. Position ids come from a precomputed buffer when static.
-    if pos_ids is not None:
-        idx = pos_ids[:BT]
+    hidden_c = hidden_state.reshape(b, BT, Q, hidden).transpose(2, 1)
+    if p['quad_k_scaled']:
+        sim = torch.matmul(quad_q, quad_k.transpose(-1, -2))
+        sim_c = torch.matmul(qq_c, kk_c.transpose(-1, -2)) * p['cross_scale']
     else:
+        sim = torch.matmul(quad_q, quad_k.transpose(-1, -2)) / Q
+        sim_c = torch.matmul(qq_c, kk_c.transpose(-1, -2)) / BT
+    attn = F.relu(sim)
+    attn = attn * attn
+    attn_c = F.relu(sim_c)
+    attn_c = attn_c * attn_c
+    if eye_mask is None:
         idx = torch.arange(BT, device=x0.device, dtype=torch.int32)
-    eye = idx.unsqueeze(-1) == idx
-    attn_c = attn_c.masked_fill(eye, 0.0)
-    quad_v = torch.matmul(attn, vg) + torch.matmul(attn_c, vg_c).transpose(2, 1).reshape(-1, 1, Q, vdim)
-    quad_u = torch.matmul(attn, ug) + torch.matmul(attn_c, ug_c).transpose(2, 1).reshape(-1, 1, Q, vdim)
-    lin_kv = torch.matmul(lk.transpose(-1, -2), vg).squeeze(1)
-    lin_ku = torch.matmul(lk.transpose(-1, -2), ug).squeeze(1)
+        eye_mask = idx.unsqueeze(-1) == idx
+    attn_c = attn_c.masked_fill(eye_mask, 0.0)
+
+    # Matrix multiplication distributes over the packed [v, u] columns, so each local,
+    # cross-token, and linear-attention MatMul handles both branches at once.
+    att_hidden = torch.matmul(attn, hidden_state) + torch.matmul(
+        attn_c, hidden_c
+    ).transpose(2, 1).reshape(b * BT, Q, hidden)
+    lin_kh = torch.matmul(lin_k.transpose(-1, -2), hidden_state)
     if not p['lin_k_scaled']:
-        inv_q = torch.reciprocal(torch.as_tensor(Q, dtype=lin_kv.dtype, device=lin_kv.device))
-        lin_kv = lin_kv * inv_q
-        lin_ku = lin_ku * inv_q
-    lin_v = torch.matmul(lq, lin_kv.unsqueeze(1))
-    lin_u = torch.matmul(lq, lin_ku.unsqueeze(1))
-    att_v = (quad_v + lin_v).reshape(-1, Q, vdim)
-    att_u = (quad_u + lin_u).reshape(-1, Q, vdim)
+        inv_q = torch.reciprocal(torch.as_tensor(
+            Q, dtype=lin_kh.dtype, device=lin_kh.device
+        ))
+        lin_kh = lin_kh * inv_q
+    att_hidden = att_hidden + torch.matmul(lin_q, lin_kh)
+    att_v, att_u = att_hidden.split((vdim, hidden - vdim), dim=-1)
+    v, u = hidden_state.split((vdim, hidden - vdim), dim=-1)
     out = (att_u * v) * torch.sigmoid(att_v * u)
-    # folded to_out: affine-free LayerNorm -> Linear -> SiLU -> grouped conv (+residual)
+
+    # Folded to_out: affine-free LayerNorm -> Linear -> SiLU -> depthwise Conv1d + residual.
     base_o = F.layer_norm(out, (vdim,), None, None, 1e-5)
     cwo = p['out_cw']
     ho = F.silu(F.linear(base_o, p['out_w'], p['out_b']))
-    ho = ho + F.conv1d(ho.transpose(1, 2), cwo, None, 1, 15, 1, cwo.shape[0]).transpose(1, 2)
+    ho = ho + F.conv1d(
+        ho.transpose(1, 2), cwo, None, 1, 15, 1, cwo.shape[0]
+    ).transpose(1, 2)
     return x0 + ho
 
 
@@ -243,52 +259,113 @@ class MOSSFORMER_SE(torch.nn.Module):
         self.in_sample_rate = in_sample_rate
         self.out_sample_rate = out_sample_rate
 
-        # ── Precompute rotary (cos/sin) tables and diagonal-mask position ids ──
-        # The inlined MossFormer attention applies a rotary embedding along the
-        # token axis and zeroes the diagonal of the cross-group attention. Both
-        # are deterministic functions of the (static) sequence length, so for a
-        # static export they are baked into registered buffers here instead of
-        # being recomputed (arange / cos / sin / eye) inside every one of the 12
-        # MossFormer calls. This removes 12 Cos + 12 Sin (plus Range / Mul) ops
-        # from the exported graph. The tables are stored as compact float16
-        # buffers (sliced + cast to float32 at use) and the mask uses int32 ids,
-        # so the initializers are half the size of the float32 / int64 originals.
-        #
-        # For DYNAMIC_AXES the token (time-frame) axis is unbounded at runtime,
-        # so a fixed-size table could silently truncate long inputs; in that case
-        # the tables are left as None and the original runtime construction is
-        # used (correct for any length).
+        # ── Infer and retain every model/configuration-static dimension once ──
+        blocks = mossformer_se.blocks
+        mf0 = blocks[0].intra_mossformer
+        self.in_channels = int(blocks[0].intra_to_u.mdl[1].weight.shape[1])
+        self.uv_channels = int(blocks[0].intra_to_u.mdl[1].weight.shape[0])
+        self.emb_dim = int(blocks[0].emb_dim)
+        self.n_freqs = int(mf0.group_size)
+        self.intra_steps = self.n_freqs - int(blocks[0].emb_ks) + 1
+        self.frames_static = MAX_SIGNAL_LENGTH if not DYNAMIC_AXES else None
+        self.n_features = int(NFFT // 2 + 1)
+        self.decoder_channels = int(
+            mossformer_se.mask_decoder.sub_pixel.conv.weight.shape[0]
+            // mossformer_se.mask_decoder.sub_pixel.r
+        )
+        self.subpixel_width = self.n_freqs * int(
+            mossformer_se.mask_decoder.sub_pixel.r
+        )
+        mf_C = int(mf0.to_qk.mdl[1].weight.shape[1])
+        mf_hidden = int(mf0.to_hidden.mdl[1].weight.shape[0])
+        mf_qk = int(mf0.to_qk.mdl[1].weight.shape[0])
+        mf_rot = int(2 * mf0.rotary_pos_emb.freqs.shape[0])
+        if DYNAMIC_AXES:
+            self.batch_static = None
+            self.model_input_len_static = None
+            self.stitched_len_static = None
+            self.istft_output_len_static = None
+        else:
+            if use_batch_fold:
+                if fold_window <= 0 or EXPORT_AUDIO_LENGTH % fold_window != 0:
+                    raise ValueError("Static batch folding requires whole fixed-length windows.")
+                self.batch_static = EXPORT_AUDIO_LENGTH // fold_window
+                self.model_input_len_static = fold_window
+                self.stitched_len_static = self.batch_static * fold_window
+            else:
+                self.batch_static = 1
+                self.model_input_len_static = MODEL_AUDIO_LENGTH
+                self.stitched_len_static = MODEL_AUDIO_LENGTH
+            self.istft_output_len_static = HOP_LENGTH * (self.frames_static - 1)
+
+        # ── Precompute rotary tables, diagonal masks, and token-shift zeros ──
+        # Rotary cos/sin are stored in their final float32 compute dtype. Sine values include
+        # the [-sin,+sin] rotate-half signs, and the int32 permutation swaps each even/odd pair.
+        # This removes 24 runtime casts and the conventional slice/Stack/Flatten rotation.
+        self.register_buffer(
+            'rotary_perm',
+            torch.arange(mf_rot, dtype=torch.int32).reshape(-1, 2).flip(1).reshape(-1)
+        )
         self.precompute_rotary = not DYNAMIC_AXES
         if self.precompute_rotary:
-            blocks = mossformer_se.blocks
             inv_freq = blocks[0].intra_mossformer.rotary_pos_emb.freqs.detach()
-            # All MossFormer instances share the same (non-learned) rotary freqs.
             for blk in blocks:
                 for mf in (blk.intra_mossformer, blk.inter_mossformer):
                     assert torch.equal(mf.rotary_pos_emb.freqs.detach(), inv_freq), \
                         "Rotary freqs differ across MossFormer layers; cannot share one table."
-            # Longest token axis over both paths: frequency sub-bands (intra rotary
-            # axis / inter diagonal axis) and time frames (inter rotary axis /
-            # intra diagonal axis), plus a small margin for the emb_ks padding.
-            n_freqs = int(blocks[0].intra_mossformer.group_size)
-            max_seq = max(n_freqs, MAX_SIGNAL_LENGTH) + 2
+            max_seq = max(self.n_freqs, self.frames_static) + 2
             pos = torch.arange(max_seq, dtype=inv_freq.dtype)
-            ang = pos.unsqueeze(-1) * inv_freq                  # (max_seq, 16)
-            # float16 storage halves the ONNX initializer footprint; the buffer
-            # is an initializer, so the per-call Slice + Cast(float32) stay as
-            # runtime ops (they are not constant-folded) and the compact float16
-            # constant is what ships in the graph.
-            self.register_buffer('rotary_cos', ang.cos().to(torch.float16))
-            self.register_buffer('rotary_sin', ang.sin().to(torch.float16))
-            # int32 (not int64) position ids for the diagonal-mask equality: the
-            # values are all < MAX_SIGNAL_LENGTH so they fit int32, ONNX Equal
-            # supports int32, and int32 halves the buffer size. int64 is reserved
-            # for tensors that feed a Slice / Gather as indices (this one does not).
-            self.register_buffer('pos_ids', torch.arange(max_seq, dtype=torch.int32))
+            ang = pos.unsqueeze(-1) * inv_freq
+            cos_half = ang.cos()
+            sin_half = ang.sin()
+            rotary_cos = torch.stack(
+                (cos_half, cos_half), dim=-1
+            ).flatten(start_dim=-2)
+            rotary_sin = torch.stack(
+                (-sin_half, sin_half), dim=-1
+            ).flatten(start_dim=-2)
+            self.register_buffer(
+                'rotary_cos_intra',
+                rotary_cos[:self.n_freqs].reshape(1, self.n_freqs, 1, mf_rot)
+            )
+            self.register_buffer(
+                'rotary_sin_intra',
+                rotary_sin[:self.n_freqs].reshape(1, self.n_freqs, 1, mf_rot)
+            )
+            self.register_buffer(
+                'rotary_cos_inter',
+                rotary_cos[:self.frames_static].reshape(1, self.frames_static, 1, mf_rot)
+            )
+            self.register_buffer(
+                'rotary_sin_inter',
+                rotary_sin[:self.frames_static].reshape(1, self.frames_static, 1, mf_rot)
+            )
+            # The two cross-token diagonal masks are shared by all six layers.
+            self.register_buffer(
+                'intra_eye_mask', torch.eye(self.frames_static, dtype=torch.bool)
+            )
+            self.register_buffer(
+                'inter_eye_mask', torch.eye(self.n_freqs, dtype=torch.bool)
+            )
+            # F.pad for token shifting lowers to a large dynamic padding subgraph in the
+            # legacy exporter. Two exact shared zeros reduce every shift to Slice+Concat.
+            self.register_buffer(
+                'intra_shift_zero',
+                torch.zeros(self.batch_static * self.frames_static, 1, mf_C // 2)
+            )
+            self.register_buffer(
+                'inter_shift_zero',
+                torch.zeros(self.batch_static * self.n_freqs, 1, mf_C // 2)
+            )
         else:
-            self.rotary_cos = None
-            self.rotary_sin = None
-            self.pos_ids = None
+            self.rotary_cos_intra = None
+            self.rotary_sin_intra = None
+            self.rotary_cos_inter = None
+            self.rotary_sin_inter = None
+            self.intra_eye_mask = None
+            self.inter_eye_mask = None
+            self.intra_shift_zero = None
+            self.inter_shift_zero = None
 
         # ── Precompute fused FFConvM / qkv weights ──
         # Every FFConvM is LayerNorm -> Linear -> SiLU -> ConvModule(depthwise conv k31 + residual).
@@ -302,21 +379,16 @@ class MOSSFORMER_SE(torch.nn.Module):
         # ``to_out`` keeps its own input but still folds its LayerNorm into its Linear.
         # The fused tensors are registered as buffers (so they ship as ONNX initializers) and
         # referenced through ``self.blk_params`` in the forward pass.
-        blocks = mossformer_se.blocks
-        mf0 = blocks[0].intra_mossformer
-        self.in_channels = int(blocks[0].intra_to_u.mdl[1].weight.shape[1])   # emb_dim * emb_ks
-        self.n_freqs = int(mf0.group_size)                                    # static frequency axis
-        # The time-frame count depends only on the input length, so it is a static int for the
-        # default (16 kHz, non-dynamic) export and None otherwise (then read from the tensor).
-        self.frames_static = MAX_SIGNAL_LENGTH if not DYNAMIC_AXES else None
-        self.n_features = int(NFFT // 2 + 1)
-        self.decoder_channels = int(mossformer_se.mask_decoder.sub_pixel.conv.weight.shape[0] // mossformer_se.mask_decoder.sub_pixel.r)
-        self.subpixel_width = self.n_freqs * int(mossformer_se.mask_decoder.sub_pixel.r)
-        mf_C = int(mf0.to_qk.mdl[1].weight.shape[1])                          # 64
-        mf_hidden = int(mf0.to_hidden.mdl[1].weight.shape[0])                 # 256
-        mf_qk = int(mf0.to_qk.mdl[1].weight.shape[0])                         # 128
-        mf_rot = int(2 * mf0.rotary_pos_emb.freqs.shape[0])                   # 32
         self._buf_id = 0
+        self.encoder_dense_params = self._dense_fsmn_params(
+            mossformer_se.dense_encoder.dilated_dense
+        )
+        self.mask_dense_params = self._dense_fsmn_params(
+            mossformer_se.mask_decoder.dense_block
+        )
+        self.complex_dense_params = self._dense_fsmn_params(
+            mossformer_se.complex_decoder.dense_block
+        )
         self.blk_params = []
         for blk in blocks:
             p = {}
@@ -324,8 +396,14 @@ class MOSSFORMER_SE(torch.nn.Module):
             p['inter_unfold_w'], p['inter_unfold_b'] = self._fold_norm4d_unfold(blk.inter_norm, blk.emb_ks)
             p['intra_uv_w'], p['intra_uv_b'], p['intra_uv_cw'] = self._fuse_pair(blk.intra_to_u, blk.intra_to_v)
             p['inter_uv_w'], p['inter_uv_b'], p['inter_uv_cw'] = self._fuse_pair(blk.inter_to_u, blk.inter_to_v)
-            p['intra_mf'] = self._mossformer_params(blk.intra_mossformer, mf_C, mf_hidden, mf_qk, mf_hidden // 2, mf_rot, self.n_freqs)
-            p['inter_mf'] = self._mossformer_params(blk.inter_mossformer, mf_C, mf_hidden, mf_qk, mf_hidden // 2, mf_rot, self.frames_static)
+            p['intra_mf'] = self._mossformer_params(
+                blk.intra_mossformer, mf_C, mf_hidden, mf_qk,
+                mf_hidden // 2, mf_rot, self.n_freqs, self.frames_static
+            )
+            p['inter_mf'] = self._mossformer_params(
+                blk.inter_mossformer, mf_C, mf_hidden, mf_qk,
+                mf_hidden // 2, mf_rot, self.frames_static, self.n_freqs
+            )
             p['attn'] = self._attention_params(blk)
             self.blk_params.append(p)
 
@@ -336,6 +414,30 @@ class MOSSFORMER_SE(torch.nn.Module):
         self._buf_id += 1
         self.register_buffer(name, t.contiguous())
         return getattr(self, name)
+
+    def _dense_fsmn_params(self, dense_block):
+        # A dense-block FSMN receives NCHW data. Recast its two channel-wise Linear
+        # projections as 1x1 Conv2d weights and rotate the depthwise memory kernel from
+        # (K,1) to (1,K). The original parameters load normally before this export wrapper
+        # is built; only the immutable ONNX representation changes.
+        params = []
+        for i in range(dense_block.depth):
+            uf = getattr(dense_block, "fsmn%d" % (i + 1)).fsmn
+            params.append({
+                'linear_w': self._rb(
+                    uf.linear.weight.detach().unsqueeze(-1).unsqueeze(-1)
+                ),
+                'linear_b': self._rb(uf.linear.bias.detach().clone()),
+                'project_w': self._rb(
+                    uf.project.weight.detach().unsqueeze(-1).unsqueeze(-1)
+                ),
+                'memory_w': self._rb(
+                    uf.conv1.weight.detach().transpose(2, 3)
+                ),
+                'padding': int(uf.lorder - 1),
+                'groups': int(uf.conv1.weight.shape[0]),
+            })
+        return params
 
     def _fold_norm4d_fconv(self, norm, conv):
         w, b = _fold_norm4d_conv2d(norm, conv)
@@ -356,7 +458,7 @@ class MOSSFORMER_SE(torch.nn.Module):
                 self._rb(torch.cat([b0, b1], 0)),
                 self._rb(torch.cat([cv0.weight, cv1.weight], 0)))
 
-    def _mossformer_params(self, mf, C, hidden, qk, vdim, rot, q_len):
+    def _mossformer_params(self, mf, C, hidden, qk, vdim, rot, q_len, bt_len):
         # Precompute the fused weights for one MossFormer: to_hidden + to_qk fused into one
         # Linear/conv, to_out's LayerNorm folded into its Linear, plus the (static) dims and
         # the rotary / offset-scale tensors. If the token axis is static, fold the linear
@@ -368,15 +470,25 @@ class MOSSFORMER_SE(torch.nn.Module):
         gamma = mf.qk_offset_scale.gamma.detach().clone()
         beta = mf.qk_offset_scale.beta.detach().clone()
         lin_k_scaled = q_len is not None
+        quad_k_scaled = q_len is not None and bt_len is not None
         if lin_k_scaled:
             inv_q = 1.0 / float(q_len)
             gamma[3].mul_(inv_q)
             beta[3].mul_(inv_q)
+        if quad_k_scaled:
+            # Scaling the complete quad-k head commutes with its rotary transform.
+            # Local similarity then needs no /Q; cross similarity only corrects by Q/BT.
+            inv_q = 1.0 / float(q_len)
+            gamma[2].mul_(inv_q)
+            beta[2].mul_(inv_q)
         return {
             'C': C, 'hidden': hidden, 'qk': qk, 'vdim': vdim, 'rot': rot,
             'in_w': in_w, 'in_b': in_b, 'in_cw': in_cw,
             'out_w': self._rb(out_w), 'out_b': self._rb(out_b), 'out_cw': self._rb(cv_o.weight.clone()),
-            'gamma': self._rb(gamma), 'beta': self._rb(beta), 'lin_k_scaled': lin_k_scaled,
+            'gamma': self._rb(gamma), 'beta': self._rb(beta),
+            'lin_k_scaled': lin_k_scaled,
+            'quad_k_scaled': quad_k_scaled,
+            'cross_scale': float(q_len / bt_len) if quad_k_scaled else None,
             'inv_freq': mf.rotary_pos_emb.freqs,
         }
 
@@ -404,10 +516,12 @@ class MOSSFORMER_SE(torch.nn.Module):
         v_beta = torch.stack([m[2].beta.detach().squeeze(0).squeeze(1) for m in v_mods], dim=0)
         return {
             'w': self._rb(conv_w), 'b': self._rb(conv_b), 'prelu': self._rb(prelu_w),
-            'qk_gamma': self._rb(torch.stack([q_gamma, k_gamma], dim=0).unsqueeze(0).unsqueeze(4)),
-            'qk_beta': self._rb(torch.stack([q_beta, k_beta], dim=0).unsqueeze(0).unsqueeze(4)),
-            'v_gamma': self._rb(v_gamma.unsqueeze(0).unsqueeze(3)),
-            'v_beta': self._rb(v_beta.unsqueeze(0).unsqueeze(3)),
+            # Final layouts consumed after moving time before the normalized channel/freq axes:
+            # Q/K [1, 2, H, 1, C, F], V [1, H, 1, C, F].
+            'qk_gamma': self._rb(torch.stack([q_gamma, k_gamma], dim=0).unsqueeze(0).unsqueeze(3)),
+            'qk_beta': self._rb(torch.stack([q_beta, k_beta], dim=0).unsqueeze(0).unsqueeze(3)),
+            'v_gamma': self._rb(v_gamma.unsqueeze(0).unsqueeze(2)),
+            'v_beta': self._rb(v_beta.unsqueeze(0).unsqueeze(2)),
             'heads': heads, 'q_ch': q_ch, 'v_ch': v_ch,
             'qk_total': 2 * heads * q_ch,
             'qk_flat': qk_flat, 'v_flat': v_ch * self.n_freqs,
@@ -433,28 +547,43 @@ class MOSSFORMER_SE(torch.nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        model_input_len = audio.shape[-1]
+        model_input_len = (
+            self.model_input_len_static
+            if self.model_input_len_static is not None
+            else audio.shape[-1]
+        )
         if self.use_batch_fold:
             # Input length is already a whole number of windows (padded OUTSIDE the model in
             # numpy), so fold (1, 1, num_window*W) -> (num_window, 1, W). norm_factor (dim=-1
             # keepdim) is already per-window, and the whole SyncANet then runs batched.
-            audio = audio.reshape(-1, 1, self.fold_window)
+            audio = audio.reshape(
+                self.batch_static if self.batch_static is not None else -1,
+                1, self.fold_window
+            )
             model_input_len = self.fold_window
         norm_factor = torch.sqrt(torch.mean(audio * audio, dim=-1, keepdim=True) + 1e-6)
         audio /= norm_factor
         padding_len = (HOP_LENGTH - model_input_len % HOP_LENGTH) % HOP_LENGTH
-        audio = torch.cat([audio, audio[..., :padding_len]], dim=-1)
-        real_part, imag_part = self.stft_model(audio)
-        power = real_part * real_part + imag_part * imag_part
+        if self.model_input_len_static is None or padding_len:
+            audio = torch.cat([audio, audio[..., :padding_len]], dim=-1)
+        bsz = self.batch_static if self.batch_static is not None else audio.shape[0]
+        packed_stft = self.stft_model(audio)
+        frames = (
+            self.frames_static
+            if self.frames_static is not None else packed_stft.shape[-1]
+        )
+        complex_input = packed_stft.reshape(
+            bsz, 2, self.n_features, frames
+        )
+        power = (complex_input * complex_input).sum(dim=1)
         magnitude_compress = torch.pow(power, self.compress_factor_sqrt)
         safe_power = power.clamp_min(torch.finfo(power.dtype).tiny)
         phase_scale = torch.pow(safe_power, self.compress_factor_sqrt - 0.5)
-        real_compress = real_part * phase_scale
-        imag_compress = imag_part * phase_scale
-        # Stack the magnitude / compressed-real / compressed-imag channels straight into the
-        # (1, 3, F, T) layout (one op instead of cat-along-batch + unsqueeze), then transpose to
-        # (1, 3, T, F) for the encoder.
-        x = torch.stack([magnitude_compress, real_compress, imag_compress], dim=1).transpose(-1, -2)
+        complex_compress = complex_input * phase_scale.unsqueeze(1)
+        # Keep real/imaginary channels packed and prepend magnitude once.
+        x = torch.cat(
+            (magnitude_compress.unsqueeze(1), complex_compress), dim=1
+        ).transpose(-1, -2)
 
         # ============================================================
         # DenseEncoder (inlined)
@@ -471,20 +600,25 @@ class MOSSFORMER_SE(torch.nn.Module):
             conv = getattr(dd, "conv%d" % (i + 1))
             norm = getattr(dd, "norm%d" % (i + 1))
             prelu = getattr(dd, "prelu%d" % (i + 1))
-            uf = getattr(dd, "fsmn%d" % (i + 1)).fsmn
+            fp = self.encoder_dense_params[i]
             dil = 2 ** i
-            out = F.pad(skip, (1, 1, dil, 0))
-            out = F.conv2d(out, conv.weight, conv.bias, dilation=(dil, 1))
+            # Symmetric Conv padding plus a constant tail crop is equivalent to the
+            # original top-only causal pad, but avoids the exporter's large Pad scaffold.
+            out = F.conv2d(
+                skip, conv.weight, conv.bias,
+                padding=(dil, 1), dilation=(dil, 1)
+            )[..., :-dil, :]
             out = F.instance_norm(out, None, None, norm.weight, norm.bias, True, 0.1, 1e-5)
             out = F.prelu(out, prelu.weight)
-            # FSMN_Wrap -> UniDeepFsmn (lorder 5)
-            fin = out.permute(0, 2, 3, 1)
-            f1 = F.relu(F.linear(fin, uf.linear.weight, uf.linear.bias))
-            p1 = F.linear(f1, uf.project.weight)
-            x_per = p1.permute(1, 3, 2, 0)
-            y = F.pad(x_per, [0, 0, uf.lorder - 1, uf.lorder - 1])
-            o = x_per + F.conv2d(y, uf.conv1.weight, groups=uf.conv1.weight.shape[0])
-            out = (fin + o.permute(3, 0, 2, 1)).permute(0, 3, 1, 2)
+            # FSMN stays NCHW: two prepacked 1x1 projections and one depthwise
+            # frequency-memory Conv replace Linear/permute/Conv/permute round trips.
+            f1 = F.relu(F.conv2d(out, fp['linear_w'], fp['linear_b']))
+            p1 = F.conv2d(f1, fp['project_w'])
+            memory = F.conv2d(
+                p1, fp['memory_w'], padding=(0, fp['padding']),
+                groups=fp['groups']
+            )
+            out = out + (p1 + memory)
             skip = torch.cat([out, skip], dim=1)
         x = out
         # conv_2: Conv2d(64 -> 64, 1x3, stride (1,2), pad (0,1)) -> InstanceNorm2d -> PReLU
@@ -495,7 +629,6 @@ class MOSSFORMER_SE(torch.nn.Module):
         # ============================================================
         # SyncANet blocks (inlined). The loop over the 6 blocks is kept.
         # ============================================================
-        bsz = x.shape[0]                                 # window-fold batch (num_window; 1 otherwise)
         for ii in range(M.n_layers):
             b = M.blocks[ii]
             pb = self.blk_params[ii]
@@ -503,57 +636,74 @@ class MOSSFORMER_SE(torch.nn.Module):
             # ------------------------- intra path -------------------------
             # intra_norm: LayerNormalization4D (statistics over the channel dim)
             mu = x.mean(dim=1, keepdim=True)
-            sd = torch.sqrt(x.var(dim=1, unbiased=False, keepdim=True) + b.intra_norm.eps)
-            t = (x - mu) / sd
+            centered = x - mu
+            sd = torch.sqrt(
+                (centered * centered).mean(dim=1, keepdim=True)
+                + b.intra_norm.eps
+            )
+            t = centered / sd
             # Fconv with intra_norm gamma / beta folded into the grouped Conv2d weights / bias.
             t = F.conv2d(t, pb['intra_fconv_w'], pb['intra_fconv_b'], groups=b.emb_dim)
             # (B, C, T, F) -> (B*T, F, C): fold the window batch into the time-frame batch so the
             # frequency-axis attention runs per (window, time-frame). For B=1 this equals the
             # original squeeze(0).permute(1, 2, 0).
             t = t.permute(0, 2, 3, 1).contiguous()
-            t = t.reshape(-1, t.shape[-2], t.shape[-1])
+            t = t.reshape(bsz * frames, self.intra_steps, self.in_channels)
             # intra_to_u + intra_to_v (fused FFConvM pair): one affine-free LayerNorm, one Linear,
             # one grouped depthwise conv (+residual), then split into the u / v branches.
             huv = F.layer_norm(t, (self.in_channels,), None, None, 1e-5)
             cw = pb['intra_uv_cw']
             huv = F.silu(F.linear(huv, pb['intra_uv_w'], pb['intra_uv_b']))
             huv = huv + F.conv1d(huv.transpose(1, 2), cw, None, 1, 15, 1, cw.shape[0]).transpose(1, 2)
-            iu, iv = huv.chunk(2, dim=-1)
+            iu, iv = huv.split((self.uv_channels, self.uv_channels), dim=-1)
             # intra_rnn: UniDeepFsmn (lorder 20) on the gated "u" branch
             uf = b.intra_rnn[0]
-            fz = iu.unsqueeze(0)
-            f1 = F.relu(F.linear(fz, uf.linear.weight, uf.linear.bias))
+            f1 = F.relu(F.linear(iu, uf.linear.weight, uf.linear.bias))
             p1 = F.linear(f1, uf.project.weight)
-            x_per = p1.permute(1, 3, 2, 0)
-            y = F.pad(x_per, [0, 0, uf.lorder - 1, uf.lorder - 1])
-            o = x_per + F.conv2d(y, uf.conv1.weight, groups=uf.conv1.weight.shape[0])
-            iu = (fz + o.permute(3, 0, 2, 1)).squeeze(0)
+            memory = F.conv1d(
+                p1.transpose(1, 2), uf.conv1.weight.squeeze(-1),
+                padding=uf.lorder - 1,
+                groups=uf.conv1.weight.shape[0]
+            ).transpose(1, 2)
+            iu = iu + (p1 + memory)
             t = iv * iu
             t = t.transpose(1, 2)
             # intra_linear: ConvTranspose1d
             t = F.conv_transpose1d(t, b.intra_linear.weight, b.intra_linear.bias, stride=b.emb_hs)
             t = t.transpose(1, 2)
             # intra_mossformer: inlined fused MossFormer path (rotary along the frequency axis).
-            t = _mossformer_block(pb['intra_mf'], t, self.n_freqs, self.frames_static, self.rotary_cos, self.rotary_sin, self.pos_ids, bsz)
+            t = _mossformer_block(
+                pb['intra_mf'], t, self.n_freqs, frames,
+                self.rotary_cos_intra, self.rotary_sin_intra, self.rotary_perm,
+                self.intra_eye_mask, self.intra_shift_zero, bsz
+            )
             # (B*T, F, C) -> (B, C, T, F)
-            t = t.reshape(bsz, -1, self.n_freqs, t.shape[-1]).permute(0, 3, 1, 2).contiguous()
+            t = t.reshape(
+                bsz, frames, self.n_freqs, self.emb_dim
+            ).permute(0, 3, 1, 2).contiguous()
             # intra_se: SELayer (avg + max channel attention)
             se = b.intra_se
-            sa = F.adaptive_avg_pool2d(t, 1).reshape(bsz, -1)
+            sa = F.adaptive_avg_pool2d(t, 1).reshape(bsz, self.emb_dim)
             sa = torch.sigmoid(F.linear(F.relu(F.linear(sa, se.avg_pool_layer[0].weight, se.avg_pool_layer[0].bias)), se.avg_pool_layer[2].weight, se.avg_pool_layer[2].bias))
-            sm = F.adaptive_max_pool2d(t, 1).reshape(bsz, -1)
+            sm = F.adaptive_max_pool2d(t, 1).reshape(bsz, self.emb_dim)
             sm = torch.sigmoid(F.linear(F.relu(F.linear(sm, se.max_pool_layer[0].weight, se.max_pool_layer[0].bias)), se.max_pool_layer[2].weight, se.max_pool_layer[2].bias))
-            t = (sa + sm).reshape(bsz, -1, 1, 1) * t
+            t = (sa + sm).reshape(bsz, self.emb_dim, 1, 1) * t
             t = t + x
 
             # ------------------------- inter path -------------------------
             inp = t
             mu = inp.mean(dim=1, keepdim=True)
-            sd = torch.sqrt(inp.var(dim=1, unbiased=False, keepdim=True) + b.inter_norm.eps)
-            t = (inp - mu) / sd
+            centered = inp - mu
+            sd = torch.sqrt(
+                (centered * centered).mean(dim=1, keepdim=True)
+                + b.inter_norm.eps
+            )
+            t = centered / sd
             # (B, C, T, F) -> (B*F, C, T): fold the window batch into the frequency batch so the
             # time-axis attention runs per (window, freq). For B=1 this equals squeeze(0).permute(2, 0, 1).
-            t = t.permute(0, 3, 1, 2).reshape(-1, inp.shape[1], inp.shape[2]).contiguous()
+            t = t.permute(0, 3, 1, 2).reshape(
+                bsz * self.n_freqs, self.emb_dim, frames
+            ).contiguous()
             # Grouped Conv1d is the inter-path unfold, with inter_norm gamma / beta folded in.
             t = F.conv1d(t, pb['inter_unfold_w'], pb['inter_unfold_b'], stride=b.emb_hs, groups=b.emb_dim)
             t = t.transpose(1, 2)
@@ -563,57 +713,74 @@ class MOSSFORMER_SE(torch.nn.Module):
             cw = pb['inter_uv_cw']
             huv = F.silu(F.linear(huv, pb['inter_uv_w'], pb['inter_uv_b']))
             huv = huv + F.conv1d(huv.transpose(1, 2), cw, None, 1, 15, 1, cw.shape[0]).transpose(1, 2)
-            iu, iv = huv.chunk(2, dim=-1)
+            iu, iv = huv.split((self.uv_channels, self.uv_channels), dim=-1)
             # inter_rnn: UniDeepFsmn (lorder 20)
             uf = b.inter_rnn[0]
-            fz = iu.unsqueeze(0)
-            f1 = F.relu(F.linear(fz, uf.linear.weight, uf.linear.bias))
+            f1 = F.relu(F.linear(iu, uf.linear.weight, uf.linear.bias))
             p1 = F.linear(f1, uf.project.weight)
-            x_per = p1.permute(1, 3, 2, 0)
-            y = F.pad(x_per, [0, 0, uf.lorder - 1, uf.lorder - 1])
-            o = x_per + F.conv2d(y, uf.conv1.weight, groups=uf.conv1.weight.shape[0])
-            iu = (fz + o.permute(3, 0, 2, 1)).squeeze(0)
+            memory = F.conv1d(
+                p1.transpose(1, 2), uf.conv1.weight.squeeze(-1),
+                padding=uf.lorder - 1,
+                groups=uf.conv1.weight.shape[0]
+            ).transpose(1, 2)
+            iu = iu + (p1 + memory)
             t = iv * iu
             t = t.transpose(1, 2)
             t = F.conv_transpose1d(t, b.inter_linear.weight, b.inter_linear.bias, stride=b.emb_hs)
             t = t.transpose(1, 2)
             # inter_mossformer: inlined fused MossFormer path (rotary along the time axis).
-            t = _mossformer_block(pb['inter_mf'], t, self.frames_static, self.n_freqs, self.rotary_cos, self.rotary_sin, self.pos_ids, bsz)
+            t = _mossformer_block(
+                pb['inter_mf'], t, frames, self.n_freqs,
+                self.rotary_cos_inter, self.rotary_sin_inter, self.rotary_perm,
+                self.inter_eye_mask, self.inter_shift_zero, bsz
+            )
             # (B*F, T, C) -> (B, C, F, T) (SELayer runs in this layout, transposed to (B,C,T,F) after)
-            t = t.reshape(bsz, self.n_freqs, -1, t.shape[-1]).permute(0, 3, 1, 2).contiguous()
+            t = t.reshape(
+                bsz, self.n_freqs, frames, self.emb_dim
+            ).permute(0, 3, 1, 2).contiguous()
             # inter_se: SELayer
             se = b.inter_se
-            sa = F.adaptive_avg_pool2d(t, 1).reshape(bsz, -1)
+            sa = F.adaptive_avg_pool2d(t, 1).reshape(bsz, self.emb_dim)
             sa = torch.sigmoid(F.linear(F.relu(F.linear(sa, se.avg_pool_layer[0].weight, se.avg_pool_layer[0].bias)), se.avg_pool_layer[2].weight, se.avg_pool_layer[2].bias))
-            sm = F.adaptive_max_pool2d(t, 1).reshape(bsz, -1)
+            sm = F.adaptive_max_pool2d(t, 1).reshape(bsz, self.emb_dim)
             sm = torch.sigmoid(F.linear(F.relu(F.linear(sm, se.max_pool_layer[0].weight, se.max_pool_layer[0].bias)), se.max_pool_layer[2].weight, se.max_pool_layer[2].bias))
-            t = (sa + sm).reshape(bsz, -1, 1, 1) * t
+            t = (sa + sm).reshape(bsz, self.emb_dim, 1, 1) * t
             inter = t.transpose(-1, 2) + inp
 
             # ------------------------- triple attention -------------------------
             ap = pb['attn']
-            old_T = self.frames_static if self.frames_static is not None else inter.shape[2]
+            old_T = frames
             qkv = F.prelu(F.conv2d(inter, ap['w'], ap['b']), ap['prelu'])
-            qk = qkv[:, :ap['qk_total']].view(bsz, 2, ap['heads'], ap['q_ch'], old_T, self.n_freqs)
-            qk_mu = qk.mean(dim=(3, 5), keepdim=True)
-            qk_sd = torch.sqrt(qk.var(dim=(3, 5), unbiased=False, keepdim=True) + ap['eps'])
-            qk = ((qk - qk_mu) / qk_sd) * ap['qk_gamma'] + ap['qk_beta']
-            vv = qkv[:, ap['qk_total']:].view(bsz, ap['heads'], ap['v_ch'], old_T, self.n_freqs)
-            v_mu = vv.mean(dim=(2, 4), keepdim=True)
-            v_sd = torch.sqrt(vv.var(dim=(2, 4), unbiased=False, keepdim=True) + ap['eps'])
-            vv = ((vv - v_mu) / v_sd) * ap['v_gamma'] + ap['v_beta']
+            qk = qkv[:, :ap['qk_total']].view(
+                bsz, 2, ap['heads'], ap['q_ch'], old_T, self.n_freqs
+            ).permute(0, 1, 2, 4, 3, 5)
+            qk = F.layer_norm(
+                qk, (ap['q_ch'], self.n_freqs), None, None, ap['eps']
+            ) * ap['qk_gamma'] + ap['qk_beta']
+            vv = qkv[:, ap['qk_total']:].view(
+                bsz, ap['heads'], ap['v_ch'], old_T, self.n_freqs
+            ).permute(0, 1, 3, 2, 4)
+            vv = F.layer_norm(
+                vv, (ap['v_ch'], self.n_freqs), None, None, ap['eps']
+            ) * ap['v_gamma'] + ap['v_beta']
             # Keep the window batch (B) as an outer batch: attention is per (window, head).
-            Q = qk[:, 0].permute(0, 1, 3, 2, 4).reshape(bsz, ap['heads'], old_T, ap['qk_flat'])
-            K = qk[:, 1].permute(0, 1, 3, 2, 4).reshape(bsz, ap['heads'], old_T, ap['qk_flat'])
-            V = vv.permute(0, 1, 3, 2, 4).reshape(bsz, ap['heads'], old_T, ap['v_flat'])
+            Q = qk[:, 0].reshape(bsz, ap['heads'], old_T, ap['qk_flat'])
+            K = qk[:, 1].reshape(bsz, ap['heads'], old_T, ap['qk_flat'])
+            V = vv.reshape(bsz, ap['heads'], old_T, ap['v_flat'])
             attn_mat = F.softmax(torch.matmul(Q, K.transpose(-1, -2)), dim=-1)
             V = torch.matmul(attn_mat, V).reshape(bsz, ap['heads'], old_T, ap['v_ch'], self.n_freqs).permute(0, 1, 3, 2, 4)
-            V = V.reshape(bsz, ap['heads'] * ap['v_ch'], old_T, self.n_freqs)
+            V = V.reshape(
+                bsz, ap['heads'] * ap['v_ch'], old_T, self.n_freqs
+            )
             pm = b.attn_concat_proj
             V = F.prelu(F.conv2d(V, pm[0].weight, pm[0].bias), pm[1].weight)
             mu = V.mean(dim=(1, 3), keepdim=True)
-            sd = torch.sqrt(V.var(dim=(1, 3), unbiased=False, keepdim=True) + pm[2].eps)
-            V = ((V - mu) / sd) * pm[2].gamma + pm[2].beta
+            centered = V - mu
+            sd = torch.sqrt(
+                (centered * centered).mean(dim=(1, 3), keepdim=True)
+                + pm[2].eps
+            )
+            V = (centered / sd) * pm[2].gamma + pm[2].beta
             x = V + inter
 
         # ============================================================
@@ -626,26 +793,27 @@ class MOSSFORMER_SE(torch.nn.Module):
             conv = getattr(dd, "conv%d" % (i + 1))
             norm = getattr(dd, "norm%d" % (i + 1))
             prelu = getattr(dd, "prelu%d" % (i + 1))
-            uf = getattr(dd, "fsmn%d" % (i + 1)).fsmn
+            fp = self.mask_dense_params[i]
             dil = 2 ** i
-            out = F.pad(skip, (1, 1, dil, 0))
-            out = F.conv2d(out, conv.weight, conv.bias, dilation=(dil, 1))
+            out = F.conv2d(
+                skip, conv.weight, conv.bias,
+                padding=(dil, 1), dilation=(dil, 1)
+            )[..., :-dil, :]
             out = F.instance_norm(out, None, None, norm.weight, norm.bias, True, 0.1, 1e-5)
             out = F.prelu(out, prelu.weight)
-            fin = out.permute(0, 2, 3, 1)
-            f1 = F.relu(F.linear(fin, uf.linear.weight, uf.linear.bias))
-            p1 = F.linear(f1, uf.project.weight)
-            x_per = p1.permute(1, 3, 2, 0)
-            y = F.pad(x_per, [0, 0, uf.lorder - 1, uf.lorder - 1])
-            o = x_per + F.conv2d(y, uf.conv1.weight, groups=uf.conv1.weight.shape[0])
-            out = (fin + o.permute(3, 0, 2, 1)).permute(0, 3, 1, 2)
+            f1 = F.relu(F.conv2d(out, fp['linear_w'], fp['linear_b']))
+            p1 = F.conv2d(f1, fp['project_w'])
+            memory = F.conv2d(
+                p1, fp['memory_w'], padding=(0, fp['padding']),
+                groups=fp['groups']
+            )
+            out = out + (p1 + memory)
             skip = torch.cat([out, skip], dim=1)
         xm = out
         # sub_pixel: SPConvTranspose2d
         sp = md.sub_pixel
-        xm = F.pad(xm, (1, 1, 0, 0))
-        xm = F.conv2d(xm, sp.conv.weight, sp.conv.bias)
-        decoder_frames = self.frames_static if self.frames_static is not None else xm.shape[2]
+        xm = F.conv2d(xm, sp.conv.weight, sp.conv.bias, padding=(0, 1))
+        decoder_frames = frames
         xm = xm.view((bsz, sp.r, self.decoder_channels, decoder_frames, self.n_freqs)).permute(0, 2, 3, 4, 1).contiguous().view((bsz, self.decoder_channels, decoder_frames, self.subpixel_width))
         # conv_1 -> InstanceNorm2d -> PReLU
         xm = F.conv2d(xm, md.conv_1.weight, md.conv_1.bias)
@@ -653,7 +821,7 @@ class MOSSFORMER_SE(torch.nn.Module):
         xm = F.prelu(xm, md.prelu.weight)
         # final_conv -> rearrange -> prelu_out
         xm = F.conv2d(xm, md.final_conv.weight, md.final_conv.bias).permute(0, 3, 2, 1).squeeze(-1)
-        mask = F.prelu(xm, md.prelu_out.weight).permute(0, 2, 1).transpose(1, 2)
+        mask = F.prelu(xm, md.prelu_out.weight)
 
         # ============================================================
         # ComplexDecoder (inlined) -> complex_out
@@ -665,25 +833,26 @@ class MOSSFORMER_SE(torch.nn.Module):
             conv = getattr(dd, "conv%d" % (i + 1))
             norm = getattr(dd, "norm%d" % (i + 1))
             prelu = getattr(dd, "prelu%d" % (i + 1))
-            uf = getattr(dd, "fsmn%d" % (i + 1)).fsmn
+            fp = self.complex_dense_params[i]
             dil = 2 ** i
-            out = F.pad(skip, (1, 1, dil, 0))
-            out = F.conv2d(out, conv.weight, conv.bias, dilation=(dil, 1))
+            out = F.conv2d(
+                skip, conv.weight, conv.bias,
+                padding=(dil, 1), dilation=(dil, 1)
+            )[..., :-dil, :]
             out = F.instance_norm(out, None, None, norm.weight, norm.bias, True, 0.1, 1e-5)
             out = F.prelu(out, prelu.weight)
-            fin = out.permute(0, 2, 3, 1)
-            f1 = F.relu(F.linear(fin, uf.linear.weight, uf.linear.bias))
-            p1 = F.linear(f1, uf.project.weight)
-            x_per = p1.permute(1, 3, 2, 0)
-            y = F.pad(x_per, [0, 0, uf.lorder - 1, uf.lorder - 1])
-            o = x_per + F.conv2d(y, uf.conv1.weight, groups=uf.conv1.weight.shape[0])
-            out = (fin + o.permute(3, 0, 2, 1)).permute(0, 3, 1, 2)
+            f1 = F.relu(F.conv2d(out, fp['linear_w'], fp['linear_b']))
+            p1 = F.conv2d(f1, fp['project_w'])
+            memory = F.conv2d(
+                p1, fp['memory_w'], padding=(0, fp['padding']),
+                groups=fp['groups']
+            )
+            out = out + (p1 + memory)
             skip = torch.cat([out, skip], dim=1)
         xc = out
         sp = cd.sub_pixel
-        xc = F.pad(xc, (1, 1, 0, 0))
-        xc = F.conv2d(xc, sp.conv.weight, sp.conv.bias)
-        decoder_frames = self.frames_static if self.frames_static is not None else xc.shape[2]
+        xc = F.conv2d(xc, sp.conv.weight, sp.conv.bias, padding=(0, 1))
+        decoder_frames = frames
         xc = xc.view((bsz, sp.r, self.decoder_channels, decoder_frames, self.n_freqs)).permute(0, 2, 3, 4, 1).contiguous().view((bsz, self.decoder_channels, decoder_frames, self.subpixel_width))
         # InstanceNorm2d -> PReLU -> Conv2d(64 -> 2)
         xc = F.instance_norm(xc, None, None, cd.norm.weight, cd.norm.bias, True, 0.1, 1e-5)
@@ -691,16 +860,27 @@ class MOSSFORMER_SE(torch.nn.Module):
         xc = F.conv2d(xc, cd.conv.weight, cd.conv.bias)
         complex_out = xc.transpose(-1, -2)
 
-        mag_real = mask * real_compress
-        mag_imag = mask * imag_compress
-        complex_real, complex_imag = complex_out.split(1, dim=1)
-        final_real = mag_real + complex_real.squeeze(1)
-        final_imag = mag_imag + complex_imag.squeeze(1)
-        factor = torch.pow(final_real * final_real + final_imag * final_imag, self.compress_factor_inv)
-        audio = self.istft_model(final_real * factor, final_imag * factor)[..., :model_input_len]
+        final_complex = mask.unsqueeze(1) * complex_compress + complex_out
+        factor = torch.pow(
+            (final_complex * final_complex).sum(dim=1),
+            self.compress_factor_inv
+        )
+        final_complex = final_complex * factor.unsqueeze(1)
+        audio = self.istft_model(final_complex.reshape(
+            bsz, 2 * self.n_features, frames
+        ))
+        if (
+            self.istft_output_len_static is None
+            or self.istft_output_len_static != model_input_len
+        ):
+            audio = audio[..., :model_input_len]
         audio *= norm_factor
         if self.use_batch_fold:
-            audio = audio.reshape(1, 1, -1)                             # stitch windows back
+            audio = audio.reshape(
+                1, 1,
+                self.stitched_len_static
+                if self.stitched_len_static is not None else -1
+            )
         if self.out_sample_rate != MODEL_SAMPLE_RATE:
             audio = torch.nn.functional.interpolate(
                 audio,
@@ -728,42 +908,50 @@ def _run_inference_demo():
 
 print('Export start ...')
 Path(onnx_model_A).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-with torch.inference_mode():
-    # The original ClearVoice pipeline (clearvoice/utils/misc.py -> torch.stft(..., center=True))
-    # uses the torch default pad_mode='reflect'. The custom STFT must mirror that, otherwise the
-    # first/last ~NFFT//HOP frames are computed from zero padding instead of a reflected signal,
-    # producing large edge errors in the spectrogram fed to the network.
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode='reflect').eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode='reflect').eval()
+with tempfile.TemporaryDirectory(prefix="mossformergan_export_") as temp_dir:
+    transient_onnx = str(Path(temp_dir) / "MossFormerGAN_SE_16K.export.onnx")
+    with torch.inference_mode():
+        # The original ClearVoice pipeline (clearvoice/utils/misc.py -> torch.stft(..., center=True))
+        # uses the torch default pad_mode='reflect'. The custom STFT must mirror that, otherwise the
+        # first/last ~NFFT//HOP frames are computed from zero padding instead of a reflected signal,
+        # producing large edge errors in the spectrogram fed to the network.
+        custom_stft = STFT_Process(model_type='stft_C', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode='reflect').eval()
+        custom_istft = STFT_Process(
+            model_type='istft_C', n_fft=NFFT, hop_len=HOP_LENGTH,
+            win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH,
+            window_type=WINDOW_TYPE, center_pad=True, pad_mode='reflect',
+            precompute_window_sum=not DYNAMIC_AXES
+        ).eval()
 
-    mossformer = load_mossformergan_model(model_path).eval().float().to("cpu")
-    mossformer = MOSSFORMER_SE(mossformer, custom_stft, custom_istft, IN_SAMPLE_RATE, OUT_SAMPLE_RATE, USE_BATCH_FOLD, FOLD_WINDOW_LENGTH)
-    if "32" in IN_AUDIO_DTYPE:
-        IN_TORCH_DTYPE = torch.float32
-    elif "int" in IN_AUDIO_DTYPE.lower():
-        IN_TORCH_DTYPE = torch.int16
-    else:
-        IN_TORCH_DTYPE = torch.float16
-    audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
+        mossformer = load_mossformergan_model(model_path).eval().float().to("cpu")
+        mossformer = MOSSFORMER_SE(mossformer, custom_stft, custom_istft, IN_SAMPLE_RATE, OUT_SAMPLE_RATE, USE_BATCH_FOLD, FOLD_WINDOW_LENGTH)
+        if "32" in IN_AUDIO_DTYPE:
+            IN_TORCH_DTYPE = torch.float32
+        elif "int" in IN_AUDIO_DTYPE.lower():
+            IN_TORCH_DTYPE = torch.int16
+        else:
+            IN_TORCH_DTYPE = torch.float16
+        audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
 
-    torch.onnx.export(
-        mossformer,
-        (audio,),
-        onnx_model_A,
-        input_names=['noisy_audio'],
-        output_names=['denoised_audio'],
-        dynamic_axes={
-            'noisy_audio': {2: 'audio_len'},
-            'denoised_audio': {2: 'audio_len'}
-        } if DYNAMIC_AXES else None,
-        opset_version=OPSET,
-        dynamo=False
-    )
-    del mossformer
-    del audio
-    del custom_stft
-    del custom_istft
-    gc.collect()
+        torch.onnx.export(
+            mossformer,
+            (audio,),
+            transient_onnx,
+            input_names=['noisy_audio'],
+            output_names=['denoised_audio'],
+            dynamic_axes={
+                'noisy_audio': {2: 'audio_len'},
+                'denoised_audio': {2: 'audio_len'}
+            } if DYNAMIC_AXES else None,
+            opset_version=OPSET,
+            dynamo=False
+        )
+        del mossformer
+        del audio
+        del custom_stft
+        del custom_istft
+        gc.collect()
+    rewrite_asymmetric_causal_convs(transient_onnx, onnx_model_A)
 model_metadata = build_audio_metadata_from_globals(
     globals(), producer=Path(__file__).name, model_name="MossFormerGAN_SE_16K", task="denoise", model_family="mossformergan_se",
     max_dynamic_audio_seconds=6, normalize_audio_default=False, input_channels=1, output_channels=1,

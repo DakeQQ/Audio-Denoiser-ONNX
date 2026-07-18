@@ -19,13 +19,13 @@ from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path
 
 
 parent_path          = Path(__file__).resolve().parent                             # The folder that contains this script.
-model_path           = r"/home/DakeQQ/Downloads/H-GTCRN-main"                        # The H-GTCRN download path.
+model_path           = str(Path.home() / "Downloads" / "H-GTCRN-main")            # The H-GTCRN download path.
 onnx_model_A         = str(parent_path / "H_GTCRN_ONNX" / "H_GTCRN.onnx")          # The exported onnx model path.
 onnx_model_Metadata  = str(metadata_path_for_model(onnx_model_A))                  # The metadata carrier onnx model path.
 
 
 DYNAMIC_AXES         = False                          # False exports a fixed windowed model; set True to keep dynamic audio length so WPE/AuxIVA can use full-sequence statistics.
-OPSET                = 18                             # ONNX opset.
+OPSET                = 20                             # ONNX opset.
 IN_SAMPLE_RATE       = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 OUT_SAMPLE_RATE      = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 MODEL_SAMPLE_RATE    = 16000                          # The internal processing sample rate of the model. STFT/ISTFT, WPE/AuxIVA and the network always run at this rate; inputs are resampled to it.
@@ -40,7 +40,9 @@ BATCH_WINDOW_SECONDS = 1.5                            # When the configured inpu
 FOLD_WINDOW_LENGTH   = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH  # Per-window length (model-rate samples) for batch folding, rounded up to a multiple of HOP_LENGTH so every window reconstructs exactly through STFT -> ISTFT.
 USE_BATCH_FOLD       = False                           # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
 EXPORT_AUDIO_LENGTH  = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length: in fold mode it is rounded UP to a whole number of windows; the tail is padded OUTSIDE the model (numpy) by the windowing loop.
-MAX_SIGNAL_LENGTH    = (FOLD_WINDOW_LENGTH // HOP_LENGTH + 1) if USE_BATCH_FOLD else (4096 if DYNAMIC_AXES else INPUT_AUDIO_LENGTH // HOP_LENGTH + 1)  # Max STFT frames (per-window count in fold mode). Sizes the WPE delay templates AND the ISTFT COLA trim.
+MODEL_AUDIO_LENGTH   = int(EXPORT_AUDIO_LENGTH * MODEL_SAMPLE_RATE / IN_SAMPLE_RATE) if not DYNAMIC_AXES else 0  # Static model-rate waveform length after interpolation.
+MAX_SIGNAL_LENGTH    = (FOLD_WINDOW_LENGTH // HOP_LENGTH + 1) if USE_BATCH_FOLD else (4096 if DYNAMIC_AXES else MODEL_AUDIO_LENGTH // HOP_LENGTH + 1)  # Max STFT frames (per-window count in fold mode). Sizes the WPE delay templates AND the ISTFT COLA trim.
+FRONTEND_BATCH       = (MODEL_AUDIO_LENGTH // FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else 1  # WPE/AuxIVA batch: one item per folded window.
 WPE_RT60             = 0.3                            # WPE reverberation time parameter.
 WPE_DELAY            = 2                              # WPE prediction delay parameter.
 WPE_ITER             = 1                              # WPE number of iterations.
@@ -50,6 +52,8 @@ CG_SOLVE_ITER        = 6                              # Inner CG steps for the W
 IN_AUDIO_DTYPE       = 'INT16'                         # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
 OUT_AUDIO_DTYPE      = 'INT16'                         # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16            = float(1.0 / 32768.0)
+FOLD_INPUT_PCM_SCALE = False  # Keep PCM normalization before the DFT kernel for exact checkpointed output parity.
+FOLD_OUTPUT_PCM_SCALE = False  # Reassociating COLA division with the non-power-of-two PCM scale can change int16 rounding.
 
 
 def pad_audio_tail_with_context(audio: np.ndarray, target_length: int) -> np.ndarray:
@@ -133,15 +137,43 @@ class ERB(nn.Module):
 
 class SFE(nn.Module):
     """Subband Feature Extraction"""
-    def __init__(self, kernel_size=3, stride=1):
+    def __init__(self, in_channels, kernel_size=3, stride=1, batch_size=1, n_frames=None, width=33):
         super().__init__()
+        if kernel_size != 3 or stride != 1:
+            raise ValueError("The optimized SFE requires kernel_size=3 and stride=1.")
+        self.in_channels = in_channels
         self.kernel_size = kernel_size
-        self.unfold = nn.Unfold(kernel_size=(1, kernel_size), stride=(1, stride), padding=(0, (kernel_size - 1) // 2))
+        self.batch_size = batch_size
+        self.n_frames = n_frames
+        self.width = width
+        self.register_buffer(
+            'zero_col',
+            None if n_frames is None else torch.zeros(batch_size, in_channels, n_frames, 1),
+        )
 
-    def forward(self, x):
+    def forward(self, x, zero_col=None):
         """x: (B,C,T,F) -> (B, C*kernel_size, T, F)"""
-        b, _, t, f = x.shape          # read dims once; batch generalizes for fold (batch>1)
-        return self.unfold(x).view(b, -1, t, f)
+        static_zero = self.zero_col if zero_col is None else zero_col
+        padded = (
+            torch.nn.functional.pad(x, (1, 1, 0, 0))
+            if static_zero is None
+            else torch.cat([static_zero, x, static_zero], dim=-1)
+        )
+        neighborhoods = torch.stack(
+            [
+                padded[..., :self.width],
+                padded[..., 1:self.width + 1],
+                padded[..., 2:self.width + 2],
+            ],
+            dim=2,
+        )
+        frames = -1 if self.n_frames is None else self.n_frames
+        return neighborhoods.reshape(
+            self.batch_size,
+            self.in_channels * self.kernel_size,
+            frames,
+            self.width,
+        )
 
 
 class TRA(nn.Module):
@@ -152,10 +184,11 @@ class TRA(nn.Module):
         self.att_gru = nn.GRU(channels, channels * 2, 1, batch_first=True)
         self.att_fc = nn.Linear(channels * 2, channels)
 
-    def forward(self, x):
+    def forward(self, x, h0=None):
         """x: (B,C,T,F) -> (B,C,T,F)"""
         zt = x.square().mean(dim=-1).transpose(1, 2)
-        at = torch.sigmoid(self.att_fc(self.att_gru(zt)[0])).transpose(1, 2).unsqueeze(-1)
+        gru_out = self.att_gru(zt, h0)[0] if h0 is not None else self.att_gru(zt)[0]
+        at = torch.sigmoid(self.att_fc(gru_out)).transpose(1, 2).unsqueeze(-1)
         return x * at
 
 
@@ -202,13 +235,23 @@ class ConvBlock(nn.Module):
 
 class GTConvBlock(nn.Module):
     """Group Temporal Convolution - Optimized (ConvBlock wrappers for state_dict compatibility)"""
-    def __init__(self, in_channels, hidden_channels, kernel_size, stride, padding, dilation, width=33):
+    def __init__(self, in_channels, hidden_channels, kernel_size, stride, padding, dilation, width=33, batch_size=1, n_frames=None):
         super().__init__()
         self.pad_size = (kernel_size[0] - 1) * dilation[0]
         self.half_channels = in_channels // 2
         self.full_channels = in_channels
+        self.batch_size = batch_size
+        self.n_frames = n_frames
+        self.width = width
 
-        self.sfe = SFE(kernel_size=3, stride=1)
+        self.sfe = SFE(
+            self.half_channels,
+            kernel_size=3,
+            stride=1,
+            batch_size=batch_size,
+            n_frames=n_frames,
+            width=width,
+        )
 
         # Use ConvBlock wrappers to match checkpoint key paths:
         # point_conv1.conv.weight, point_conv1.bn.weight, point_conv1.act.weight, etc.
@@ -221,7 +264,7 @@ class GTConvBlock(nn.Module):
         self.tra = TRA(in_channels // 2)
 
         # Pre-allocated static zero tensor for causal padding
-        self.register_buffer('pad_zeros', torch.zeros(1, hidden_channels, self.pad_size, width), persistent=False)
+        self.register_buffer('pad_zeros', torch.zeros(batch_size, hidden_channels, self.pad_size, width), persistent=False)
 
     def fuse_bn_(self):
         """Fuse all BatchNorm layers into their preceding Conv layers."""
@@ -229,20 +272,31 @@ class GTConvBlock(nn.Module):
         self.depth_conv.fuse_bn_()
         self.point_conv2.fuse_bn_()
 
-    def forward(self, x):
+    def forward(self, x, tra_h0=None, sfe_zero=None):
         """x: (B, C, T, F)"""
-        b, _, _, f = x.shape          # batch & freq — read once, reused (batch>1 under fold)
         x1, x2 = x.split(self.half_channels, dim=1)
 
-        x1 = self.sfe(x1)
+        x1 = self.sfe(x1, sfe_zero)
         h1 = self.point_conv1(x1)
-        h1 = torch.cat([self.pad_zeros.expand(b, -1, -1, -1), h1], dim=2)
+        h1 = torch.cat([self.pad_zeros, h1], dim=2)
         h1 = self.depth_conv(h1)
         h1 = self.point_conv2(h1)
-        h1 = self.tra(h1)
+        h1 = self.tra(h1, tra_h0)
 
         # ShuffleNet channel shuffle: interleave h1 and x2 along channel dim
-        return torch.stack([h1, x2], dim=2).view(b, self.full_channels, -1, f)
+        if self.n_frames is None:
+            return torch.stack([h1, x2], dim=2).reshape(
+                self.batch_size,
+                self.full_channels,
+                -1,
+                self.width,
+            )
+        return torch.stack([h1, x2], dim=2).reshape(
+            self.batch_size,
+            self.full_channels,
+            self.n_frames,
+            self.width,
+        )
 
 
 class GRNN(nn.Module):
@@ -258,89 +312,102 @@ class GRNN(nn.Module):
         self.rnn1 = nn.GRU(input_size // 2, hidden_size // 2, num_layers, batch_first=batch_first, bidirectional=bidirectional)
         self.rnn2 = nn.GRU(input_size // 2, hidden_size // 2, num_layers, batch_first=batch_first, bidirectional=bidirectional)
 
-    def forward(self, x, h=None):
-        """
-        x: (B, seq_length, input_size)
-        h: (h_dim, B, hidden_size)
-        """
-        if h is None:
-            h = torch.zeros(self.h_dim, x.shape[0], self.hidden_size, device=x.device, dtype=x.dtype)
-
+    def forward(self, x, h0=None):
+        """x: (B, seq_length, input_size)"""
         x1, x2 = x.split(self.half_input, dim=-1)
-        h1, h2 = h.split(self.half_hidden, dim=-1)
-
-        y1, h1 = self.rnn1(x1, h1.contiguous())
-        y2, h2 = self.rnn2(x2, h2.contiguous())
-        return torch.cat([y1, y2], dim=-1), torch.cat([h1, h2], dim=-1)
+        if h0 is None:
+            y1, _ = self.rnn1(x1)
+            y2, _ = self.rnn2(x2)
+        else:
+            y1, _ = self.rnn1(x1, h0)
+            y2, _ = self.rnn2(x2, h0)
+        return torch.cat([y1, y2], dim=-1)
 
 
 class DPGRNN(nn.Module):
     """Grouped Dual-path RNN"""
-    def __init__(self, input_size, width, hidden_size, **kwargs):
+    def __init__(self, input_size, width, hidden_size, batch_size=1, n_frames=None, **kwargs):
         super(DPGRNN, self).__init__(**kwargs)
         self.input_size = input_size
         self.width = width
         self.hidden_size = hidden_size
+        self.batch_size = batch_size
+        self.n_frames = n_frames
 
-        self.intra_rnn = GRNN(input_size=input_size, hidden_size=hidden_size // 2, bidirectional=True)
+        self.intra_rnn = GRNN(
+            input_size=input_size,
+            hidden_size=hidden_size // 2,
+            bidirectional=True,
+        )
         self.intra_fc = nn.Linear(hidden_size, hidden_size)
         self.intra_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
 
-        self.inter_rnn = GRNN(input_size=input_size, hidden_size=hidden_size, bidirectional=False)
+        self.inter_rnn = GRNN(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            bidirectional=False,
+        )
         self.inter_fc = nn.Linear(hidden_size, hidden_size)
         self.inter_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
 
-    def forward(self, x):
+    def forward(self, x, intra_h0=None, inter_h0=None):
         """x: (B, C, T, F)"""
-        t = x.shape[2]                                    # time frames — read once, reused for every reshape (batch dim uses -1)
+        if self.n_frames is None:
+            t = x.shape[2]
+            batch_time = -1
+            batch_freq = -1
+        else:
+            t = self.n_frames
+            batch_time = self.batch_size * self.n_frames
+            batch_freq = self.batch_size * self.width
 
         ## Intra RNN
         x_perm = x.permute(0, 2, 3, 1)                    # (B, T, F, C)
-        intra_in = x_perm.reshape(-1, self.width, self.hidden_size)  # (B*T, F, C) — reshape: x_perm is permuted (non-contiguous)
-        intra_x = self.intra_fc(self.intra_rnn(intra_in)[0])      # (B*T, F, C)
-        intra_x = self.intra_ln(intra_x.reshape(-1, t, self.width, self.hidden_size))  # (B, T, F, C) — batch via -1
+        intra_in = x_perm.reshape(batch_time, self.width, self.hidden_size)  # (B*T, F, C)
+        intra_x = self.intra_fc(self.intra_rnn(intra_in, intra_h0))      # (B*T, F, C)
+        intra_x = self.intra_ln(intra_x.reshape(self.batch_size, t, self.width, self.hidden_size))
         intra_out = x_perm + intra_x                       # (B, T, F, C)
 
         ## Inter RNN
-        inter_in = intra_out.transpose(1, 2).reshape(-1, t, self.hidden_size)  # (B*F, T, C) — reshape: transposed (non-contiguous)
-        inter_x = self.inter_fc(self.inter_rnn(inter_in)[0])      # (B*F, T, C)
-        inter_x = self.inter_ln(inter_x.reshape(-1, self.width, t, self.hidden_size).transpose(1, 2))  # (B, T, F, C) — batch via -1
+        inter_in = intra_out.transpose(1, 2).reshape(batch_freq, t, self.hidden_size)  # (B*F, T, C)
+        inter_x = self.inter_fc(self.inter_rnn(inter_in, inter_h0))      # (B*F, T, C)
+        inter_x = self.inter_ln(inter_x.reshape(self.batch_size, self.width, t, self.hidden_size).transpose(1, 2))
         inter_out = intra_out + inter_x                    # (B, T, F, C)
 
         return inter_out.permute(0, 3, 1, 2)              # (B, C, T, F)
 
 
 class Encoder(nn.Module):
-    def __init__(self):
+    def __init__(self, batch_size=1, n_frames=None):
         super().__init__()
         self.en_convs = nn.ModuleList([
             ConvBlock(6 * 3, 16, (1, 5), stride=(1, 2), padding=(0, 2)),
             ConvBlock(16, 16, (1, 5), stride=(1, 2), padding=(0, 2), groups=2),
-            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(1, 1)),
-            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(2, 1)),
-            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(5, 1))
+            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(1, 1), batch_size=batch_size, n_frames=n_frames),
+            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(2, 1), batch_size=batch_size, n_frames=n_frames),
+            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(5, 1), batch_size=batch_size, n_frames=n_frames)
         ])
 
     def fuse_bn_(self):
         for conv in self.en_convs:
             conv.fuse_bn_()
 
-    def forward(self, x):
+    def forward(self, x, tra_h0=None, sfe_zero=None):
         e0 = self.en_convs[0](x)
         e1 = self.en_convs[1](e0)
-        e2 = self.en_convs[2](e1)
-        e3 = self.en_convs[3](e2)
-        e4 = self.en_convs[4](e3)
+        e2 = self.en_convs[2](e1, tra_h0, sfe_zero)
+        e3 = self.en_convs[3](e2, tra_h0, sfe_zero)
+        e4 = self.en_convs[4](e3, tra_h0, sfe_zero)
         return e4, (e0, e1, e2, e3, e4)
 
 
 class Decoder(nn.Module):
-    def __init__(self):
+    def __init__(self, batch_size=1, n_frames=None):
         super().__init__()
         self.de_convs = nn.ModuleList([
-            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(5, 1)),
-            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(2, 1)),
-            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(1, 1)),
+            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(5, 1), batch_size=batch_size, n_frames=n_frames),
+            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(2, 1), batch_size=batch_size, n_frames=n_frames),
+            GTConvBlock(16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(1, 1), batch_size=batch_size, n_frames=n_frames),
             ConvBlock(16, 16, (1, 5), stride=(1, 2), padding=(0, 2), groups=2, use_deconv=True),
             ConvBlock(16, 2, (1, 5), stride=(1, 2), padding=(0, 2), use_deconv=True, is_last=True)
         ])
@@ -349,10 +416,10 @@ class Decoder(nn.Module):
         for conv in self.de_convs:
             conv.fuse_bn_()
 
-    def forward(self, x, en_outs):
-        x = self.de_convs[0](x + en_outs[4])
-        x = self.de_convs[1](x + en_outs[3])
-        x = self.de_convs[2](x + en_outs[2])
+    def forward(self, x, en_outs, tra_h0=None, sfe_zero=None):
+        x = self.de_convs[0](x + en_outs[4], tra_h0, sfe_zero)
+        x = self.de_convs[1](x + en_outs[3], tra_h0, sfe_zero)
+        x = self.de_convs[2](x + en_outs[2], tra_h0, sfe_zero)
         x = self.de_convs[3](x + en_outs[1])
         x = self.de_convs[4](x + en_outs[0])
         return x
@@ -366,18 +433,28 @@ class GTCRN_IVA(nn.Module):
     Input:  spec_features (1, 6, T, F=257) float32
     Output: m (1, 2, T, F=257) float32 — complex ratio mask
     """
-    def __init__(self):
+    def __init__(self, batch_size=1, n_frames=None):
         super().__init__()
         self.n_fft = 512
         self.hop_len = 256
         self.win_len = 512
 
         self.erb = ERB(65, 64)
-        self.sfe = SFE(3, 1)
-        self.encoder = Encoder()
-        self.dpgrnn1 = DPGRNN(16, 33, 16)
-        self.dpgrnn2 = DPGRNN(16, 33, 16)
-        self.decoder = Decoder()
+        self.sfe = SFE(6, 3, 1, batch_size=batch_size, n_frames=n_frames, width=129)
+        self.encoder = Encoder(batch_size=batch_size, n_frames=n_frames)
+        self.dpgrnn1 = DPGRNN(16, 33, 16, batch_size=batch_size, n_frames=n_frames)
+        self.dpgrnn2 = DPGRNN(16, 33, 16, batch_size=batch_size, n_frames=n_frames)
+        self.decoder = Decoder(batch_size=batch_size, n_frames=n_frames)
+        self.register_buffer(
+            'gt_sfe_zero',
+            None if n_frames is None else torch.zeros(batch_size, 8, n_frames, 1),
+        )
+        self.register_buffer('tra_h0', torch.zeros(1, batch_size, 16))
+        self.register_buffer(
+            'intra_h0',
+            None if n_frames is None else torch.zeros(2, batch_size * n_frames, 4),
+        )
+        self.register_buffer('inter_h0', torch.zeros(1, batch_size * 33, 8))
 
     def fuse_bn_(self):
         """Fuse all BatchNorm layers into Conv weights for inference."""
@@ -394,19 +471,18 @@ class GTCRN_IVA(nn.Module):
         # Subband Feature Extraction
         feat = self.sfe(feat)                    # (1, 18, T, 129)
         # Encoder
-        feat, en_outs = self.encoder(feat)
+        feat, en_outs = self.encoder(feat, self.tra_h0, self.gt_sfe_zero)
         # Dual-path Grouped RNN
-        feat = self.dpgrnn1(feat)                # (1, 16, T, 33)
-        feat = self.dpgrnn2(feat)                # (1, 16, T, 33)
+        feat = self.dpgrnn1(feat, self.intra_h0, self.inter_h0)  # (1, 16, T, 33)
+        feat = self.dpgrnn2(feat, self.intra_h0, self.inter_h0)  # (1, 16, T, 33)
         # Decoder
-        m_feat = self.decoder(feat, en_outs)     # (1, 2, T, F_erb=129)
+        m_feat = self.decoder(feat, en_outs, self.tra_h0, self.gt_sfe_zero)  # (1, 2, T, F_erb=129)
         # ERB band synthesis — keep in (T,F) layout to avoid transposing large tensors
         m = self.erb.bs(m_feat)                  # (1, 2, T, F=257)
 
         # Split mask and ref in native (T,F) layout (no transpose needed)
         m_real, m_imag = m.split(1, dim=1)                             # each (1, 1, T, F)
-        ref, _ = spec_features.split([2, 4], dim=1)                    # (1, 2, T, F)
-        ref_real, ref_imag = ref.split(1, dim=1)                       # each (1, 1, T, F)
+        ref_real, ref_imag, _ = spec_features.split([1, 1, 4], dim=1)  # each ref: (1, 1, T, F)
 
         # CRM in (T,F) layout, then transpose only the smaller output tensors to (F,T)
         s_real = (ref_real * m_real - ref_imag * m_imag).squeeze(1).transpose(-1, -2)  # (1, F, T)
@@ -420,7 +496,7 @@ class GTCRN_IVA(nn.Module):
 # Complex tensors are represented as separate real/imag tensors or (..., 2) pairs
 # ═══════════════════════════════════════════════════════════════════════════
 
-def batched_complex_solve_cg(R_r, R_i, P_r, P_i, n_iter=36):
+def batched_complex_solve_cg(R_r, R_i, P_r, P_i, zero, n_iter=36):
     """
     Solve R @ G = P for G using Conjugate Gradient (CG).
     ONNX-friendly: uses only matmul, element-wise ops, and reductions.
@@ -431,12 +507,12 @@ def batched_complex_solve_cg(R_r, R_i, P_r, P_i, n_iter=36):
     Returns: G_r, G_i of same shape as P
     """
     # Initialize: x=0, r=P, p=r
-    x_r = torch.zeros_like(P_r)
-    x_i = torch.zeros_like(P_i)
-    r_r = P_r.clone()
-    r_i = P_i.clone()
-    p_r = P_r.clone()
-    p_i = P_i.clone()
+    x_r = zero
+    x_i = zero
+    r_r = P_r
+    r_i = P_i
+    p_r = P_r
+    p_i = P_i
 
     # rr = sum_n |r_n|^2 per (B, F, M) = r^H @ r per column
     rr = (r_r * r_r + r_i * r_i).sum(dim=-2) + 1e-12  # (B, F, M)
@@ -478,24 +554,20 @@ def batched_complex_solve_cg(R_r, R_i, P_r, P_i, n_iter=36):
     return x_r, x_i
 
 
-def solve_2x2_complex(A, b):
+def solve_2x2_complex(A, b, batch_size, n_freq_bins):
     """
-    Solve A @ x = b for x, where A is (..., 2, 2, 2) complex and b is (..., 2, 2) complex.
-    Uses Cramer's rule for 2x2 system. ONNX-friendly (no linalg ops).
+    Solve A @ x = b for a 2x2 complex A using Cramer's rule.
 
-    A: (..., 2, 2, 2) - 2x2 complex matrix (last dim is real/imag)
-    b: (..., 2, 2)    - 2-element complex vector (last dim is real/imag)
-    Returns: x (..., 2, 2) complex vector
+    This deliberately preserves the baseline operation order. A unit-vector
+    specialization is algebraically equivalent and bit-exact in PyTorch, but
+    its raw ORT graph diverges for ill-conditioned sparse inputs after several
+    AuxIVA iterations.
     """
-    # A = [[a, b], [c, d]], det = ad - bc
-    A_row0, A_row1 = A.split(1, dim=-3)  # each (..., 1, 2, 2)
-    a, b_mat = A_row0.squeeze(-3).split(1, dim=-2)  # each (..., 1, 2)
-    a, b_mat = a.squeeze(-2), b_mat.squeeze(-2)  # each (..., 2)
-    c, d = A_row1.squeeze(-3).split(1, dim=-2)  # each (..., 1, 2)
-    c, d = c.squeeze(-2), d.squeeze(-2)  # each (..., 2)
+    # Flatten only the two matrix axes. Keeping a singleton coefficient axis
+    # lets every scalar expression broadcast naturally without Squeeze nodes.
+    a, b_mat, c, d = A.reshape(batch_size, n_freq_bins, 4, 2).split(1, dim=-2)
 
-    # Split all complex pairs into real/imag once to avoid repeated gather
-    a_r, a_i = a.split(1, dim=-1)      # each (..., 1)
+    a_r, a_i = a.split(1, dim=-1)
     b_mat_r, b_mat_i = b_mat.split(1, dim=-1)
     c_r, c_i = c.split(1, dim=-1)
     d_r, d_i = d.split(1, dim=-1)
@@ -503,36 +575,26 @@ def solve_2x2_complex(A, b):
     # det = a*d - b*c (complex)
     ad = torch.cat([a_r * d_r - a_i * d_i, a_r * d_i + a_i * d_r], dim=-1)
     bc = torch.cat([b_mat_r * c_r - b_mat_i * c_i, b_mat_r * c_i + b_mat_i * c_r], dim=-1)
-    det = ad - bc  # (..., 2)
-
-    # inv_det = conj(det) / |det|^2
+    det = ad - bc
     det_r, det_i = det.split(1, dim=-1)
     det_abs_sq = 1.0 / ((det_r ** 2 + det_i ** 2) + 1e-12)
-    inv_det_r = det_r * det_abs_sq   # (..., 1)
-    inv_det_i = -det_i * det_abs_sq  # (..., 1)
+    inv_det_r = det_r * det_abs_sq
+    inv_det_i = -det_i * det_abs_sq
 
-    # x0 = (d * b[0] - b_mat * b[1]) * inv_det
-    # x1 = (a * b[1] - c * b[0]) * inv_det
-    b0, b1 = b.split(1, dim=-2)  # each (..., 1, 2)
-    b0, b1 = b0.squeeze(-2), b1.squeeze(-2)  # each (..., 2)
+    b0, b1 = b.split(1, dim=-2)
     b0_r, b0_i = b0.split(1, dim=-1)
     b1_r, b1_i = b1.split(1, dim=-1)
 
-    # num0 = d * b0 - b_mat * b1
     num0_r = (d_r * b0_r - d_i * b0_i) - (b_mat_r * b1_r - b_mat_i * b1_i)
     num0_i = (d_r * b0_i + d_i * b0_r) - (b_mat_r * b1_i + b_mat_i * b1_r)
-
-    # num1 = a * b1 - c * b0
     num1_r = (a_r * b1_r - a_i * b1_i) - (c_r * b0_r - c_i * b0_i)
     num1_i = (a_r * b1_i + a_i * b1_r) - (c_r * b0_i + c_i * b0_r)
 
-    # Multiply by inv_det
     x0 = torch.cat([num0_r * inv_det_r - num0_i * inv_det_i,
                     num0_r * inv_det_i + num0_i * inv_det_r], dim=-1)
     x1 = torch.cat([num1_r * inv_det_r - num1_i * inv_det_i,
                     num1_r * inv_det_i + num1_i * inv_det_r], dim=-1)
-
-    return torch.stack([x0, x1], dim=-2)  # (..., 2, 2)
+    return torch.cat([x0, x1], dim=-2)
 
 
 class OnnxFriendlyWPE(torch.nn.Module):
@@ -545,7 +607,7 @@ class OnnxFriendlyWPE(torch.nn.Module):
       - Hoist loop-invariant: Xp transpose computed once outside iteration loop
     """
     def __init__(self, n_channels=2, rt60=0.3, hop_length=256, delay=2, sample_rate=16000, num_iter=1, ns_iter=36,
-         n_freq_bins=NFFT // 2 + 1, max_frames=MAX_SIGNAL_LENGTH):
+            n_freq_bins=NFFT // 2 + 1, max_frames=MAX_SIGNAL_LENGTH, batch_size=1, dynamic_frames=False):
         super().__init__()
         self.M = n_channels
         self.Lg = int(rt60 * sample_rate / hop_length)
@@ -555,15 +617,21 @@ class OnnxFriendlyWPE(torch.nn.Module):
         self.MLg = self.M * self.Lg
         self.n_freq_bins = n_freq_bins
         self.max_frames = max_frames
+        self.batch_size = batch_size
+        self.dynamic_frames = dynamic_frames
         # Pre-compute identity matrix as buffer (avoids runtime torch.eye allocation)
         self.register_buffer('eye_MLg', torch.eye(self.MLg, dtype=torch.float32))
+
+        # Static delay-bank construction. Each output position gathers its delayed
+        # source frame once; invalid leading positions are selected as exact zeros.
+        frame_ids = torch.arange(max_frames, dtype=torch.int32).unsqueeze(0)
+        lag_offsets = delay + torch.arange(self.Lg, dtype=torch.int32).unsqueeze(1)
+        delay_indices = frame_ids - lag_offsets
+        self.register_buffer('delay_indices', delay_indices.clamp_min(0).reshape(-1))
+        self.register_buffer('delay_valid', (delay_indices >= 0).view(1, 1, self.Lg, 1, max_frames))
         self.register_buffer(
-            'delay_template_r',
-            torch.zeros(1, n_freq_bins, self.MLg, max_frames, dtype=torch.float32),
-        )
-        self.register_buffer(
-            'delay_template_i',
-            torch.zeros(1, n_freq_bins, self.MLg, max_frames, dtype=torch.float32),
+            'cg_zero',
+            torch.zeros(batch_size, n_freq_bins, self.MLg, n_channels, dtype=torch.float32),
         )
 
     def forward(self, X_real, X_imag):
@@ -571,29 +639,59 @@ class OnnxFriendlyWPE(torch.nn.Module):
         X_real, X_imag: (B, M, F, T) — multi-channel STFT real/imag parts.
         Returns: Y_real, Y_imag of same shape — dereverberated.
         """
-        B, M, F, T = X_real.shape
         # Permute to (B, F, M, T)
         Xp_r = X_real.permute(0, 2, 1, 3)  # (B, F, M, T)
         Xp_i = X_imag.permute(0, 2, 1, 3)
 
         # Build delay matrix: (B, F, M*Lg, T)
-        if F != self.n_freq_bins or T > self.max_frames:
-            raise ValueError(
-                f"WPE delay buffers require F={self.n_freq_bins} and T<={self.max_frames}, got F={F}, T={T}."
+        if self.dynamic_frames:
+            T = X_real.shape[-1]
+            delayed_r = []
+            delayed_i = []
+            for l_idx in range(self.Lg):
+                shift = self.D + l_idx
+                delayed_r.append(torch.nn.functional.pad(Xp_r[..., :-shift], (shift, 0)).unsqueeze(2))
+                delayed_i.append(torch.nn.functional.pad(Xp_i[..., :-shift], (shift, 0)).unsqueeze(2))
+            X_delay_r = torch.cat(delayed_r, dim=2).reshape(
+                self.batch_size,
+                self.n_freq_bins,
+                self.MLg,
+                T,
             )
-
-        MLg = self.MLg
-        # Expand the batch-1 zero delay template to the actual batch (num_window under fold);
-        # for batch=1 this is a no-op. .clone() materializes a writable per-window buffer.
-        X_delay_r = self.delay_template_r[:, :, :, :T].expand(B, -1, -1, -1).clone()
-        X_delay_i = self.delay_template_i[:, :, :, :T].expand(B, -1, -1, -1).clone()
-
-        for l_idx in range(self.Lg):
-            start_col = self.D + l_idx
-            row_start = l_idx * M
-            row_end = row_start + M
-            X_delay_r[:, :, row_start:row_end, start_col:] = Xp_r[:, :, :, :-start_col]
-            X_delay_i[:, :, row_start:row_end, start_col:] = Xp_i[:, :, :, :-start_col]
+            X_delay_i = torch.cat(delayed_i, dim=2).reshape(
+                self.batch_size,
+                self.n_freq_bins,
+                self.MLg,
+                T,
+            )
+        else:
+            T = self.max_frames
+            gathered_r = torch.index_select(Xp_r, -1, self.delay_indices).reshape(
+                self.batch_size,
+                self.n_freq_bins,
+                self.M,
+                self.Lg,
+                self.max_frames,
+            ).permute(0, 1, 3, 2, 4)
+            gathered_i = torch.index_select(Xp_i, -1, self.delay_indices).reshape(
+                self.batch_size,
+                self.n_freq_bins,
+                self.M,
+                self.Lg,
+                self.max_frames,
+            ).permute(0, 1, 3, 2, 4)
+            X_delay_r = torch.where(self.delay_valid, gathered_r, 0.0).reshape(
+                self.batch_size,
+                self.n_freq_bins,
+                self.MLg,
+                self.max_frames,
+            )
+            X_delay_i = torch.where(self.delay_valid, gathered_i, 0.0).reshape(
+                self.batch_size,
+                self.n_freq_bins,
+                self.MLg,
+                self.max_frames,
+            )
 
         # Compute eps matching original: 1e-3 * mean_over_F(max_over(M,T)(|X|^2)).
         # Keep it PER-WINDOW (per batch element) so folded windows stay independent
@@ -602,8 +700,8 @@ class OnnxFriendlyWPE(torch.nn.Module):
         eps_val = (1e-3 * mag_sq.amax(dim=(-2, -1)).mean(dim=-1)).reshape(-1, 1, 1, 1)  # (B, 1, 1, 1)
 
         # Y = Xp initially
-        Y_r = Xp_r.clone()  # (B, F, M, T)
-        Y_i = Xp_i.clone()
+        Y_r = Xp_r  # (B, F, M, T)
+        Y_i = Xp_i
 
         # Hoist loop-invariant: Xp transposed doesn't change across iterations
         Xp_rT = Xp_r.transpose(-2, -1)  # (B, F, T, M)
@@ -637,6 +735,7 @@ class OnnxFriendlyWPE(torch.nn.Module):
                 R_imag,
                 P_real,
                 P_imag,
+                self.cg_zero,
                 n_iter=self.solve_iter,
             )
 
@@ -660,37 +759,37 @@ class OnnxFriendlyAuxIVA(torch.nn.Module):
     Replaces torch.linalg.solve with analytical 2x2 complex solve.
 
     Optimizations:
-      - Pre-compute: eye_M, e_s unit vectors registered as buffers
+      - Pre-compute static demixing state as immutable buffers
       - Hoist: X transpose computed once outside iteration loop
-      - Use split instead of slice for source channel extraction
+      - Functional row updates avoid mutation-driven ScatterND graphs
     """
-    def __init__(self, n_iter=10, n_channels=2, n_freq_bins=NFFT // 2 + 1):
+    def __init__(self, n_iter=10, n_channels=2, n_freq_bins=NFFT // 2 + 1, batch_size=1, n_frames=MAX_SIGNAL_LENGTH):
         super().__init__()
         self.n_iter = n_iter
         self.M = n_channels
         self.n_freq_bins = n_freq_bins
+        self.batch_size = batch_size
+        self.n_frames = n_frames
         # Pre-computed constants as buffers
         eye_M = torch.eye(n_channels, dtype=torch.float32)
-        self.register_buffer('eye_M', eye_M)
         self.register_buffer('proj_back_one', torch.ones(1, 1, dtype=torch.float32))
         self.register_buffer('proj_back_zero', torch.zeros(1, 1, dtype=torch.float32))
-        # Pre-compute e_s unit vectors across the fixed frequency axis.
-        e_s_all = torch.zeros(n_channels, n_freq_bins, n_channels, 2)
-        for s in range(n_channels):
-            e_s_all[s, :, s, 0] = 1.0
+        e_s_all = torch.zeros(n_channels, batch_size, n_freq_bins, n_channels, 2)
+        for source in range(n_channels):
+            e_s_all[source, :, :, source, 0] = 1.0
         self.register_buffer('e_s', e_s_all)
         self.eps = 1e-10
         self.register_buffer(
             'eps_eye',
-            (self.eps * eye_M).view(1, 1, n_channels, n_channels).expand(1, n_freq_bins, n_channels, n_channels).clone(),
+            (self.eps * eye_M).view(1, 1, n_channels, n_channels),
         )
         self.register_buffer(
             'init_W_r',
-            eye_M.view(1, 1, n_channels, n_channels).expand(1, n_freq_bins, n_channels, n_channels).clone(),
+            eye_M.view(1, 1, n_channels, n_channels).expand(batch_size, n_freq_bins, n_channels, n_channels).clone(),
         )
         self.register_buffer(
             'init_W_i',
-            torch.zeros(1, n_freq_bins, n_channels, n_channels, dtype=torch.float32),
+            torch.zeros(batch_size, n_freq_bins, n_channels, n_channels, dtype=torch.float32),
         )
 
     def forward(self, X_real, X_imag):
@@ -698,8 +797,7 @@ class OnnxFriendlyAuxIVA(torch.nn.Module):
         X_real, X_imag: (B, M=2, F, T) — dereverberated STFT.
         Returns: Y_real, Y_imag (B, M=2, F, T) — separated sources.
         """
-        B, M, F, T = X_real.shape
-        inv_T = 1.0 / T
+        inv_T = (1.0 / X_real.shape[-1]) if self.n_frames is None else (1.0 / self.n_frames)
 
         # Reshape to (B, F, M, T) for processing
         X_r = X_real.permute(0, 2, 1, 3)  # (B, F, M, T)
@@ -709,25 +807,25 @@ class OnnxFriendlyAuxIVA(torch.nn.Module):
         X_rT = X_r.transpose(-2, -1)  # (B, F, T, M)
         X_iT = X_i.transpose(-2, -1)
 
-        # Initialize W as identity: (B, F, M, M). Expand the batch-1 buffers to the actual
-        # batch (num_window under fold; no-op for batch=1) so the per-source in-place W[s]
-        # updates below write batch-B values into a writable buffer.
-        W_r = self.init_W_r.expand(B, -1, -1, -1).clone()
-        W_i = self.init_W_i.expand(B, -1, -1, -1).clone()
+        # Keep each demixing row as an SSA tensor. Python list replacement below
+        # updates graph references, not tensor storage, so export emits no ScatterND.
+        W_rows_r = list(self.init_W_r.split(1, dim=2))
+        W_rows_i = list(self.init_W_i.split(1, dim=2))
 
         # Y = W @ X (W starts as identity, so Y = X initially)
-        Y_r = X_r.clone()
-        Y_i = X_i.clone()
+        Y_r = X_r
+        Y_i = X_i
 
         for iter_idx in range(self.n_iter):
             # r = 2 * L2_norm(Y over F): (B, M, T)
             Y_pow = Y_r * Y_r + Y_i * Y_i  # (B, F, M, T)
             r = 2.0 * torch.sqrt(Y_pow.sum(dim=1) + self.eps)  # (B, M, T)
             r_inv = 1.0 / r  # (B, M, T)
+            r_inv_sources = r_inv.split(1, dim=1)
 
-            for s in range(M):
+            for s in range(self.M):
                 # r_inv for source s: (B, 1, 1, T)
-                w_s = r_inv[:, s:s+1, :].unsqueeze(1)  # (B, 1, 1, T)
+                w_s = r_inv_sources[s].unsqueeze(1)  # (B, 1, 1, T)
 
                 # weighted X: (B, F, M, T)
                 wX_r = X_r * w_s
@@ -742,6 +840,8 @@ class OnnxFriendlyAuxIVA(torch.nn.Module):
                     WV_r = V_r
                     WV_i = V_i
                 else:
+                    W_r = torch.cat(W_rows_r, dim=2)
+                    W_i = torch.cat(W_rows_i, dim=2)
                     # WV = W @ V: (B, F, M, M)
                     WV_r = torch.matmul(W_r, V_r) - torch.matmul(W_i, V_i)
                     WV_i = torch.matmul(W_r, V_i) + torch.matmul(W_i, V_r)
@@ -749,69 +849,53 @@ class OnnxFriendlyAuxIVA(torch.nn.Module):
                 # Solve (WV + eps*I) @ w_new = e_s using pre-computed buffers
                 WV_r_reg = WV_r + self.eps_eye
 
-                # Stack WV as (B, F, 2, 2, 2) for solve_2x2_complex
-                A_solve = torch.stack([WV_r_reg, WV_i], dim=-1)  # (B, F, M, M, 2)
-                w_new = solve_2x2_complex(A_solve, self.e_s[s])  # (B, F, M, 2)
-
-                # w_new split into real/imag
-                w_new_r, w_new_i = w_new.split(1, dim=-1)  # each (B, F, M, 1)
-                w_new_r = w_new_r.squeeze(-1)  # (B, F, M)
-                w_new_i = w_new_i.squeeze(-1)
+                A_solve = torch.stack([WV_r_reg, WV_i], dim=-1)
+                w_new = solve_2x2_complex(
+                    A_solve,
+                    self.e_s[s],
+                    self.batch_size,
+                    self.n_freq_bins,
+                )
+                w_new_r, w_new_i = w_new.split(1, dim=-1)
 
                 # W[s] = conj(w_new)
-                conj_w_r = w_new_r   # (B, F, M)
+                conj_w_r = w_new_r   # (B, F, M, 1)
                 conj_w_i = -w_new_i
 
                 # Normalize: denom = conj(w) @ V @ w
-                wn_r_col = w_new_r.unsqueeze(-1)  # (B, F, M, 1)
-                wn_i_col = w_new_i.unsqueeze(-1)
-                Vw_r = torch.matmul(V_r, wn_r_col) - torch.matmul(V_i, wn_i_col)  # (B, F, M, 1)
-                Vw_i = torch.matmul(V_r, wn_i_col) + torch.matmul(V_i, wn_r_col)
+                Vw_r = torch.matmul(V_r, w_new_r) - torch.matmul(V_i, w_new_i)
+                Vw_i = torch.matmul(V_r, w_new_i) + torch.matmul(V_i, w_new_r)
 
-                denom_r = (conj_w_r * Vw_r.squeeze(-1) - conj_w_i * Vw_i.squeeze(-1)).sum(dim=-1)
+                denom_r = (conj_w_r * Vw_r - conj_w_i * Vw_i).sum(dim=-2, keepdim=True)
 
                 # For HPD V, w^H V w is real and non-negative; normalizing with the
                 # real scalar avoids phase drift from a noisy complex sqrt.
-                norm_scale = torch.rsqrt(denom_r.clamp(min=0.0) + self.eps).unsqueeze(-1)
+                norm_scale = torch.rsqrt(denom_r.clamp(min=0.0) + self.eps)
                 final_r = conj_w_r * norm_scale
                 final_i = conj_w_i * norm_scale
 
-                # Update W[s]
-                W_r[:, :, s, :] = final_r
-                W_i[:, :, s, :] = final_i
+                # Update one functional row; no tensor mutation reaches ONNX.
+                W_rows_r[s] = final_r.reshape(self.batch_size, self.n_freq_bins, 1, self.M)
+                W_rows_i[s] = final_i.reshape(self.batch_size, self.n_freq_bins, 1, self.M)
 
             # Recompute Y = W @ X
+            W_r = torch.cat(W_rows_r, dim=2)
+            W_i = torch.cat(W_rows_i, dim=2)
             Y_r = torch.matmul(W_r, X_r) - torch.matmul(W_i, X_i)
             Y_i = torch.matmul(W_r, X_i) + torch.matmul(W_i, X_r)
 
         # Projection back to align with reference channel (channel 0)
-        ref_r = X_r[:, :, 0, :]  # (B, F, T)
-        ref_i = X_i[:, :, 0, :]
-
-        # Use split for channel extraction instead of indexing + zeros_like
-        Y_s_list_r = Y_r.split(1, dim=2)  # list of (B, F, 1, T)
-        Y_s_list_i = Y_i.split(1, dim=2)
-
-        out_r_list = []
-        out_i_list = []
-        for s in range(M):
-            Ys_r = Y_s_list_r[s].squeeze(2)  # (B, F, T)
-            Ys_i = Y_s_list_i[s].squeeze(2)
-
-            num_r = (ref_r * Ys_r + ref_i * Ys_i).sum(dim=-1)
-            num_i = (ref_r * Ys_i - ref_i * Ys_r).sum(dim=-1)
-            denom = (Ys_r * Ys_r + Ys_i * Ys_i).sum(dim=-1)
-            valid = denom > 0.0
-            safe_denom = 1.0 / torch.where(valid, denom, self.proj_back_one)
-
-            c_r = torch.where(valid, num_r * safe_denom, self.proj_back_one).unsqueeze(-1)  # (B, F, 1)
-            c_i = torch.where(valid, num_i * safe_denom, self.proj_back_zero).unsqueeze(-1)
-
-            out_r_list.append(c_r * Ys_r + c_i * Ys_i)
-            out_i_list.append(c_r * Ys_i - c_i * Ys_r)
-
-        Y_out_r = torch.stack(out_r_list, dim=2)
-        Y_out_i = torch.stack(out_i_list, dim=2)
+        ref_r, _ = X_r.split(1, dim=2)  # (B, F, 1, T), broadcast over sources
+        ref_i, _ = X_i.split(1, dim=2)
+        num_r = (ref_r * Y_r + ref_i * Y_i).sum(dim=-1)
+        num_i = (ref_r * Y_i - ref_i * Y_r).sum(dim=-1)
+        denom = (Y_r * Y_r + Y_i * Y_i).sum(dim=-1)
+        valid = denom > 0.0
+        safe_denom = 1.0 / torch.where(valid, denom, self.proj_back_one)
+        c_r = torch.where(valid, num_r * safe_denom, self.proj_back_one).unsqueeze(-1)
+        c_i = torch.where(valid, num_i * safe_denom, self.proj_back_zero).unsqueeze(-1)
+        Y_out_r = c_r * Y_r + c_i * Y_i
+        Y_out_i = c_r * Y_i - c_i * Y_r
 
         return Y_out_r.permute(0, 2, 1, 3), Y_out_i.permute(0, 2, 1, 3)
 
@@ -835,7 +919,7 @@ class H_GTCRN_CUSTOM(torch.nn.Module):
     Input:  noisy_audio (1, N_CHANNELS, audio_len) int16
     Output: denoised_audio (1, 1, audio_len) int16
     """
-    def __init__(self, gtcrn_core, stft_model, istft_model, wpe_module, iva_module, n_fft=512, in_sample_rate=16000, out_sample_rate=16000, use_batch_fold=False, fold_window=0):
+    def __init__(self, gtcrn_core, stft_model, istft_model, wpe_module, iva_module, n_fft=512, in_sample_rate=16000, out_sample_rate=16000, use_batch_fold=False, fold_window=0, model_audio_length=0, n_frames=None, frontend_batch=1, fold_input_pcm_scale=False, fold_output_pcm_scale=False):
         super(H_GTCRN_CUSTOM, self).__init__()
         self.gtcrn = gtcrn_core
         self.stft_model = stft_model
@@ -843,7 +927,7 @@ class H_GTCRN_CUSTOM(torch.nn.Module):
         self.wpe = wpe_module
         self.iva = iva_module
         # Pre-computed constants as buffers (no runtime computation)
-        self.register_buffer('inv_int16', torch.tensor([INV_INT16], dtype=torch.float16 if OUT_AUDIO_DTYPE == 'F16' else torch.float32))
+        self.register_buffer('inv_int16', torch.tensor([INV_INT16], dtype=torch.float32))
         self.register_buffer('output_pcm_scale', torch.tensor(32767.0))
         self.in_sample_rate = in_sample_rate
         self.out_sample_rate = out_sample_rate
@@ -859,6 +943,11 @@ class H_GTCRN_CUSTOM(torch.nn.Module):
         self.n_freq_bins = n_fft // 2 + 1  # Avoid runtime .shape query for F dimension
         self.use_batch_fold = use_batch_fold          # Fold long audio into fixed windows and batch-process them together
         self.fold_window = fold_window                # Per-window length (model-rate samples) used when folding
+        self.model_audio_length = model_audio_length
+        self.n_frames = n_frames
+        self.frontend_batch = frontend_batch
+        self.fold_input_pcm_scale = fold_input_pcm_scale
+        self.fold_output_pcm_scale = fold_output_pcm_scale
 
     def forward(self, audio):
         """
@@ -873,7 +962,7 @@ class H_GTCRN_CUSTOM(torch.nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        if "int" in IN_AUDIO_DTYPE.lower():
+        if "int" in IN_AUDIO_DTYPE.lower() and not self.fold_input_pcm_scale:
             audio_f = audio_f * self.inv_int16      # int16 PCM -> [-1, 1]; F16/F32 inputs already arrive normalized.
         audio_f = audio_f - torch.mean(audio_f)
         if self.resample_after_centering:
@@ -888,49 +977,51 @@ class H_GTCRN_CUSTOM(torch.nn.Module):
         if self.use_batch_fold:
             # Fold (1, 2, num_window*W) -> (num_window*2, 1, W): window-major, channel-minor,
             # so the STFT output rows regroup cleanly to (num_window, 2, F, T) for WPE/AuxIVA.
-            stft_in = audio_f.reshape(2, -1, self.fold_window).transpose(0, 1).reshape(-1, 1, self.fold_window)
+            stft_in = audio_f.reshape(2, self.frontend_batch, self.fold_window).transpose(0, 1).reshape(
+                self.frontend_batch * 2,
+                1,
+                self.fold_window,
+            )
         else:
             # view replaces squeeze(0)+unsqueeze(1): (1,2,L) -> (2,1,L) in one op
-            stft_in = audio_f.view(2, 1, -1)
+            stft_in = audio_f.reshape(2, 1, self.model_audio_length) if self.model_audio_length else audio_f.reshape(2, 1, -1)
         real_parts, imag_parts = self.stft_model(stft_in)  # each (B*2, F, T)  [B=num_window fold / 1 non-fold]
-        n_frames = real_parts.shape[-1]
+        n_frames = real_parts.shape[-1] if self.n_frames is None else self.n_frames
+
+        # Regroup once and reuse in WPE plus network feature construction.
+        stft_real = real_parts.reshape(self.frontend_batch, 2, self.n_freq_bins, n_frames)
+        stft_imag = imag_parts.reshape(self.frontend_batch, 2, self.n_freq_bins, n_frames)
 
         # ─── 3. WPE dereverberation ──────────────────────────────────────
         # Regroup channels for the multi-channel front-end: (B*2, F, T) -> (B, 2, F, T)
-        drb_real, drb_imag = self.wpe(
-            real_parts.reshape(-1, 2, self.n_freq_bins, n_frames),
-            imag_parts.reshape(-1, 2, self.n_freq_bins, n_frames),
-        )
+        drb_real, drb_imag = self.wpe(stft_real, stft_imag)
 
         # ─── 4. AuxIVA source separation ─────────────────────────────────
         iva_real, iva_imag = self.iva(drb_real, drb_imag)  # each (B, 2, F, T)
 
-        # ─── 5. Channel selection via torch.where (no float mul) ──────────
-        # Use split instead of slice for ONNX-friendly channel extraction
-        iva_r0, iva_r1 = iva_real.split(1, dim=1)  # each (B, 1, F, T)
-        iva_i0, iva_i1 = iva_imag.split(1, dim=1)
-        energy = (iva_real * iva_real + iva_imag * iva_imag).sum(dim=(2, 3))  # (B, 2)
-        # pred broadcast shape fused: use split instead of gather for ONNX-friendly extraction
+        # ─── 5. Compute both source powers once, then reorder logs ─────────
+        iva_power = iva_real * iva_real + iva_imag * iva_imag
+        energy = iva_power.sum(dim=(2, 3))  # (B, 2)
         energy_0, energy_1 = energy.split(1, dim=1)  # each (B, 1)
-        pred = (energy_0 < energy_1).reshape(-1, 1, 1, 1)  # (B, 1, 1, 1)
-        sel_real = torch.where(pred, iva_r0, iva_r1)      # (B, 1, F, T)
-        sel_imag = torch.where(pred, iva_i0, iva_i1)
-        unsel_real = torch.where(pred, iva_r1, iva_r0)
-        unsel_imag = torch.where(pred, iva_i1, iva_i0)
+        pred = (energy_0 < energy_1).reshape(self.frontend_batch, 1, 1, 1)
 
         # ─── 6. Fused log-magnitude: log10(sqrt(x)) = 0.5*log10(x) ──────
         # Original clamps the MAGNITUDE at 1e-12 (norm(...).clamp(1e-12)). Because sqrt is
         # monotonic, clamp(sqrt(x),1e-12) == sqrt(clamp(x,1e-24)), so clamp the squared
         # magnitude at (1e-12)^2 = 1e-24 to stay bit-exact with the original feature floor.
-        sel_log = 0.5 * torch.log10((sel_real * sel_real + sel_imag * sel_imag).clamp(min=1e-24))
-        unsel_log = 0.5 * torch.log10((unsel_real * unsel_real + unsel_imag * unsel_imag).clamp(min=1e-24))
+        log_magnitude = 0.5 * torch.log10(iva_power.clamp(min=1e-24))
+        log_0, log_1 = log_magnitude.split(1, dim=1)
+        sel_log = torch.where(pred, log_0, log_1)
+        unsel_log = torch.where(pred, log_1, log_0)
 
-        # ─── 7. Feature construction: single stack+cat+transpose ─────────
-        # Stack real/imag interleaved -> (B*2,2,F,T) -> reshape (B,4,F,T)
-        # Ordering: [ch0_real, ch0_imag, ch1_real, ch1_imag] (matches original)
-        spec_4ch = torch.stack([real_parts, imag_parts], dim=1).reshape(-1, 4, self.n_freq_bins, n_frames)
-        # Combine all 6 features in (F,T) layout, then single transpose to (T,F)
-        spec_features = torch.cat([spec_4ch, sel_log, unsel_log], dim=1).transpose(-1, -2)  # (B, 6, T, F)
+        # ─── 7. Feature construction: one final allocation + transpose ───
+        # Ordering: [ch0_real, ch0_imag, ch1_real, ch1_imag, selected_log, other_log].
+        real_0, real_1 = stft_real.split(1, dim=1)
+        imag_0, imag_1 = stft_imag.split(1, dim=1)
+        spec_features = torch.cat(
+            [real_0, imag_0, real_1, imag_1, sel_log, unsel_log],
+            dim=1,
+        ).transpose(-1, -2)  # (B, 6, T, F)
 
         # ─── 8. GTCRN network (ERB + Encoder + DPGRNN + Decoder + CRM) ───
         s_real, s_imag = self.gtcrn(spec_features)  # each (B, F, T)
@@ -938,7 +1029,7 @@ class H_GTCRN_CUSTOM(torch.nn.Module):
         # ─── 9. iSTFT -> time-domain audio ───────────────────────────────
         audio_out = self.istft_model(s_real, s_imag)  # (B, 1, W)
         if self.use_batch_fold:
-            audio_out = audio_out.reshape(1, 1, -1)   # stitch windows back
+            audio_out = audio_out.reshape(1, 1, self.model_audio_length)   # stitch windows back
 
         # ─── 10. Resample output and scale to int16 PCM ──────────────────
         if self.output_resample_before_pcm:
@@ -948,7 +1039,7 @@ class H_GTCRN_CUSTOM(torch.nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        if "int" in OUT_AUDIO_DTYPE.lower():
+        if "int" in OUT_AUDIO_DTYPE.lower() and not self.fold_output_pcm_scale:
             audio_out = audio_out * self.output_pcm_scale      # [-1, 1] -> int16 PCM; F16/F32 outputs stay normalized.
         if self.output_resample_after_pcm:
             audio_out = torch.nn.functional.interpolate(
@@ -957,10 +1048,12 @@ class H_GTCRN_CUSTOM(torch.nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        # The WPE/AuxIVA front-end divides by a determinant that is zero for a fully silent
-        # window, so guard the output against NaN/Inf (the int16 cast already maps NaN -> 0, so
-        # this keeps the int16 output identical while making the float output finite on silence).
-        audio_out = torch.nan_to_num(audio_out, nan=0.0, posinf=32767.0, neginf=-32768.0)
+        # The WPE/AuxIVA front-end can produce NaN for a fully silent window. Replace NaN
+        # explicitly; the clamp below maps +/-Inf to the same limits as nan_to_num. This is
+        # numerically equivalent at the int16 output and avoids the exporter's two
+        # float -> double -> IsInf side chains, which otherwise add needless mixed-precision
+        # Cast nodes.
+        audio_out = torch.where(torch.isnan(audio_out), torch.zeros_like(audio_out), audio_out)
         if "int" in OUT_AUDIO_DTYPE.lower():
             return audio_out.clamp(-32768.0, 32767.0).to(torch.int16)
         if "32" in OUT_AUDIO_DTYPE:
@@ -979,21 +1072,50 @@ def _run_inference_demo():
 
 print('Export start ...')
 with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode=PAD_MODE).eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode=PAD_MODE).eval()
+    static_n_frames = None if DYNAMIC_AXES else MAX_SIGNAL_LENGTH
+    custom_stft = STFT_Process(
+        model_type='stft_B',
+        n_fft=NFFT,
+        hop_len=HOP_LENGTH,
+        win_length=WINDOW_LENGTH,
+        max_frames=0,
+        window_type=WINDOW_TYPE,
+        center_pad=True,
+        pad_mode=PAD_MODE,
+        input_scale=INV_INT16 if FOLD_INPUT_PCM_SCALE else 1.0,
+    ).eval()
+    custom_istft = STFT_Process(
+        model_type='istft_B',
+        n_fft=NFFT,
+        hop_len=HOP_LENGTH,
+        win_length=WINDOW_LENGTH,
+        max_frames=MAX_SIGNAL_LENGTH,
+        window_type=WINDOW_TYPE,
+        center_pad=True,
+        pad_mode=PAD_MODE,
+        output_scale=32767.0 if FOLD_OUTPUT_PCM_SCALE else 1.0,
+        static_cola=not DYNAMIC_AXES,
+    ).eval()
     wpe_module = OnnxFriendlyWPE(
         n_channels=N_CHANNELS,
         rt60=WPE_RT60,
         hop_length=HOP_LENGTH,
         delay=WPE_DELAY,
-        sample_rate=IN_SAMPLE_RATE,
+        sample_rate=MODEL_SAMPLE_RATE,
         num_iter=WPE_ITER,
         ns_iter=CG_SOLVE_ITER,
         n_freq_bins=NFFT // 2 + 1,
         max_frames=MAX_SIGNAL_LENGTH,
+        batch_size=FRONTEND_BATCH,
+        dynamic_frames=DYNAMIC_AXES,
     ).eval()
-    iva_module = OnnxFriendlyAuxIVA(n_iter=IVA_ITER, n_channels=N_CHANNELS).eval()
-    gtcrn_iva = GTCRN_IVA().eval()
+    iva_module = OnnxFriendlyAuxIVA(
+        n_iter=IVA_ITER,
+        n_channels=N_CHANNELS,
+        batch_size=FRONTEND_BATCH,
+        n_frames=static_n_frames,
+    ).eval()
+    gtcrn_iva = GTCRN_IVA(batch_size=FRONTEND_BATCH, n_frames=static_n_frames).eval()
     ckpt = torch.load(model_path + "/checkpoints/best_model_0121.tar", map_location='cpu')
     gtcrn_iva.load_state_dict(ckpt['model'], strict=False)
     gtcrn_iva.fuse_bn_()  # Fuse BatchNorm into Conv weights for optimized inference
@@ -1008,6 +1130,11 @@ with torch.inference_mode():
         out_sample_rate=OUT_SAMPLE_RATE,
         use_batch_fold=USE_BATCH_FOLD,
         fold_window=FOLD_WINDOW_LENGTH,
+        model_audio_length=MODEL_AUDIO_LENGTH,
+        n_frames=static_n_frames,
+        frontend_batch=FRONTEND_BATCH,
+        fold_input_pcm_scale=FOLD_INPUT_PCM_SCALE,
+        fold_output_pcm_scale=FOLD_OUTPUT_PCM_SCALE,
     ).eval()
     if "32" in IN_AUDIO_DTYPE:
         IN_TORCH_DTYPE = torch.float32
@@ -1028,7 +1155,7 @@ with torch.inference_mode():
             'noisy_audio': {2: 'audio_len'},
             'denoised_audio': {2: 'audio_len'}
         } if DYNAMIC_AXES else None,
-        opset_version=17,
+        opset_version=OPSET,
         dynamo=False
     )
     # If torch.onnx.export produced external data, re-save as a single self-contained file.

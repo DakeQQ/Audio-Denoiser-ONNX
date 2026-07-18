@@ -19,14 +19,14 @@ from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path
 
 parent_path = Path(__file__).resolve().parent
 
-model_path   = "/home/DakeQQ/Downloads/MossFormer2_SE_48K"                         # The MossFormer2_SE_48K download folder.
-onnx_model_A = str(parent_path / "MossFormer_ONNX" / "MossFormer2_SE_48K.onnx")  # The exported onnx model path.
+model_path   = str(Path.home() / "Downloads" / "MossFormer2_SE_48K")              # The MossFormer2_SE_48K download folder.
+onnx_model_A = str(parent_path / "MossFormer_ONNX" / "MossFormer2_SE_48K.onnx")   # The exported onnx model path.
 onnx_model_Metadata = str(metadata_path_for_model(onnx_model_A))                  # The metadata carrier onnx model path.
 
 
 # ---- Model / audio settings ----
 DYNAMIC_AXES       = False                    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-OPSET              = 18
+OPSET              = 20
 MODEL_SAMPLE_RATE  = 48000                   # MossFormer2_SE_48K runs at 48kHz internally.
 IN_SAMPLE_RATE     = 48000                   # [8000, 16000, 22500, 24000, 44000, 48000]; input audio sample rate.
 OUT_SAMPLE_RATE    = 48000                   # [8000, 16000, 22500, 24000, 44000, 48000]; output audio sample rate.
@@ -34,6 +34,7 @@ INPUT_AUDIO_LENGTH = 96000                   # Maximum input audio length in IN_
 IN_AUDIO_DTYPE     = 'INT16'                 # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
 OUT_AUDIO_DTYPE    = 'INT16'                 # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16          = float(1.0 / 32768.0)
+LOG_INT16_POWER    = float(2.0 * np.log(32768.0))
 WINDOW_TYPE        = 'hamming'               # Type of window function used in the STFT
 N_MELS             = 60                      # Number of Mel bands to generate in the Mel-spectrogram
 NFFT               = 1920                    # Number of FFT components for the STFT process
@@ -75,9 +76,9 @@ class MOSSFORMER_SE(torch.nn.Module):
         super(MOSSFORMER_SE, self).__init__()
         self.mossformer_se = mossformer_se.mossformer
         self.istft_model = istft_model
-        self.inv_int16 = torch.tensor([INV_INT16], dtype=torch.float16 if OUT_AUDIO_DTYPE == 'F16' else torch.float32)
         self.use_batch_fold = use_batch_fold          # Fold long audio into fixed windows and batch-process them together
         self.fold_window = fold_window                # Per-window length (model-rate samples) used when folding
+        self.static_batch = 1 if not use_batch_fold else EXPORT_AUDIO_LENGTH // fold_window
         # ---- Faithful Kaldi-fbank feature extractor --------------------------------------
         # The original clearvoice pipeline (clearvoice/utils/decode.py) computes input
         # features with torchaudio.compliance.kaldi.fbank, i.e. per-frame DC-offset
@@ -100,15 +101,20 @@ class MOSSFORMER_SE(torch.nn.Module):
         self.stft_fbins = stft_model.half_n_fft + 1
         self.register_buffer('frontend_kernel', torch.cat((fbank_kernel, stft_kernel), dim=0).contiguous())
         self.register_buffer('mel_banks', self._kaldi_mel_banks(n_mels, padded, 48000.0, 20.0, 0.0))
-        self.log_eps = float(torch.finfo(torch.float32).eps)
+        # The fused frontend consumes normalised PCM. Kaldi was trained on int16-scale
+        # samples, so compensate its power spectrum in log space. Keeping the large
+        # 32768**2 factor out of the graph avoids overflowing FP16 while preserving
+        # log(max(power, float32_eps)) exactly in real arithmetic.
+        self.scaled_log_eps = float(torch.finfo(torch.float32).eps * INV_INT16 * INV_INT16)
+        self.log_int16_power = LOG_INT16_POWER
 
-        t = torch.arange(max_signal_len * 3, dtype=torch.float32)  # Create time steps
+        table_len = max_signal_len * 3 if DYNAMIC_AXES else max_signal_len
+        t = torch.arange(table_len, dtype=torch.float32)  # Create time steps
         sinu = t.unsqueeze(-1) * self.mossformer_se.pos_enc.inv_freq  # Calculate sine and cosine embeddings
         emb = torch.cat((sinu.sin(), sinu.cos()), dim=-1)  # Concatenate sine and cosine embeddings
         emb_pos = (emb * self.mossformer_se.pos_enc.scale).transpose(0, -1)  # Scale the embeddings
-        # Stored as a float16 buffer to halve its initializer footprint. The forward pass
-        # slices the few frames it needs first and casts only that small slice back to
-        # float32, so the memory saving costs just one Cast over a tiny tensor.
+        # Static exports use the exact runtime length; float16 storage preserves the
+        # established model numerics and is cast once to the float32 compute dtype.
         self.register_buffer('emb_pos', emb_pos.unsqueeze(0).half().contiguous())
 
         self.win_length_for_delta = 5
@@ -135,15 +141,13 @@ class MOSSFORMER_SE(torch.nn.Module):
         self.register_buffer('fsmn_pad', torch.zeros((1, uf0.output_dim, uf0.lorder - 1), dtype=torch.float32))
 
         # Rotary cos/sin tables, shared by every FLASH layer (they depend only on the frame
-        # position, not on the data). Precomputed once here for the maximum possible frame
-        # count and sliced per call, exactly like emb_pos above. This keeps the Range / Mul /
-        # Stack / Cos / Sin out of the exported graph (they become constant initializers) and
-        # avoids recomputing the tables on every forward call. Stored as float16 to halve the
-        # initializer footprint; the forward slices the live frames first and casts only that
-        # small slice back to float32.
+        # position, not on the data). Static exports build the exact frame count; dynamic
+        # exports retain an over-provisioned table and slice per call. This keeps Range / Mul /
+        # Stack / Cos / Sin out of the exported graph. Float16 storage preserves the existing
+        # model numerics and each table is cast once to the float32 compute dtype.
         rot_freqs = flash0.rotary_pos_emb.freqs
         self.rot_dim = int(2 * rot_freqs.shape[0])              # literal channel count rotated (e.g. 32)
-        rot_ang = torch.arange(max_signal_len * 3, dtype=rot_freqs.dtype).unsqueeze(-1) * rot_freqs
+        rot_ang = torch.arange(table_len, dtype=rot_freqs.dtype).unsqueeze(-1) * rot_freqs
         rot_ang = torch.stack((rot_ang, rot_ang), dim=-1).flatten(-2)
         self.register_buffer('rot_cos', rot_ang.cos().half().unsqueeze(0).unsqueeze(2).contiguous())
         self.register_buffer('rot_sin', rot_ang.sin().half().unsqueeze(0).unsqueeze(2).contiguous())
@@ -307,8 +311,10 @@ class MOSSFORMER_SE(torch.nn.Module):
 
     def forward(self, audio):
         audio = audio.float()
-        if "int" not in IN_AUDIO_DTYPE.lower():
-            audio = audio * 32768.0      # F16/F32 inputs arrive in [-1, 1]; lift them to the int16 amplitude the Kaldi fbank expects.
+        if "int" in IN_AUDIO_DTYPE.lower():
+            # Keep the expensive fused DFT Conv in range when it is converted to FP16.
+            # Float model inputs already arrive in the same normalised [-1, 1] domain.
+            audio = audio * INV_INT16
         if self.in_sample_rate != MODEL_SAMPLE_RATE:
             audio = torch.nn.functional.interpolate(
                 audio,
@@ -331,17 +337,17 @@ class MOSSFORMER_SE(torch.nn.Module):
         kaldi_frames = kaldi_frames * kaldi_frames                                               # square the real & imag Kaldi DFT rows
         kaldi_real_power, kaldi_imag_power = torch.split(kaldi_frames, self.feat_fbins, dim=1)   # (1, f_bins, m) squared parts
         power = kaldi_real_power + kaldi_imag_power                                              # power spectrum
-        mel_features = torch.matmul(self.mel_banks, power).clamp(min=self.log_eps).log()         # (1, n_mels, m)
+        mel_features = torch.matmul(self.mel_banks, power).clamp(min=self.scaled_log_eps).log()  # (1, n_mels, m)
+        mel_features = mel_features + self.log_int16_power                                      # restore int16-domain log power
         # Reuse the known (static) frame count instead of reading it back from the tensor
         # shape; this keeps the rest of the pipeline free of dynamic Shape/Gather/Range ops.
         mel_features_len = mel_features.shape[-1].unsqueeze(0) if DYNAMIC_AXES else self.static_frames
         mel_features_delta = self.compute_deltas(mel_features, time_dim=mel_features_len)
         mel_features_delta_2 = self.compute_deltas(mel_features_delta, time_dim=mel_features_len)
         mel_features = torch.cat([mel_features, mel_features_delta, mel_features_delta_2], dim=1)
-        real_part, imag_part = torch.split(stft_frames, self.stft_fbins, dim=1)
         x = self.mossformer_se.norm(mel_features)
         x = self.mossformer_se.conv1d_encoder(x)
-        x = x + self.emb_pos[..., :mel_features_len].float()
+        x = x + (self.emb_pos[..., :mel_features_len] if DYNAMIC_AXES else self.emb_pos).float()
 
         # ---- Inlined self.mossformer_se.mdl(x, mel_features_len) ----
         # Computation_Block -> MossFormerM -> MossformerBlock_GFSMN, expanded so the
@@ -357,28 +363,36 @@ class MOSSFORMER_SE(torch.nn.Module):
 
         mdl_input = x                                    # [B, 512, n]
         h = x.permute(0, 2, 1).contiguous()              # [B, n, 512]
-        bsz = h.shape[0]                                 # batch = num_window under fold (1 otherwise)
+        bsz = h.shape[0] if DYNAMIC_AXES else self.static_batch
         inv_n = 1.0 / mel_features_len
 
         # Rotary cos/sin tables sliced to the frame count and broadcast over the 4 heads
         rot_dim = self.rot_dim
-        rcos = self.rot_cos[:, :mel_features_len].float()   # [1, n, 1, rot_dim]
-        rsin = self.rot_sin[:, :mel_features_len].float()
+        rcos = (self.rot_cos[:, :mel_features_len] if DYNAMIC_AXES else self.rot_cos).float()
+        rsin = (self.rot_sin[:, :mel_features_len] if DYNAMIC_AXES else self.rot_sin).float()
 
         # Group padding to a multiple of group_size (loop-invariant; static when not dynamic)
         group_size = self.flash_group_size
         remainder = mel_features_len % group_size
         padding = 0 if remainder == 0 else group_size - remainder
         padded_len = mel_features_len + padding
+        num_groups = padded_len // group_size
 
-        pad_A4 = self.pad_A4[:, :padding].float()
-        pad_VU = self.pad_VU[:, :padding].float()
+        pad_A4 = self.pad_A4[:, :padding].float() if padding > 0 else None
+        pad_VU = self.pad_VU[:, :padding].float() if padding > 0 else None
+        shift_pad = self.shift_pad
+        fsmn_pad = self.fsmn_pad
+        if self.static_batch != 1:
+            pad_A4 = pad_A4.expand(bsz, -1, -1, -1) if padding > 0 else None
+            pad_VU = pad_VU.expand(bsz, -1, -1) if padding > 0 else None
+            shift_pad = shift_pad.expand(bsz, -1, -1)
+            fsmn_pad = fsmn_pad.expand(bsz, -1, -1)
 
         for i in range(len(flash_layers)):
             # ===== FLASH_ShareA_FFConvM (fused to_hidden || to_qk) =====
             residual = h
             x_shift, x_pass = h.chunk(2, dim=-1)
-            x_shift = torch.cat((self.shift_pad.expand(bsz, -1, -1), x_shift[:, :-1, :]), dim=1)
+            x_shift = torch.cat((shift_pad, x_shift[:, :-1, :]), dim=1)
             normed_x = torch.cat((x_shift, x_pass), dim=-1)
 
             base = normed_x / (torch.norm(normed_x, dim=-1, keepdim=True) + self.fl_norm_eps)
@@ -394,21 +408,21 @@ class MOSSFORMER_SE(torch.nn.Module):
             half = torch.stack((-mid[..., 1::2], mid[..., 0::2]), dim=-1).flatten(-2)
             scaled = torch.cat((mid * rcos + half * rsin, scaled[..., rot_dim:]), dim=-1)
             if padding > 0:
-                scaled = torch.cat((scaled, pad_A4.expand(bsz, -1, -1, -1)), dim=1)  # [B, padded_len, 4, qk]
-            scaled = scaled.reshape(bsz, -1, group_size, 4, self.fl_qk)
+                scaled = torch.cat((scaled, pad_A4), dim=1)  # [B, padded_len, 4, qk]
+            scaled = scaled.reshape(bsz, num_groups, group_size, 4, self.fl_qk)
             quad_q, lin_q, quad_k, lin_k = scaled.split(1, dim=3)
             quad_q = quad_q.squeeze(3)
             lin_q = lin_q.squeeze(3)
             quad_k = quad_k.squeeze(3)
             lin_k = lin_k.squeeze(3)
             if padding > 0:
-                vug = torch.cat((value_proj, pad_VU.expand(bsz, -1, -1)), dim=1).reshape(bsz, -1, group_size, self.fl_vu2)
+                vug = torch.cat((value_proj, pad_VU), dim=1).reshape(bsz, num_groups, group_size, self.fl_vu2)
             else:
-                vug = value_proj.reshape(bsz, -1, group_size, self.fl_vu2)
+                vug = value_proj.reshape(bsz, num_groups, group_size, self.fl_vu2)
 
             # Quadratic attention (padded keys are exact zeros -> no extra masking required)
             attn = F.relu(torch.matmul(quad_q, quad_k.transpose(-1, -2)))
-            quad_out = torch.matmul(attn.square(), vug)
+            quad_out = torch.matmul(attn * attn, vug)
 
             # Linear attention
             lin_k_flat = lin_k.permute(0, 3, 1, 2).reshape(bsz, 1, self.fl_qk, padded_len)
@@ -446,7 +460,7 @@ class MOSSFORMER_SE(torch.nn.Module):
             uf = gf.fsmn
             f1 = F.relu(F.linear(xu, uf.linear.weight, uf.linear.bias))
             xp = F.linear(f1, uf.project.weight, None).transpose(1, 2)
-            yy = torch.cat((self.fsmn_pad.expand(bsz, -1, -1), xp, self.fsmn_pad.expand(bsz, -1, -1)), dim=2)
+            yy = torch.cat((fsmn_pad, xp, fsmn_pad), dim=2)
             yy = F.conv1d(yy, self._fs_mem_c[i], None, groups=uf.conv1.groups)
             xu = xu + (xp + yy).transpose(1, 2)
 
@@ -470,9 +484,8 @@ class MOSSFORMER_SE(torch.nn.Module):
         x_out, x_gate = torch.split(gate_pair, [self.tail_channels, self.tail_channels], dim=1)
         x = torch.tanh(x_out) * torch.sigmoid(x_gate)
         x = F.relu(F.conv1d(x, self.mossformer_se.conv1_decoder.weight, None))
-        real_part *= x
-        imag_part *= x
-        audio = self.istft_model(real_part, imag_part)
+        stft_frames = (stft_frames.reshape(bsz, 2, self.stft_fbins, mel_features_len) * x.unsqueeze(1)).reshape(bsz, self.stft_fbins * 2, mel_features_len)
+        audio = self.istft_model._istft_packed_forward(stft_frames)
         if self.use_batch_fold:
             audio = audio.reshape(1, 1, -1)                             # stitch windows back
         if self.out_sample_rate != MODEL_SAMPLE_RATE:
@@ -484,8 +497,11 @@ class MOSSFORMER_SE(torch.nn.Module):
                 align_corners=False
             )
         if "int" in OUT_AUDIO_DTYPE.lower():
-            return audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
-        audio = audio * self.inv_int16
+            # Clamp in the normalised domain, then use an int32 staging cast. FP16 cannot
+            # represent +32767 (it rounds to +32768), and a direct FP16 -> int16 cast can
+            # wrap that value to -32768.
+            audio = audio.clamp(min=-1.0, max=32767.0 / 32768.0) * 32768.0
+            return audio.to(torch.int32).clamp(min=-32768, max=32767).to(torch.int16)
         if "32" in OUT_AUDIO_DTYPE:
             return audio
         return audio.to(torch.float16)
@@ -504,7 +520,7 @@ print('Export start ...')
 Path(onnx_model_A).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
 with torch.inference_mode():
     custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=False, pad_mode='constant').eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=False, pad_mode='constant').eval()
+    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=False, pad_mode='constant', static_frames=not DYNAMIC_AXES).eval()
     mossformer = load_mossformer2_model(model_path).eval().float().to("cpu")
     mossformer = MOSSFORMER_SE(mossformer, custom_stft, custom_istft, NFFT, N_MELS, IN_SAMPLE_RATE, OUT_SAMPLE_RATE, MAX_SIGNAL_LENGTH, USE_BATCH_FOLD, FOLD_WINDOW_LENGTH)
     if "32" in IN_AUDIO_DTYPE:
@@ -526,7 +542,7 @@ with torch.inference_mode():
             'noisy_audio': {2: 'audio_len'},
             'denoised_audio': {2: 'out_audio_len'}
         } if DYNAMIC_AXES else None,
-        opset_version=17,
+        opset_version=OPSET,
         dynamo=False
     )
     del mossformer

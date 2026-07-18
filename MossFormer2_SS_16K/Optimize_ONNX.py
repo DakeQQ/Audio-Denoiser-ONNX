@@ -18,7 +18,7 @@ from Optimize_ONNX_Common import OptimizerConfig, Plan, run_optimizer
 ORIGINAL_FOLDER_PATH = str(_SCRIPT_DIR / "MossFormer_ONNX")
 OPTIMIZED_FOLDER_PATH = str(_SCRIPT_DIR / "MossFormer_Optimized")
 
-ENABLE_FP16 = False  # F16 works and perform well.
+ENABLE_FP16 = False     # F16 works and perform well.
 UPGRADE_OPSET = 0
 
 
@@ -27,7 +27,7 @@ MODEL_PLANS = {
         method="F16" if ENABLE_FP16 else "F32",
         num_heads=8,
         hidden_size=512,
-        opt_level=2,
+        opt_level=1,
         only_onnxruntime=True,
     ),
 }

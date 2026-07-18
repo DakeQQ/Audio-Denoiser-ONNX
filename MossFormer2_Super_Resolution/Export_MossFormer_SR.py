@@ -18,18 +18,20 @@ for _candidate in Path(__file__).resolve().parents:
         break
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
 from Example_Audio import model_audio_path
+from Rewrite_ONNX_Reflect_Padding import rewrite_reflect_padding
 
 
-model_path           = "/home/DakeQQ/Downloads/MossFormer2_SR_48K"
+model_path           = str(Path.home() / "Downloads" / "MossFormer2_SR_48K")
 parent_path          = Path(__file__).resolve().parent                                      # The folder that contains this script.
-onnx_model_A         = str(parent_path / "MossFormer_ONNX" / "MossFormer2_SR.onnx")        # The exported onnx model path.
+onnx_model_Raw       = str(parent_path / "MossFormer_ONNX" / "MossFormer2_SR.raw.onnx")    # Immutable source-optimized PyTorch export.
+onnx_model_A         = str(parent_path / "MossFormer_ONNX" / "MossFormer2_SR.onnx")        # Final model after the targeted Pad rewrite.
 onnx_model_Metadata  = str(metadata_path_for_model(onnx_model_A))                           # The metadata carrier onnx model path.
 test_audio           = model_audio_path("mossformer2_super_resolution")                     # The original audio path.
 save_generated_audio = str(parent_path / "super_resolution.wav")                            # The output super resolution audio path.
 
 
 DYNAMIC_AXES         = False    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-OPSET                = 18
+OPSET                = 20
 IN_AUDIO_DTYPE       = 'INT16'  # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
 OUT_AUDIO_DTYPE      = 'INT16'  # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16            = float(1.0 / 32768.0)
@@ -118,13 +120,16 @@ class MOSSFORMER_SR(torch.nn.Module):
     ):
         super(MOSSFORMER_SR, self).__init__()
         self.input_scale = 1.0 / 32768.0  # int16 PCM -> [-1, 1]; fused into the resample kernel
-        self.inv_int16 = torch.tensor([INV_INT16], dtype=torch.float16 if OUT_AUDIO_DTYPE == 'F16' else torch.float32)
-        self.mossformer_sr = mossformer_sr
+        self.register_buffer('inv_int16', torch.tensor([INV_INT16], dtype=torch.float16 if OUT_AUDIO_DTYPE == 'F16' else torch.float32))
         self.mask_net = mossformer_sr[0].mossformer
         self.generator = mossformer_sr[1]
-        self.pre_stft = pre_stft
+        self.stft_hop = int(pre_stft.hop_len)
+        self.stft_bins = pre_nfft // 2 + 1
+        self.n_mels = int(n_mels)
+        self.register_buffer('stft_kernel', pre_stft.stft_kernel.detach().contiguous())
         fbank = torchaudio.functional.melscale_fbanks(pre_nfft // 2 + 1, 0, 8000, n_mels, super_sample_rate, 'slaney', 'slaney')
         self.register_buffer('fbank', fbank.transpose(0, 1).unsqueeze(0).contiguous())
+        self.register_buffer('mel_power_epsilon', torch.tensor(1e-9, dtype=torch.float32))
         self.scale_factor = float(super_sample_rate / original_sample_rate)
 
         model_audio_len = int(round(float(input_audio_len) * self.scale_factor))
@@ -133,6 +138,7 @@ class MOSSFORMER_SR(torch.nn.Module):
         # built with center_pad=False and the reflect padding is applied explicitly in forward().
         self.mel_pad = (pre_nfft - pre_stft.hop_len) // 2
         self.static_frames = (model_audio_len + 2 * self.mel_pad - pre_nfft) // pre_stft.hop_len + 1
+        self.static_input_len = int(input_audio_len)
         self.static_audio_len = model_audio_len
         # The HiFi-GAN Generator upsamples each mel frame back to hop_len samples, so its output is
         # static_frames * hop_len samples. Pad it back up to the input length so it aligns with the
@@ -181,11 +187,12 @@ class MOSSFORMER_SR(torch.nn.Module):
                 h[p::L] /= h[p::L].sum()
             # Align preserved source samples to output indices 0, L, 2L... while keeping
             # the exact L * input_len output length through ConvTranspose output padding.
-            self.resample_pad = (M - 1) // 2
+            self.resample_pad = L * K
             self.resample_output_padding = L - 1
             # Fold the int16 -> [-1, 1] scale into the interpolation kernel (conv is linear, so
             # conv(audio / 32768, h) == conv(audio, h / 32768)).
-            self.register_buffer('resample_kernel', torch.from_numpy(h * self.input_scale).float().view(1, 1, M))
+            kernel = torch.from_numpy(h * self.input_scale).float().view(1, 1, -1)
+            self.register_buffer('resample_kernel', kernel.contiguous())
         else:
             self.resample_kernel = None
             self.resample_pad = 0
@@ -196,20 +203,22 @@ class MOSSFORMER_SR(torch.nn.Module):
         flash_layers = gfsmn.layers
         fsmn_blocks = gfsmn.fsmn
         flash0 = flash_layers[0]
-        max_seq = max(MAX_SIGNAL_LENGTH, self.static_frames + 16)
+        max_seq = MAX_SIGNAL_LENGTH if DYNAMIC_AXES else self.static_frames
 
         t = torch.arange(max_seq, dtype=torch.float32)
         sinu = t.unsqueeze(-1) * mask_net.pos_enc.inv_freq
         emb = torch.cat((sinu.sin(), sinu.cos()), dim=-1)
         emb_pos = (emb * mask_net.pos_enc.scale).transpose(0, -1).unsqueeze(0)
-        self.register_buffer('emb_pos', emb_pos.contiguous().half())
+        self.register_buffer('emb_pos', emb_pos.contiguous())
 
         group_size = flash0.group_size
         qk_dim = flash0.qk_offset_scale.gamma.shape[-1]
         vu_dim = flash0.to_hidden.mdl[1].weight.shape[0] // 2
         model_dim = flash0.to_hidden.mdl[1].weight.shape[1]
         dw_kernel = flash0.to_hidden.mdl[3].sequential[1].conv.weight.shape[-1]
+        self.num_layers = len(flash_layers)
         self.model_dim = model_dim
+        self.model_half = model_dim // 2
         self.flash_group_size = group_size
         self.fl_vu = vu_dim
         self.fl_vu2 = vu_dim * 2
@@ -235,11 +244,44 @@ class MOSSFORMER_SR(torch.nn.Module):
         self.rot_dim = int(2 * rot_freqs.shape[0])
         rot_ang = torch.arange(max_seq, dtype=rot_freqs.dtype).unsqueeze(-1) * rot_freqs
         rot_ang = torch.stack((rot_ang, rot_ang), dim=-1).flatten(-2)
-        self.register_buffer('rot_cos', rot_ang.cos().half().unsqueeze(0).unsqueeze(2).contiguous())
-        self.register_buffer('rot_sin', rot_ang.sin().half().unsqueeze(0).unsqueeze(2).contiguous())
+        rot_sin = rot_ang.sin().unsqueeze(0).unsqueeze(2).contiguous()
+        rot_sign = torch.tensor([-1.0, 1.0], dtype=rot_sin.dtype).repeat(self.rot_dim // 2).reshape(1, 1, 1, self.rot_dim)
+        self.register_buffer('rot_cos', rot_ang.cos().unsqueeze(0).unsqueeze(2).contiguous())
+        self.register_buffer('rot_signed_sin', (rot_sin * rot_sign).contiguous())
+        self.register_buffer('rot_pair_index', torch.arange(self.rot_dim, dtype=torch.int32).reshape(-1, 2).flip(1).reshape(-1).contiguous())
+        pad_length = group_size if DYNAMIC_AXES else self.static_padding
         self.register_buffer('shift_pad', torch.zeros((1, 1, model_dim // 2), dtype=torch.float32))
-        self.register_buffer('pad_A4', torch.zeros((1, group_size, 4, qk_dim), dtype=torch.float32))
-        self.register_buffer('pad_VU', torch.zeros((1, group_size, vu_dim * 2), dtype=torch.float32))
+        self.register_buffer('pad_A4', torch.zeros((1, pad_length, 4, qk_dim), dtype=torch.float32))
+        self.register_buffer('pad_VU', torch.zeros((1, pad_length, vu_dim * 2), dtype=torch.float32))
+        self.register_buffer('head_quad_q', torch.tensor(0, dtype=torch.int32))
+        self.register_buffer('head_lin_q', torch.tensor(1, dtype=torch.int32))
+        self.register_buffer('head_quad_k', torch.tensor(2, dtype=torch.int32))
+        self.register_buffer('head_lin_k', torch.tensor(3, dtype=torch.int32))
+        self.register_buffer('norm_one', torch.ones(1, dtype=torch.float32))
+        self.register_buffer('norm_zero', torch.zeros(1, dtype=torch.float32))
+        self.register_buffer('fl_in_norm_min', torch.tensor(self.fl_norm_eps, dtype=torch.float32))
+        self.register_buffer('fl_out_norm_min', torch.tensor(self.fl_out_norm_eps, dtype=torch.float32))
+
+        front_conv = mask_net.conv1d_encoder
+        front_w = front_conv.weight.detach().double()
+        front_gamma = mask_net.norm.weight.detach().double().reshape(1, -1, 1)
+        front_beta = mask_net.norm.bias.detach().double()
+        self.register_buffer('front_w', (front_w * front_gamma).float().contiguous())
+        front_b = front_w.squeeze(-1) @ front_beta
+        if front_conv.bias is not None:
+            front_b = front_b + front_conv.bias.detach().double()
+        self.register_buffer('front_b', front_b.float().contiguous())
+        self.front_norm_eps = float(mask_net.norm.eps)
+
+        mm_norm = mask_net.mdl.intra_mdl.norm
+        self.mm_norm_shape = tuple(mm_norm.normalized_shape)
+        self.mm_norm_eps = float(mm_norm.eps)
+        self.register_buffer('mm_norm_w', mm_norm.weight.detach().contiguous())
+        self.register_buffer('mm_norm_b', mm_norm.bias.detach().contiguous())
+        intra_norm = mask_net.mdl.intra_norm
+        self.intra_norm_eps = float(intra_norm.eps)
+        self.register_buffer('intra_norm_w', intra_norm.weight.detach().contiguous())
+        self.register_buffer('intra_norm_b', intra_norm.bias.detach().contiguous())
 
         self._fl_in_w, self._fl_in_b, self._fl_in_c = [], [], []
         self._fl_out_w, self._fl_out_b, self._fl_out_c = [], [], []
@@ -251,9 +293,15 @@ class MOSSFORMER_SR(torch.nn.Module):
                               fl.to_qk.mdl[1].weight.detach().float() * gqk * self.fl_in_scale_fold), dim=0).float().contiguous()
             b_in = torch.cat((fl.to_hidden.mdl[1].bias.detach(),
                               fl.to_qk.mdl[1].bias.detach()), dim=0).float().contiguous()
+            # ConvModule computes activation + depthwise_conv(activation). Add the identity
+            # coefficient to each depthwise kernel's center tap once, removing that full-tensor
+            # residual Add from every exported FFConv path.
             c_in = torch.cat((fl.to_hidden.mdl[3].sequential[1].conv.weight.detach(),
-                              fl.to_qk.mdl[3].sequential[1].conv.weight.detach()), dim=0).contiguous()
+                              fl.to_qk.mdl[3].sequential[1].conv.weight.detach()), dim=0).clone().contiguous()
+            c_in[:, 0, self.dw_pad] += 1.0
             w_out = (fl.to_out.mdl[1].weight.detach().float() * fl.to_out.mdl[0].g.detach().float() * self.fl_out_scale_fold).float().contiguous()
+            c_out = fl.to_out.mdl[3].sequential[1].conv.weight.detach().clone().contiguous()
+            c_out[:, 0, self.dw_pad] += 1.0
             qk_scale = torch.ones((4, 1), dtype=torch.float32)
             qk_scale[0, 0] = self.fl_inv_g
             if self.fold_lin_inv_n:
@@ -265,7 +313,7 @@ class MOSSFORMER_SR(torch.nn.Module):
             self.register_buffer(f'fl_in_c_{i}', c_in)
             self.register_buffer(f'fl_out_w_{i}', w_out)
             self.register_buffer(f'fl_out_b_{i}', fl.to_out.mdl[1].bias.detach().float().contiguous())
-            self.register_buffer(f'fl_out_c_{i}', fl.to_out.mdl[3].sequential[1].conv.weight.detach().contiguous())
+            self.register_buffer(f'fl_out_c_{i}', c_out)
             self.register_buffer(f'qkos_gamma_{i}', qkos_gamma)
             self.register_buffer(f'qkos_beta_{i}', qkos_beta)
             self._fl_in_w.append(getattr(self, f'fl_in_w_{i}'))
@@ -282,8 +330,20 @@ class MOSSFORMER_SR(torch.nn.Module):
         self.fs_uv_groups = self.fs_inner * 2
         self.fs_ln_shape = tuple(gf0.to_u.mdl[0].normalized_shape)
         self.fs_ln_eps = float(gf0.to_u.mdl[0].eps)
-        self.register_buffer('fsmn_pad', torch.zeros((1, gf0.fsmn.output_dim, gf0.fsmn.lorder - 1), dtype=torch.float32))
+        # Supplying shared affine identities avoids two repeated Constant tensors per exported
+        # LayerNormalization while preserving the exact affine-free normalization.
+        self.register_buffer('fs_ln_one', torch.ones(self.fs_ln_shape, dtype=torch.float32))
+        self.register_buffer('fs_ln_zero', torch.zeros(self.fs_ln_shape, dtype=torch.float32))
+        self._fs_mem_padding = int(gf0.fsmn.lorder - 1)
         self._fs_uv_w, self._fs_uv_b, self._fs_uv_c, self._fs_mem_c = [], [], [], []
+        self._fs_mem_linear_w, self._fs_mem_linear_b, self._fs_mem_project_w = [], [], []
+        self._fs_front_w, self._fs_front_b, self._fs_back_w, self._fs_back_b = [], [], [], []
+        self._fs_n1_w, self._fs_n1_b, self._fs_n2_w, self._fs_n2_b = [], [], [], []
+        self.fs_front_alpha = []
+        self.fs_n1_shape = tuple(fsmn_blocks[0].norm1.normalized_shape)
+        self.fs_n1_eps = float(fsmn_blocks[0].norm1.eps)
+        self.fs_n2_shape = tuple(fsmn_blocks[0].norm2.normalized_shape)
+        self.fs_n2_eps = float(fsmn_blocks[0].norm2.eps)
         for i, fb in enumerate(fsmn_blocks):
             gf = fb.gated_fsmn
             w_parts, b_parts, c_parts = [], [], []
@@ -291,15 +351,45 @@ class MOSSFORMER_SR(torch.nn.Module):
                 ln, lin = branch.mdl[0], branch.mdl[1]
                 w_parts.append(lin.weight.detach().float() * ln.weight.detach().float().unsqueeze(0))
                 b_parts.append(lin.weight.detach().float() @ ln.bias.detach().float() + lin.bias.detach().float())
-                c_parts.append(branch.mdl[3].sequential[1].conv.weight.detach())
+                c_branch = branch.mdl[3].sequential[1].conv.weight.detach().clone()
+                c_branch[:, 0, self.dw_pad] += 1.0
+                c_parts.append(c_branch)
             self.register_buffer(f'fs_uv_w_{i}', torch.cat(w_parts, dim=0).float().contiguous())
             self.register_buffer(f'fs_uv_b_{i}', torch.cat(b_parts, dim=0).float().contiguous())
             self.register_buffer(f'fs_uv_c_{i}', torch.cat(c_parts, dim=0).contiguous())
-            self.register_buffer(f'fs_mem_c_{i}', gf.fsmn.conv1.weight.detach().squeeze(-1).contiguous())
+            # UniDeepFsmn likewise computes project(x) + depthwise_conv(project(x)).
+            fs_mem_c = gf.fsmn.conv1.weight.detach().squeeze(-1).clone().contiguous()
+            fs_mem_c[:, 0, self._fs_mem_padding] += 1.0
+            self.register_buffer(f'fs_mem_c_{i}', fs_mem_c)
+            self.register_buffer(f'fs_mem_linear_w_{i}', gf.fsmn.linear.weight.detach().contiguous())
+            self.register_buffer(f'fs_mem_linear_b_{i}', gf.fsmn.linear.bias.detach().contiguous())
+            self.register_buffer(f'fs_mem_project_w_{i}', gf.fsmn.project.weight.detach().contiguous())
             self._fs_uv_w.append(getattr(self, f'fs_uv_w_{i}'))
             self._fs_uv_b.append(getattr(self, f'fs_uv_b_{i}'))
             self._fs_uv_c.append(getattr(self, f'fs_uv_c_{i}'))
             self._fs_mem_c.append(getattr(self, f'fs_mem_c_{i}'))
+            self._fs_mem_linear_w.append(getattr(self, f'fs_mem_linear_w_{i}'))
+            self._fs_mem_linear_b.append(getattr(self, f'fs_mem_linear_b_{i}'))
+            self._fs_mem_project_w.append(getattr(self, f'fs_mem_project_w_{i}'))
+            if fb.conv1[1].weight.numel() != 1:
+                raise ValueError('The block-front PReLU must have one scalar slope.')
+            self.fs_front_alpha.append(float(fb.conv1[1].weight.detach()))
+            self.register_buffer(f'fs_front_w_{i}', fb.conv1[0].weight.detach().squeeze(-1).contiguous())
+            self.register_buffer(f'fs_front_b_{i}', fb.conv1[0].bias.detach().contiguous())
+            self.register_buffer(f'fs_back_w_{i}', fb.conv2.weight.detach().squeeze(-1).contiguous())
+            self.register_buffer(f'fs_back_b_{i}', fb.conv2.bias.detach().contiguous())
+            self.register_buffer(f'fs_n1_w_{i}', fb.norm1.weight.detach().contiguous())
+            self.register_buffer(f'fs_n1_b_{i}', fb.norm1.bias.detach().contiguous())
+            self.register_buffer(f'fs_n2_w_{i}', fb.norm2.weight.detach().contiguous())
+            self.register_buffer(f'fs_n2_b_{i}', fb.norm2.bias.detach().contiguous())
+            self._fs_front_w.append(getattr(self, f'fs_front_w_{i}'))
+            self._fs_front_b.append(getattr(self, f'fs_front_b_{i}'))
+            self._fs_back_w.append(getattr(self, f'fs_back_w_{i}'))
+            self._fs_back_b.append(getattr(self, f'fs_back_b_{i}'))
+            self._fs_n1_w.append(getattr(self, f'fs_n1_w_{i}'))
+            self._fs_n1_b.append(getattr(self, f'fs_n1_b_{i}'))
+            self._fs_n2_w.append(getattr(self, f'fs_n2_w_{i}'))
+            self._fs_n2_b.append(getattr(self, f'fs_n2_b_{i}'))
 
         self.tail_channels = mask_net.conv1_decoder.in_channels
         spk_w = mask_net.conv1d_out.weight.detach()[:self.tail_channels, :, 0].float()
@@ -310,6 +400,10 @@ class MOSSFORMER_SR(torch.nn.Module):
                             mask_net.output_gate[0].bias.detach()), dim=0).float()
         self.register_buffer('tail_gate_w', (gate_w @ spk_w).float().unsqueeze(-1).contiguous())
         self.register_buffer('tail_gate_b', (gate_w @ spk_b + gate_b).float().contiguous())
+        self.register_buffer('tail_decoder_w', mask_net.conv1_decoder.weight.detach().contiguous())
+        if mask_net.prelu.weight.numel() != 1:
+            raise ValueError('The mask-tail PReLU must have one scalar slope.')
+        self.tail_prelu_alpha = float(mask_net.prelu.weight.detach())
 
         gen = self.generator
         self.gen_num_upsamples = gen.num_upsamples
@@ -338,18 +432,22 @@ class MOSSFORMER_SR(torch.nn.Module):
             self._gen_res_c1_inv.append(c1_invs)
             self._gen_res_c2_inv.append(c2_invs)
 
-    def _run_mdl(self, mdl_input, n):
-        mask_net = self.mask_net
-        gfsmn = mask_net.mdl.intra_mdl.mossformerM
-        flash_layers = gfsmn.layers
-        fsmn_blocks = gfsmn.fsmn
-        mm_norm = mask_net.mdl.intra_mdl.norm
-        intra_norm = mask_net.mdl.intra_norm
+        # All source checkpoint tensors reached by forward are now represented by packed
+        # buffers or by the generator tree. Drop the duplicate MaskNet/module-list state.
+        self.mask_net = None
 
-        h = mdl_input.permute(0, 2, 1).contiguous()
+    def _group_norm_static(self, x, eps, channels=None):
+        channels = self.model_dim if channels is None else channels
+        x = x.reshape(1, 1, channels * self.static_frames)
+        x = F.instance_norm(x, None, None, self.norm_one, self.norm_zero, True, 0.1, eps)
+        return x.reshape(1, channels, self.static_frames)
+
+    def _run_mdl(self, mdl_input, n):
+        h = mdl_input.transpose(1, 2).contiguous()
+        bsz = h.shape[0] if DYNAMIC_AXES else 1
         inv_n = 1.0 if self.fold_lin_inv_n else 1.0 / n
-        rcos = self.rot_cos[:, :n].float()
-        rsin = self.rot_sin[:, :n].float()
+        rcos = self.rot_cos[:, :n]
+        rsin = self.rot_signed_sin[:, :n]
 
         group_size = self.flash_group_size
         if DYNAMIC_AXES:
@@ -361,97 +459,99 @@ class MOSSFORMER_SR(torch.nn.Module):
             padding = self.static_padding
             padded_len = self.static_padded_len
             num_groups = self.static_num_groups
-        pad_A4 = self.pad_A4[:, :padding]
-        pad_VU = self.pad_VU[:, :padding]
+        if DYNAMIC_AXES:
+            pad_A4 = self.pad_A4[:, :padding].expand(bsz, -1, -1, -1)
+            pad_VU = self.pad_VU[:, :padding].expand(bsz, -1, -1)
+            shift_pad = self.shift_pad.expand(bsz, -1, -1)
+        else:
+            pad_A4 = self.pad_A4
+            pad_VU = self.pad_VU
+            shift_pad = self.shift_pad
 
-        for i in range(len(flash_layers)):
+        for i in range(self.num_layers):
             residual = h
-            x_shift, x_pass = h.chunk(2, dim=-1)
-            x_shift = torch.cat((self.shift_pad, x_shift[:, :-1, :]), dim=1)
+            x_shift, x_pass = torch.split(h, [self.model_half, self.model_half], dim=-1)
+            x_shift = torch.cat((shift_pad, x_shift[:, :-1, :]), dim=1)
             normed_x = torch.cat((x_shift, x_pass), dim=-1)
 
-            base = normed_x / torch.clamp(torch.norm(normed_x, dim=-1, keepdim=True), min=self.fl_norm_eps)
+            base = normed_x / torch.clamp(torch.norm(normed_x, dim=-1, keepdim=True), min=self.fl_in_norm_min)
             proj = F.silu(F.linear(base, self._fl_in_w[i], self._fl_in_b[i]))
-            proj = proj + F.conv1d(proj.transpose(1, 2), self._fl_in_c[i], None, padding=self.dw_pad, groups=self.fl_in_groups).transpose(1, 2)
-            v, u, qk = torch.split(proj, [self.fl_vu, self.fl_vu, self.fl_qk], dim=-1)
-            value_proj = proj[..., :self.fl_vu2]
+            proj = F.conv1d(proj.transpose(1, 2), self._fl_in_c[i], None, padding=self.dw_pad, groups=self.fl_in_groups).transpose(1, 2)
+            value_proj, qk = torch.split(proj, [self.fl_vu2, self.fl_qk], dim=-1)
+            v, u = torch.split(value_proj, [self.fl_vu, self.fl_vu], dim=-1)
 
             scaled = qk.unsqueeze(-2) * self._qkos_gamma[i] + self._qkos_beta[i]
             mid, tail = torch.split(scaled, [self.rot_dim, self.fl_qk - self.rot_dim], dim=-1)
-            mid_even, mid_odd = mid.reshape(1, n, 4, self.rot_dim // 2, 2).split(1, dim=-1)
-            half = torch.cat((-mid_odd, mid_even), dim=-1).flatten(-2)
+            half = mid.index_select(-1, self.rot_pair_index)
             scaled = torch.cat((mid * rcos + half * rsin, tail), dim=-1)
             if padding > 0:
                 scaled = torch.cat((scaled, pad_A4), dim=1)
-            scaled = scaled.reshape(1, num_groups, group_size, 4, self.fl_qk)
-            quad_q, lin_q, quad_k, lin_k = scaled.split(1, dim=3)
-            quad_q = quad_q.squeeze(3)
-            lin_q = lin_q.squeeze(3)
-            quad_k = quad_k.squeeze(3)
-            lin_k = lin_k.squeeze(3)
+            scaled = scaled.reshape(bsz, num_groups, group_size, 4, self.fl_qk)
+            quad_q = scaled[:, :, :, self.head_quad_q, :]
+            lin_q = scaled[:, :, :, self.head_lin_q, :]
+            quad_k = scaled[:, :, :, self.head_quad_k, :]
+            lin_k = scaled[:, :, :, self.head_lin_k, :]
             if padding > 0:
-                vug = torch.cat((value_proj, pad_VU), dim=1).reshape(1, num_groups, group_size, self.fl_vu2)
+                vug = torch.cat((value_proj, pad_VU), dim=1).reshape(bsz, num_groups, group_size, self.fl_vu2)
             else:
-                vug = value_proj.reshape(1, num_groups, group_size, self.fl_vu2)
+                vug = value_proj.reshape(bsz, num_groups, group_size, self.fl_vu2)
 
             attn = F.relu(torch.matmul(quad_q, quad_k.transpose(-1, -2)))
             quad_out = torch.matmul(attn.square(), vug)
-            lin_k_flat = lin_k.permute(0, 3, 1, 2).reshape(1, 1, self.fl_qk, padded_len)
-            lin_kvu = torch.matmul(lin_k_flat, vug.reshape(1, 1, padded_len, self.fl_vu2))
+            lin_k_flat = lin_k.permute(0, 3, 1, 2).reshape(bsz, 1, self.fl_qk, padded_len)
+            lin_kvu = torch.matmul(lin_k_flat, vug.reshape(bsz, 1, padded_len, self.fl_vu2))
             if not self.fold_lin_inv_n:
                 lin_kvu = lin_kvu * inv_n
             lin_out = torch.matmul(lin_q, lin_kvu)
 
-            att_vu = (quad_out + lin_out).reshape(1, padded_len, self.fl_vu2)[:, :n, :]
+            att_vu = (quad_out + lin_out).reshape(bsz, padded_len, self.fl_vu2)[:, :n, :]
             att_v, att_u = torch.split(att_vu, [self.fl_vu, self.fl_vu], dim=-1)
             out = (att_u * v) * torch.sigmoid(att_v * u)
 
-            y = out / torch.clamp(torch.norm(out, dim=-1, keepdim=True), min=self.fl_out_norm_eps)
+            y = out / torch.clamp(torch.norm(out, dim=-1, keepdim=True), min=self.fl_out_norm_min)
             y = F.silu(F.linear(y, self._fl_out_w[i], self._fl_out_b[i]))
-            y = y + F.conv1d(y.transpose(1, 2), self._fl_out_c[i], None, padding=self.dw_pad, groups=self.model_dim).transpose(1, 2)
+            y = F.conv1d(y.transpose(1, 2), self._fl_out_c[i], None, padding=self.dw_pad, groups=self.model_dim).transpose(1, 2)
             h = residual + y
 
-            gblk = fsmn_blocks[i]
             blk_in = h
-            c1 = gblk.conv1[0]
-            c1y = F.prelu(F.conv1d(blk_in.transpose(1, 2), c1.weight, c1.bias), gblk.conv1[1].weight)
-            n1 = gblk.norm1
-            gf_in = F.layer_norm(c1y.transpose(1, 2), n1.normalized_shape, n1.weight, n1.bias, n1.eps)
+            c1y = F.leaky_relu(F.linear(blk_in, self._fs_front_w[i], self._fs_front_b[i]), negative_slope=self.fs_front_alpha[i])
+            gf_in = F.layer_norm(c1y, self.fs_n1_shape, self._fs_n1_w[i], self._fs_n1_b[i], self.fs_n1_eps)
 
-            gf = gblk.gated_fsmn
-            xn = F.layer_norm(gf_in, self.fs_ln_shape, None, None, self.fs_ln_eps)
+            xn = F.layer_norm(gf_in, self.fs_ln_shape, self.fs_ln_one, self.fs_ln_zero, self.fs_ln_eps)
             proj = F.silu(F.linear(xn, self._fs_uv_w[i], self._fs_uv_b[i]))
-            proj = proj + F.conv1d(proj.transpose(1, 2), self._fs_uv_c[i], None, padding=self.dw_pad, groups=self.fs_uv_groups).transpose(1, 2)
+            proj = F.conv1d(proj.transpose(1, 2), self._fs_uv_c[i], None, padding=self.dw_pad, groups=self.fs_uv_groups).transpose(1, 2)
             xu, xv = torch.split(proj, [self.fs_inner, self.fs_inner], dim=-1)
 
-            uf = gf.fsmn
-            f1 = F.relu(F.linear(xu, uf.linear.weight, uf.linear.bias))
-            xp = F.linear(f1, uf.project.weight, None).transpose(1, 2)
-            yy = torch.cat((self.fsmn_pad, xp, self.fsmn_pad), dim=2)
-            yy = F.conv1d(yy, self._fs_mem_c[i], None, groups=uf.conv1.groups)
-            xu = xu + (xp + yy).transpose(1, 2)
+            f1 = F.relu(F.linear(xu, self._fs_mem_linear_w[i], self._fs_mem_linear_b[i]))
+            xp = F.linear(f1, self._fs_mem_project_w[i], None).transpose(1, 2)
+            yy = F.conv1d(xp, self._fs_mem_c[i], None, padding=self._fs_mem_padding, groups=self.fs_inner)
+            xu = xu + yy.transpose(1, 2)
 
             y = xv * xu + gf_in
-            n2 = gblk.norm2
-            norm2_out = F.layer_norm(y, n2.normalized_shape, n2.weight, n2.bias, n2.eps).transpose(1, 2)
-            c2 = gblk.conv2
-            h = F.conv1d(norm2_out, c2.weight, c2.bias).transpose(1, 2) + blk_in
+            norm2_out = F.layer_norm(y, self.fs_n2_shape, self._fs_n2_w[i], self._fs_n2_b[i], self.fs_n2_eps)
+            h = F.linear(norm2_out, self._fs_back_w[i], self._fs_back_b[i]) + blk_in
 
-        h = F.layer_norm(h, mm_norm.normalized_shape, mm_norm.weight, mm_norm.bias, mm_norm.eps)
-        h = h.permute(0, 2, 1).contiguous()
-        h = F.group_norm(h, intra_norm.num_groups, intra_norm.weight, intra_norm.bias, intra_norm.eps)
+        h = F.layer_norm(h, self.mm_norm_shape, self.mm_norm_w, self.mm_norm_b, self.mm_norm_eps)
+        h = h.transpose(1, 2).contiguous()
+        if DYNAMIC_AXES:
+            h = F.group_norm(h, 1, self.intra_norm_w, self.intra_norm_b, self.intra_norm_eps)
+        else:
+            h = self._group_norm_static(h, self.intra_norm_eps)
+            h = h * self.intra_norm_w.reshape(1, self.model_dim, 1) + self.intra_norm_b.reshape(1, self.model_dim, 1)
         return h + mdl_input
 
     def _run_masknet(self, mel_features, n):
-        mask_net = self.mask_net
-        x = mask_net.norm(mel_features)
-        x = mask_net.conv1d_encoder(x)
-        x = self._run_mdl(x + self.emb_pos[..., :n].float(), n)
-        x = F.prelu(x, mask_net.prelu.weight)
+        if DYNAMIC_AXES:
+            x = F.group_norm(mel_features, 1, None, None, self.front_norm_eps)
+        else:
+            x = self._group_norm_static(mel_features, self.front_norm_eps, channels=self.n_mels)
+        x = F.conv1d(x, self.front_w, self.front_b)
+        x = self._run_mdl(x + self.emb_pos[..., :n], n)
+        x = F.leaky_relu(x, negative_slope=self.tail_prelu_alpha)
         gate_pair = F.conv1d(x, self.tail_gate_w, self.tail_gate_b)
         x_out, x_gate = torch.split(gate_pair, [self.tail_channels, self.tail_channels], dim=1)
         x = torch.tanh(x_out) * torch.sigmoid(x_gate)
-        return F.relu(F.conv1d(x, mask_net.conv1_decoder.weight, None))
+        return F.relu(F.conv1d(x, self.tail_decoder_w, None))
 
     def _snake(self, x, alpha, inv_alpha):
         return x + inv_alpha * torch.sin(alpha * x).square()
@@ -500,7 +600,13 @@ class MOSSFORMER_SR(torch.nn.Module):
         # int16 -> [-1, 1] scale (1 / 32768) is fused into the resample kernel so the primary
         # integer-ratio path needs no separate divide; the fallbacks apply it explicitly.
         if self.resample_kernel is not None:
-            return F.conv_transpose1d(audio, self.resample_kernel, stride=self.resample_L, padding=self.resample_pad, output_padding=self.resample_output_padding)
+            return F.conv_transpose1d(
+                audio,
+                self.resample_kernel,
+                stride=self.resample_L,
+                padding=self.resample_pad,
+                output_padding=self.resample_output_padding,
+            )
         audio = audio * self.input_scale
         if self.scale_factor != 1.0:
             return F.interpolate(audio, scale_factor=self.scale_factor, mode="linear", align_corners=True, recompute_scale_factor=False)
@@ -515,9 +621,11 @@ class MOSSFORMER_SR(torch.nn.Module):
         audio = self._upsample(audio.float())
         # HiFi-GAN mel: explicit reflect pad of (n_fft - hop) / 2 then a center=False STFT.
         mp = self.mel_pad
-        audio_mel = torch.cat([audio[..., 1:mp + 1].flip(2), audio, audio[..., -(mp + 1):-1].flip(2)], dim=2)
-        real_part, imag_part = self.pre_stft(audio_mel)
-        mel_features = torch.matmul(self.fbank, torch.sqrt(real_part * real_part + imag_part * imag_part)).clamp(min=1e-5).log()
+        audio_mel = F.pad(audio, (mp, mp), mode='reflect')
+        spectrum = F.conv1d(audio_mel, self.stft_kernel, stride=self.stft_hop)
+        spectrum = spectrum.reshape(1, 2, self.stft_bins, self.static_frames)
+        magnitude = torch.sqrt(spectrum.square().sum(dim=1) + self.mel_power_epsilon)
+        mel_features = torch.matmul(self.fbank, magnitude).clamp(min=1e-5).log()
         mel_features_len = mel_features.shape[-1] if DYNAMIC_AXES else self.static_frames
         mossformer_output = self._run_masknet(mel_features, mel_features_len)
         generated_wav = self._run_generator(mossformer_output)
@@ -535,19 +643,22 @@ class MOSSFORMER_SR(torch.nn.Module):
         # halves share an identical group delay and sum coherently with perfect reconstruction and
         # no spectral seam. Reflect padding (slice+flip, ONNX-friendly) removes convolution edge
         # transients; the per-window Hann overlap-add on the host smooths any residual boundary.
-        c = self.xover_half
-        audio_padded = torch.cat([audio[..., 1:c + 1].flip(2), audio, audio[..., -(c + 1):-1].flip(2)], dim=2)
-        gen_padded = torch.cat([generated_wav[..., 1:c + 1].flip(2), generated_wav, generated_wav[..., -(c + 1):-1].flip(2)], dim=2)
-        both_low = F.conv1d(torch.cat((audio_padded, gen_padded), dim=0), self.xover_lp)
-        audio_low, gen_low = torch.split(both_low, 1, dim=0)
-        wav_sub = generated_wav - gen_low + audio_low
+        difference = audio - generated_wav
+        difference_low = F.conv1d(F.pad(difference, (self.xover_half, self.xover_half), mode='reflect'), self.xover_lp)
+        wav_sub = generated_wav + difference_low
         wav_sub = wav_sub[..., :audio.shape[-1] if DYNAMIC_AXES else self.static_audio_len]
-        # Scale the [-1, 1] waveform to 16-bit PCM first. Integer output returns that PCM tensor;
-        # floating output divides it back to [-1, 1] inside the graph, matching the shared dtype
-        # contract without any host-side scaling.
-        pcm = torch.clamp(wav_sub * 32767.0, -32768.0, 32767.0)
         if "int" in OUT_AUDIO_DTYPE.lower():
-            return pcm.to(torch.int16)
+            # Keep clipping safe after FP16 conversion. The old float-domain
+            # ``* 32767 -> clip -> int16`` chain was unsafe because 32767 rounds
+            # to 32768 in FP16; positive peaks then wrapped to -32768 in the final
+            # cast. Clip the normalized waveform first, cast through int32, and do
+            # the exact PCM bounds check in integer arithmetic.
+            normalized = torch.clamp(wav_sub, -1.0, 1.0)
+            pcm_i32 = (normalized * 32768.0).to(torch.int32)
+            pcm_i32 = torch.clamp(pcm_i32, -32768, 32767)
+            return pcm_i32.to(torch.int16)
+        # Floating output keeps the existing [-1, 1] contract.
+        pcm = torch.clamp(wav_sub * 32767.0, -32768.0, 32767.0)
         pcm = pcm * self.inv_int16
         if "32" in OUT_AUDIO_DTYPE:
             return pcm
@@ -581,7 +692,7 @@ with torch.inference_mode():
     torch.onnx.export(
         mossformer,
         (audio,),
-        onnx_model_A,
+        onnx_model_Raw,
         input_names=['original_audio'],
         output_names=['super_resolution_audio'],
         do_constant_folding=True,
@@ -589,13 +700,14 @@ with torch.inference_mode():
             'original_audio': {2: 'audio_len'},
             'super_resolution_audio': {2: 'super_audio_len'}
         } if DYNAMIC_AXES else None,
-        opset_version=17,
+        opset_version=OPSET,
         dynamo=False
     )
     del mossformer
     del audio
     del pre_stft
     gc.collect()
+rewrite_reflect_padding(onnx_model_Raw, onnx_model_A)
 model_metadata = build_audio_metadata_from_globals(
     globals(), producer=Path(__file__).name, model_name="MossFormer2_SR", task="super_resolution", model_family="mossformer2_sr",
     max_dynamic_audio_seconds=6, normalize_audio_default=False,
@@ -609,5 +721,9 @@ model_metadata = build_audio_metadata_from_globals(
 )
 stamp_export_metadata(onnx_model_A, model_metadata, OPSET)
 print(f"Metadata saved to: {onnx_model_Metadata}")
+raw_model_path = Path(onnx_model_Raw)
+if raw_model_path.exists():
+    raw_model_path.unlink()
+    print(f"Removed temporary raw model: {raw_model_path}")
 print('\nExport done!')
 _run_inference_demo()

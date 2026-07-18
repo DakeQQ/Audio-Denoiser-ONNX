@@ -1,6 +1,7 @@
 import gc
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import torch
@@ -13,12 +14,13 @@ for _candidate in Path(__file__).resolve().parents:
             sys.path.insert(0, str(_candidate))
         break
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
+from Rewrite_ONNX_Initializer_Identities import rewrite_initializer_identities
 
 
 parent_path          = Path(__file__).resolve().parent                     # The folder that contains this script.
-project_path         = "/home/DakeQQ/Downloads/NKF-AEC-gh-pages"            # The NKF-AEC GitHub project download path. https://github.com/jfsean/NKF-AEC
+project_path         = str(Path.home() / "Downloads" / "NKF-AEC-gh-pages") # The NKF-AEC GitHub project download path. https://github.com/jfsean/NKF-AEC
 checkpoint_path      = project_path + "/src/nkf_epoch70.pt"               # The pretrained checkpoint path.
-onnx_model_A         = str(parent_path / "NKF_AEC_ONNX" / "NKF_AEC.onnx") # The exported onnx model path.
+onnx_model_A         = str(parent_path / "NKF_AEC_ONNX" / "NKF_AEC.onnx") # Final targeted-rewrite deployment model.
 onnx_model_Metadata  = str(metadata_path_for_model(onnx_model_A))          # The metadata carrier onnx model path.
 
 
@@ -30,7 +32,7 @@ WINDOW_TYPE         = 'hann'         # Type of window function used in the STFT
 NFFT                = 1024           # Number of FFT components for the STFT process
 WINDOW_LENGTH       = 1024           # Length of windowing, edit it carefully.
 HOP_LENGTH          = 256            # Number of samples between successive frames in the STFT
-MAX_SIGNAL_LENGTH   = 256            # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
+MAX_SIGNAL_LENGTH   = INPUT_AUDIO_LENGTH // HOP_LENGTH + 1  # Exact center-padded frame count for the static export shape.
 
 # Batch-fold constants
 USE_BATCH_FOLD      = False          # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
@@ -54,61 +56,77 @@ RNN_DIM             = 18             # GRU hidden dimension, do not edit the val
 IN_AUDIO_DTYPE      = 'INT16'        # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
 OUT_AUDIO_DTYPE     = 'INT16'        # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16           = float(1.0 / 32768.0)
-OPSET               = 18             # ONNX opset.
+OPSET               = 20             # ONNX opset.
 
 
 class ComplexGRU_Real(nn.Module):
-    """ComplexGRU decomposed into real/imaginary parts for ONNX export."""
+    """ComplexGRU in sequence-first layout without output layout conversions."""
     def __init__(self, input_size, hidden_size, num_layers=1, batch_first=True, bias=True):
         super().__init__()
-        self.gru_r = nn.GRU(input_size, hidden_size, num_layers, bias=bias, batch_first=batch_first)
-        self.gru_i = nn.GRU(input_size, hidden_size, num_layers, bias=bias, batch_first=batch_first)
+        if num_layers != 1:
+            raise ValueError("The NKF checkpoint uses exactly one GRU layer.")
+        self.gru_r = nn.GRU(input_size, hidden_size, num_layers, bias=bias, batch_first=False)
+        self.gru_i = nn.GRU(input_size, hidden_size, num_layers, bias=bias, batch_first=False)
         self.num_layers = num_layers
         self.hidden_size = hidden_size
 
-    def forward(self, x_real, x_imag, h_rr, h_ir, h_ri, h_ii):
-        Frr, h_rr = self.gru_r(x_real, h_rr)
-        Fir, h_ir = self.gru_r(x_imag, h_ir)
-        Fri, h_ri = self.gru_i(x_real, h_ri)
-        Fii, h_ii = self.gru_i(x_imag, h_ii)
-        # complex(Frr - Fii, Fri + Fir)
-        out_real = Frr - Fii
-        out_imag = Fri + Fir
-        return out_real, out_imag, h_rr, h_ir, h_ri, h_ii
+    def forward(self, x, h_rr, h_ir, h_ri, h_ii):
+        x_real, x_imag = x.split(1, dim=0)
+        _, h_rr = self.gru_r(x_real, h_rr)
+        _, h_ir = self.gru_r(x_imag, h_ir)
+        _, h_ri = self.gru_i(x_real, h_ri)
+        _, h_ii = self.gru_i(x_imag, h_ii)
+        return torch.cat((h_rr - h_ii, h_ri + h_ir), dim=0), h_rr, h_ir, h_ri, h_ii
 
 
 class ComplexDense_Real(nn.Module):
     """ComplexDense decomposed into real/imaginary parts for ONNX export.
-    Fused: batched matmul via stacked weights (2, out, in) applied to stacked input."""
+    Fused as a two-group 1x1 convolution so ORT can absorb scalar activations."""
     def __init__(self, in_channel, out_channel, bias=True):
         super().__init__()
         self.linear_real = nn.Linear(in_channel, out_channel, bias=bias)
         self.linear_imag = nn.Linear(in_channel, out_channel, bias=bias)
+        self.in_channel = in_channel
         self.out_channel = out_channel
         self._fused = False
 
     def fuse_weights_(self):
-        """Stack real/imag weights for batched matmul: (2, in, out) pre-transposed."""
+        """Pack real/imag affine transforms as two Conv1d channel groups."""
         with torch.no_grad():
-            # stacked_weight: (2, in, out) — pre-transposed for bmm
-            self.register_buffer('stacked_weight', torch.stack([self.linear_real.weight, self.linear_imag.weight], dim=0).transpose(1, 2).contiguous())
+            self.register_buffer(
+                'group_weight',
+                torch.cat((self.linear_real.weight, self.linear_imag.weight), dim=0).unsqueeze(2).contiguous(),
+            )
             if self.linear_real.bias is not None:
-                # stacked_bias: (2, 1, out)
-                self.register_buffer('stacked_bias', torch.stack([self.linear_real.bias, self.linear_imag.bias], dim=0).unsqueeze(1))
+                self.register_buffer('group_bias', torch.cat((self.linear_real.bias, self.linear_imag.bias)))
             else:
-                self.register_buffer('stacked_bias', None)
+                self.register_buffer('group_bias', None)
         self._fused = True
 
-    def forward(self, x_real, x_imag):
-        if self._fused and x_real.shape[0] == 1 and x_imag.shape[0] == 1:
-            # x_real, x_imag: (1, F, in) -> cat: (2, F, in)
-            x_stacked = torch.cat([x_real, x_imag], dim=0)
-            # bmm: (2, F, in) @ (2, in, out) -> (2, F, out)
-            out = torch.bmm(x_stacked, self.stacked_weight)
-            if self.stacked_bias is not None:
-                out = out + self.stacked_bias
-            return out.split(1, dim=0)
-        return self.linear_real(x_real), self.linear_imag(x_imag)
+    def _from_grouped(self, x, branch_batch):
+        return x.reshape(2, self.out_channel, branch_batch).transpose(1, 2)
+
+    def forward(self, x, branch_batch, negative_slope=None, keep_grouped=False):
+        if self._fused:
+            x = x.transpose(1, 2).reshape(1, 2 * self.in_channel, branch_batch)
+            x = torch.nn.functional.conv1d(x, self.group_weight, self.group_bias, groups=2)
+            if negative_slope is not None:
+                x = torch.nn.functional.leaky_relu(x, negative_slope=negative_slope)
+            return x if keep_grouped else self._from_grouped(x, branch_batch)
+        return torch.stack((self.linear_real(x[0]), self.linear_imag(x[1])), dim=0)
+
+    def forward_grouped(self, x, branch_batch):
+        if not self._fused:
+            raise RuntimeError("Call cache_export_constants_() before export or inference.")
+        x = torch.nn.functional.conv1d(x, self.group_weight, self.group_bias, groups=2)
+        return self._from_grouped(x, branch_batch)
+
+    def forward_grouped_activated(self, x, branch_batch, negative_slope):
+        if not self._fused:
+            raise RuntimeError("Call cache_export_constants_() before export or inference.")
+        x = torch.nn.functional.conv1d(x, self.group_weight, self.group_bias, groups=2)
+        x = torch.nn.functional.leaky_relu(x, negative_slope=negative_slope)
+        return self._from_grouped(x, branch_batch)
 
 
 class ComplexPReLU_Real(nn.Module):
@@ -116,27 +134,28 @@ class ComplexPReLU_Real(nn.Module):
     def __init__(self):
         super().__init__()
         self.prelu = nn.PReLU()
-        self.register_buffer('cached_weight', torch.ones(1, dtype=torch.float32), persistent=False)
+        self.negative_slope = 0.0
         self.use_cached_weight = False
 
     def cache_weight_(self):
-        with torch.no_grad():
-            self.cached_weight.copy_(self.prelu.weight.detach())
+        self.negative_slope = float(self.prelu.weight.detach().item())
         self.use_cached_weight = True
 
-    def forward(self, x_real, x_imag):
-        weight = self.cached_weight if self.use_cached_weight else self.prelu.weight
-        return torch.nn.functional.prelu(x_real, weight), torch.nn.functional.prelu(x_imag, weight)
+    def forward(self, x):
+        if self.use_cached_weight:
+            return torch.nn.functional.leaky_relu(x, negative_slope=self.negative_slope)
+        return torch.nn.functional.prelu(x, self.prelu.weight)
 
 
 class KGNet_Real(nn.Module):
     """KGNet decomposed into real/imaginary parts for ONNX export."""
-    def __init__(self, L, fc_dim, rnn_layers, rnn_dim):
+    def __init__(self, L, fc_dim, rnn_layers, rnn_dim, model_batch):
         super().__init__()
         self.L = L
         self.rnn_layers = rnn_layers
         self.rnn_dim = rnn_dim
         self.n_freq = NFFT // 2 + 1
+        self.branch_batch = model_batch * self.n_freq
 
         # fc_in: ComplexDense(2*L+1, fc_dim) + ComplexPReLU
         self.fc_in_dense = ComplexDense_Real(2 * L + 1, fc_dim, bias=True)
@@ -155,34 +174,27 @@ class KGNet_Real(nn.Module):
         self.fc_out_act.cache_weight_()
 
     def fuse_dense_weights_(self):
-        """Fuse ComplexDense weights for batched matmul."""
+        """Pack all ComplexDense weights for grouped 1x1 convolution."""
         self.fc_in_dense.fuse_weights_()
         self.fc_out_dense1.fuse_weights_()
         self.fc_out_dense2.fuse_weights_()
 
-    def forward(self, input_real, input_imag, h_rr, h_ir, h_ri, h_ii):
-        # input_real, input_imag: (1, F, 2*L+1)
-        b = input_real.shape[0]
-        x_real, x_imag = self.fc_in_dense(input_real, input_imag)
-        x_real, x_imag = self.fc_in_act(x_real, x_imag)
-
-        # GRU expects (batch=F, seq=1, fc_dim) per window: (b, F, fc_dim) -> (b*F, 1, fc_dim)
-        x_real = x_real.view(b * self.n_freq, 1, -1)
-        x_imag = x_imag.view(b * self.n_freq, 1, -1)
-
-        # ComplexGRU
-        x_real, x_imag, h_rr, h_ir, h_ri, h_ii = self.complex_gru(x_real, x_imag, h_rr, h_ir, h_ri, h_ii)
-
-        # Back to (b, F, rnn_dim) from (b*F, 1, rnn_dim)
-        x_real = x_real.view(b, self.n_freq, -1)
-        x_imag = x_imag.view(b, self.n_freq, -1)
-
-        # fc_out: fused dense layers, all (1, F, *)
-        x_real, x_imag = self.fc_out_dense1(x_real, x_imag)
-        x_real, x_imag = self.fc_out_act(x_real, x_imag)
-        x_real, x_imag = self.fc_out_dense2(x_real, x_imag)
-
-        return x_real, x_imag, h_rr, h_ir, h_ri, h_ii
+    def forward(self, x, h_rr, h_ir, h_ri, h_ii):
+        # x arrives directly in grouped Conv1d layout: (1, real+imag channels, frequency).
+        x = self.fc_in_dense.forward_grouped_activated(
+            x,
+            self.branch_batch,
+            self.fc_in_act.negative_slope,
+        )
+        x, h_rr, h_ir, h_ri, h_ii = self.complex_gru(x, h_rr, h_ir, h_ri, h_ii)
+        x = self.fc_out_dense1(
+            x,
+            self.branch_batch,
+            self.fc_out_act.negative_slope,
+            keep_grouped=True,
+        )
+        x = self.fc_out_dense2.forward_grouped(x, self.branch_batch)
+        return x, h_rr, h_ir, h_ri, h_ii
 
 
 class NKF(nn.Module):
@@ -199,11 +211,12 @@ class NKF(nn.Module):
         self.rnn_dim = rnn_dim
         self.custom_stft = custom_stft
         self.custom_istft = custom_istft
-        self.kg_net = KGNet_Real(L, fc_dim, rnn_layers, rnn_dim)
+        self.model_batch = EXPORT_AUDIO_LENGTH // fold_window if use_batch_fold else 1
+        self.kg_net = KGNet_Real(L, fc_dim, rnn_layers, rnn_dim, self.model_batch)
         self.n_freq = NFFT // 2 + 1  # 513 frequency bins
         self.max_frames = max_frames
-        self.inv_int16 = torch.tensor([INV_INT16], dtype=torch.float16 if OUT_AUDIO_DTYPE == 'F16' else torch.float32)
-        self.output_pcm_scale = 32767.0
+        self.input_pcm_scale_folded = "int" in IN_AUDIO_DTYPE.lower() and custom_stft.input_scale != 1.0
+        self.output_pcm_scale_folded = "int" in OUT_AUDIO_DTYPE.lower() and custom_istft.output_scale != 1.0
         self.in_sample_rate = in_sample_rate
         self.out_sample_rate = out_sample_rate
         self.in_sample_rate_scale = in_sample_rate / 16000.0
@@ -220,10 +233,10 @@ class NKF(nn.Module):
 
         self.register_buffer('h_prior_real_buffer', torch.zeros(1, self.n_freq, L, dtype=torch.float32))
         self.register_buffer('h_prior_imag_buffer', torch.zeros(1, self.n_freq, L, dtype=torch.float32))
-        self.register_buffer('h_rr_buffer', torch.zeros(rnn_layers, self.n_freq, rnn_dim, dtype=torch.float32))
-        self.register_buffer('h_ir_buffer', torch.zeros(rnn_layers, self.n_freq, rnn_dim, dtype=torch.float32))
-        self.register_buffer('h_ri_buffer', torch.zeros(rnn_layers, self.n_freq, rnn_dim, dtype=torch.float32))
-        self.register_buffer('h_ii_buffer', torch.zeros(rnn_layers, self.n_freq, rnn_dim, dtype=torch.float32))
+        self.register_buffer('h_rr_buffer', torch.zeros(rnn_layers, self.model_batch * self.n_freq, rnn_dim, dtype=torch.float32))
+        self.register_buffer('h_ir_buffer', torch.zeros(rnn_layers, self.model_batch * self.n_freq, rnn_dim, dtype=torch.float32))
+        self.register_buffer('h_ri_buffer', torch.zeros(rnn_layers, self.model_batch * self.n_freq, rnn_dim, dtype=torch.float32))
+        self.register_buffer('h_ii_buffer', torch.zeros(rnn_layers, self.model_batch * self.n_freq, rnn_dim, dtype=torch.float32))
         self.register_buffer('zeros_pad', torch.zeros(1, self.n_freq, L - 1, dtype=torch.float32))
 
     def cache_export_constants_(self):
@@ -241,7 +254,7 @@ class NKF(nn.Module):
         if self.use_batch_fold:
             far_end_audio = far_end_audio.reshape(-1, 1, self.fold_window)
             near_end_audio = near_end_audio.reshape(-1, 1, self.fold_window)
-        b = far_end_audio.shape[0]
+        b = self.model_batch
         audio_len = far_end_audio.shape[-1] if DYNAMIC_AXES else INPUT_AUDIO_LENGTH
         audio_pair = torch.cat([far_end_audio, near_end_audio], dim=0).float()
         if self.resample_before_centering:
@@ -251,8 +264,8 @@ class NKF(nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        if "int" in IN_AUDIO_DTYPE.lower():
-            audio_pair = audio_pair * self.inv_int16      # int16 PCM -> [-1, 1]; F16/F32 inputs already arrive normalized.
+        if "int" in IN_AUDIO_DTYPE.lower() and not self.input_pcm_scale_folded:
+            audio_pair = audio_pair * INV_INT16      # int16 PCM -> [-1, 1]; F16/F32 inputs already arrive normalized.
         audio_pair = audio_pair - audio_pair.mean(dim=2, keepdim=True)
         if self.resample_after_centering:
             audio_pair = torch.nn.functional.interpolate(
@@ -267,20 +280,27 @@ class NKF(nn.Module):
         ref_real, mic_real = pair_real.split(b, dim=0)
         ref_imag, mic_imag = pair_imag.split(b, dim=0)
 
-        T = ref_real.shape[2]
-        if T > self.max_frames:
+        T = ref_real.shape[2] if DYNAMIC_AXES else self.max_frames
+        if DYNAMIC_AXES and T > self.max_frames:
             raise ValueError(f"Input produces {T} frames, but MAX_SIGNAL_LENGTH is {self.max_frames}.")
 
-        # Use registered buffers directly (already zero-initialized)
-        h_prior_real = self.h_prior_real_buffer.expand(b, -1, -1)
-        h_prior_imag = self.h_prior_imag_buffer.expand(b, -1, -1)
-        h_rr = self.h_rr_buffer.repeat(1, b, 1)
-        h_ir = self.h_ir_buffer.repeat(1, b, 1)
-        h_ri = self.h_ri_buffer.repeat(1, b, 1)
-        h_ii = self.h_ii_buffer.repeat(1, b, 1)
+        # Static batch one uses the registered buffers directly; the optional folded profile
+        # takes its separate, compile-time branch.
+        if self.model_batch == 1:
+            h_prior_real = self.h_prior_real_buffer
+            h_prior_imag = self.h_prior_imag_buffer
+            zeros_pad = self.zeros_pad
+        else:
+            h_prior_real = self.h_prior_real_buffer.expand(b, -1, -1)
+            h_prior_imag = self.h_prior_imag_buffer.expand(b, -1, -1)
+            zeros_pad = self.zeros_pad.expand(b, -1, -1)
+        h_rr = self.h_rr_buffer
+        h_ir = self.h_ir_buffer
+        h_ri = self.h_ri_buffer
+        h_ii = self.h_ii_buffer
 
-        ref_real_padded = torch.cat([self.zeros_pad.expand(b, -1, -1), ref_real], dim=2)
-        ref_imag_padded = torch.cat([self.zeros_pad.expand(b, -1, -1), ref_imag], dim=2)
+        ref_real_padded = torch.cat((zeros_pad, ref_real), dim=2)
+        ref_imag_padded = torch.cat((zeros_pad, ref_imag), dim=2)
 
         # Frame-by-frame Kalman filter loop
         echo_frames_real = []
@@ -296,9 +316,14 @@ class NKF(nn.Module):
         # input = cat([xt, mic, zeros_L]) — reuse h_prior_real/imag as the L-wide zero block
         input_real = torch.cat([xt_real, mic_real_t, h_prior_real], dim=2)
         input_imag = torch.cat([xt_imag, mic_imag_t, h_prior_imag], dim=2)
+        input_pair = torch.cat((input_real, input_imag), dim=2).transpose(1, 2)
 
         # KGNet forward
-        kg_real, kg_imag, h_rr, h_ir, h_ri, h_ii = self.kg_net(input_real, input_imag, h_rr, h_ir, h_ri, h_ii)
+        kg_pair, h_rr, h_ir, h_ri, h_ii = self.kg_net(input_pair, h_rr, h_ir, h_ri, h_ii)
+        kg_real, kg_imag = kg_pair.split(1, dim=0)
+        if self.model_batch != 1:
+            kg_real = kg_real.reshape(self.model_batch, self.n_freq, self.L)
+            kg_imag = kg_imag.reshape(self.model_batch, self.n_freq, self.L)
 
         # h_post = kg * e (h_prior=0, so addition term vanishes)
         h_post_real = kg_real * mic_real_t - kg_imag * mic_imag_t
@@ -330,9 +355,14 @@ class NKF(nn.Module):
             # xt: (1, F, L), e: (1, F, 1), dh: (1, F, L) -> total: (1, F, 2*L+1)
             input_real = torch.cat([xt_real, e_real, dh_real], dim=2)
             input_imag = torch.cat([xt_imag, e_imag, dh_imag], dim=2)
+            input_pair = torch.cat((input_real, input_imag), dim=2).transpose(1, 2)
 
             # KGNet forward
-            kg_real, kg_imag, h_rr, h_ir, h_ri, h_ii = self.kg_net(input_real, input_imag, h_rr, h_ir, h_ri, h_ii)
+            kg_pair, h_rr, h_ir, h_ri, h_ii = self.kg_net(input_pair, h_rr, h_ir, h_ri, h_ii)
+            kg_real, kg_imag = kg_pair.split(1, dim=0)
+            if self.model_batch != 1:
+                kg_real = kg_real.reshape(self.model_batch, self.n_freq, self.L)
+                kg_imag = kg_imag.reshape(self.model_batch, self.n_freq, self.L)
 
             # h_post update (ONNX-compatible, no in-place ops)
             h_post_real = h_prior_real + kg_real * e_real - kg_imag * e_imag
@@ -365,8 +395,8 @@ class NKF(nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        if "int" in OUT_AUDIO_DTYPE.lower():
-            aec_results = aec_results * self.output_pcm_scale      # [-1, 1] -> int16 PCM; F16/F32 outputs stay normalized.
+        if "int" in OUT_AUDIO_DTYPE.lower() and not self.output_pcm_scale_folded:
+            aec_results = aec_results * 32767.0      # [-1, 1] -> int16 PCM; F16/F32 outputs stay normalized.
         if self.output_resample_after_pcm:
             aec_results = torch.nn.functional.interpolate(
                 aec_results,
@@ -435,56 +465,81 @@ def _run_inference_demo():
 
 
 print('Export start ...')
-with torch.inference_mode():
-    custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant").eval()
-    custom_istft = STFT_Process(model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant").eval()
-    nkf_export = NKF(
-        L=FILTER_ORDER,
-        fc_dim=FC_DIM,
-        rnn_layers=RNN_LAYERS,
-        rnn_dim=RNN_DIM,
-        custom_stft=custom_stft,
-        custom_istft=custom_istft,
-        max_frames=MAX_SIGNAL_LENGTH,
-        in_sample_rate=IN_SAMPLE_RATE,
-        out_sample_rate=OUT_SAMPLE_RATE,
-        use_batch_fold=USE_BATCH_FOLD,
-        fold_window=FOLD_WINDOW_LENGTH
-    ).eval()
-    original_state_dict = torch.load(checkpoint_path, map_location='cpu')
-    nkf_export = load_nkf_weights(nkf_export, original_state_dict)
-    nkf_export = nkf_export.float().eval()
-    nkf_export.cache_export_constants_()
+final_path = Path(onnx_model_A).expanduser().resolve()
+final_path.parent.mkdir(parents=True, exist_ok=True)
+# Remove raw artifacts produced by older versions of this exporter. The current
+# raw graph lives only in TemporaryDirectory and is deleted automatically.
+for legacy_raw_path in (
+    final_path.with_name(f'{final_path.stem}.raw.onnx'),
+    final_path.with_name(f'{final_path.stem}.raw_Metadata.onnx'),
+):
+    legacy_raw_path.unlink(missing_ok=True)
 
-    if "32" in IN_AUDIO_DTYPE:
-        IN_TORCH_DTYPE = torch.float32
-    elif "int" in IN_AUDIO_DTYPE.lower():
-        IN_TORCH_DTYPE = torch.int16
-    else:
-        IN_TORCH_DTYPE = torch.float16
-    near_end_audio = torch.ones(1, 1, EXPORT_AUDIO_LENGTH, dtype=IN_TORCH_DTYPE)
-    far_end_audio = torch.ones(1, 1, EXPORT_AUDIO_LENGTH, dtype=IN_TORCH_DTYPE)
+with tempfile.TemporaryDirectory(prefix='nkf_aec_export_') as temp_dir:
+    raw_model_path = Path(temp_dir) / 'NKF_AEC.raw.onnx'
+    rewritten_model_path = Path(temp_dir) / final_path.name
+    with torch.inference_mode():
+        custom_stft = STFT_Process(
+            model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
+            max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
+            input_scale=INV_INT16 if "int" in IN_AUDIO_DTYPE.lower() else 1.0,
+        ).eval()
+        custom_istft = STFT_Process(
+            model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
+            max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
+            static_norm=not DYNAMIC_AXES,
+            output_scale=32767.0 if "int" in OUT_AUDIO_DTYPE.lower() else 1.0,
+        ).eval()
+        nkf_export = NKF(
+            L=FILTER_ORDER,
+            fc_dim=FC_DIM,
+            rnn_layers=RNN_LAYERS,
+            rnn_dim=RNN_DIM,
+            custom_stft=custom_stft,
+            custom_istft=custom_istft,
+            max_frames=MAX_SIGNAL_LENGTH,
+            in_sample_rate=IN_SAMPLE_RATE,
+            out_sample_rate=OUT_SAMPLE_RATE,
+            use_batch_fold=USE_BATCH_FOLD,
+            fold_window=FOLD_WINDOW_LENGTH
+        ).eval()
+        original_state_dict = torch.load(checkpoint_path, map_location='cpu')
+        nkf_export = load_nkf_weights(nkf_export, original_state_dict)
+        nkf_export = nkf_export.float().eval()
+        nkf_export.cache_export_constants_()
 
-    Path(onnx_model_A).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
-        nkf_export,
-        (far_end_audio, near_end_audio),
-        onnx_model_A,
-        input_names=['far_end_audio', 'near_end_audio'],
-        output_names=['aec_audio'],
-        do_constant_folding=True,
-        dynamic_axes={
-            'far_end_audio': {2: 'audio_len'},
-            'near_end_audio': {2: 'audio_len'},
-            'aec_audio': {2: 'audio_len'}
-        } if DYNAMIC_AXES else None,
-        opset_version=OPSET,
-        dynamo=False
-    )
-    del nkf_export
-    del near_end_audio
-    del far_end_audio
-    gc.collect()
+        if "32" in IN_AUDIO_DTYPE:
+            IN_TORCH_DTYPE = torch.float32
+        elif "int" in IN_AUDIO_DTYPE.lower():
+            IN_TORCH_DTYPE = torch.int16
+        else:
+            IN_TORCH_DTYPE = torch.float16
+        near_end_audio = torch.ones(1, 1, EXPORT_AUDIO_LENGTH, dtype=IN_TORCH_DTYPE)
+        far_end_audio = torch.ones(1, 1, EXPORT_AUDIO_LENGTH, dtype=IN_TORCH_DTYPE)
+
+        torch.onnx.export(
+            nkf_export,
+            (far_end_audio, near_end_audio),
+            raw_model_path,
+            input_names=['far_end_audio', 'near_end_audio'],
+            output_names=['aec_audio'],
+            do_constant_folding=True,
+            dynamic_axes={
+                'far_end_audio': {2: 'audio_len'},
+                'near_end_audio': {2: 'audio_len'},
+                'aec_audio': {2: 'audio_len'}
+            } if DYNAMIC_AXES else None,
+            opset_version=OPSET,
+            dynamo=False
+        )
+        del nkf_export
+        del near_end_audio
+        del far_end_audio
+        gc.collect()
+
+    rewrite_report = rewrite_initializer_identities(raw_model_path, rewritten_model_path)
+    rewritten_model_path.replace(final_path)
+print(f"Targeted ONNX rewrite: {rewrite_report['deleted_nodes']} Identity aliases removed")
 model_metadata = build_audio_metadata_from_globals(
     globals(), producer=Path(__file__).name, model_name="NKF_AEC", task="aec", model_family="nkf_aec",
     max_dynamic_audio_seconds=4, normalize_audio_default=False, input_channels=1, output_channels=1,

@@ -103,7 +103,7 @@ class OptimizerConfig:
     dynamic_default_tensor_type: int | None = None
     dynamic_nodes_to_exclude: NodeSelector = None
     dynamic_nodes_to_include: NodeSelector = None
-    # float16 defaults: opt-in only, with waveform/norm-safe op blocks
+    # float16 defaults: opt-in only; models can add targeted waveform/norm guards
     f16_keep_io_types: bool = False
     f16_force_initializers: bool = True
     f16_min_positive_val: float = 1e-7
@@ -385,9 +385,10 @@ def optimize_onnx_model(
 ) -> None:
     from onnxruntime.transformers.optimizer import optimize_model
 
+    opt_level = config.optimizer_level if rp.opt_level is None else rp.opt_level
     kwargs = {
         "use_gpu": rp.use_gpu,
-        "opt_level": config.optimizer_level if rp.opt_level is None else rp.opt_level,
+        "opt_level": opt_level,
         "num_heads": _resolve_int(rp.num_heads, src_path),
         "hidden_size": _resolve_int(rp.hidden_size, src_path),
         "optimization_options": build_fusion_options(config),
@@ -398,7 +399,18 @@ def optimize_onnx_model(
     if rp.provider is not None:
         kwargs["provider"] = rp.provider
 
-    model = optimize_model(model_path, **kwargs)
+    if opt_level == 0 and rp.only_onnxruntime:
+        # Some mixed-precision policies select one contiguous FP32 region by the
+        # exporter's node names. ORT level 1 rewrites rank-3 MatMul nodes into
+        # Reshape -> Gemm -> Reshape before float16 conversion, fragmenting that
+        # region into hundreds of avoidable FP16 islands. Wrap the graph directly
+        # when level 0 is requested; the second onnxslim pass and runtime ORT
+        # optimizer still apply dtype-aware rewrites after conversion.
+        from onnxruntime.transformers.onnx_model import OnnxModel
+
+        model = OnnxModel(onnx.load(model_path))
+    else:
+        model = optimize_model(model_path, **kwargs)
     if use_fp16:
         model.convert_float_to_float16(
             keep_io_types=config.f16_keep_io_types,
@@ -407,7 +419,7 @@ def optimize_onnx_model(
             max_finite_val=config.f16_max_finite_val,
             min_positive_val=config.f16_min_positive_val,
             op_block_list=rp.f16_op_block_list,
-            node_block_list=rp.f16_node_block_list,
+            node_block_list=_resolve_nodes(rp.f16_node_block_list, src_path),
         )
         renamed = _deduplicate_node_names(model.model.graph)
         if renamed:
@@ -531,8 +543,8 @@ def run_optimizer(config: OptimizerConfig) -> None:
 
     if any(_uses_fp16(plan) for plan in config.model_plans.values()):
         print(
-            "FP16 conversion is enabled explicitly. The default conversion keeps graph I/O types and "
-            "blocks waveform/norm-sensitive ops from float16. Validate with realistic audio before use."
+            "FP16 conversion is enabled explicitly. Configured node/operator guards remain in FP32; "
+            "validate each model with realistic audio before use."
         )
 
     for name, rp in resolved.items():

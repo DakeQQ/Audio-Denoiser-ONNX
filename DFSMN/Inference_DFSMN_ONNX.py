@@ -35,7 +35,7 @@ def _resolve_onnx_model_path(default_model_path: str) -> str:
 onnx_model_A = _resolve_onnx_model_path(onnx_model_A)
 
 
-ORT_Accelerate_Providers  = []          # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
+ORT_Accelerate_Providers  = []  # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 ORT_LOG                    = False      # Enable ONNX Runtime logging for debugging. Set to False for best performance.
 ORT_FP16                   = False      # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.

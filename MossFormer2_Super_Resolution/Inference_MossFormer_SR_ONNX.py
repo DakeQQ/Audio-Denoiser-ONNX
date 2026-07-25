@@ -13,7 +13,13 @@ for _candidate in Path(__file__).resolve().parents:
         if str(_candidate) not in sys.path:
             sys.path.insert(0, str(_candidate))
         break
-from audio_onnx_metadata import load_runtime_metadata, runtime_config_from_metadata, validate_audio_metadata
+from audio_onnx_metadata import (
+    load_runtime_metadata,
+    numpy_dtype_from_onnx_meta,
+    resolve_onnx_shape,
+    runtime_config_from_metadata,
+    validate_audio_metadata,
+)
 from Example_Audio import model_audio_path
 
 # --- File paths -------------------------------------------------------------
@@ -155,22 +161,12 @@ def _build_session_opts_ort() -> onnxruntime.SessionOptions:
     return opts
 
 
-def _numpy_dtype_from_meta(meta):
-    meta_type = meta.type
-    if "int16" in meta_type:
-        return np.int16
-    if "int32" in meta_type:
-        return np.int32
-    if "int64" in meta_type:
-        return np.int64
-    if "float16" in meta_type:
-        return np.float16
-    return np.float32
-
-
-def _ort_zeros(shape, dtype):
+def _ortvalue_from_meta(meta, runtime_shape):
     return onnxruntime.OrtValue.ortvalue_from_numpy(
-        np.zeros(shape, dtype=dtype),
+        np.zeros(
+            resolve_onnx_shape(meta, runtime_shape),
+            dtype=numpy_dtype_from_onnx_meta(meta),
+        ),
         device_type,
         DEVICE_ID,
     )
@@ -237,8 +233,8 @@ in_name_A = ort_session_A.get_inputs()
 out_name_A = ort_session_A.get_outputs()
 in_name_A0 = in_name_A[0].name
 out_name_A0 = out_name_A[0].name
-input_dtype_np = _numpy_dtype_from_meta(in_name_A[0])
-output_dtype_np = _numpy_dtype_from_meta(out_name_A[0])
+input_dtype_np = numpy_dtype_from_onnx_meta(in_name_A[0])
+output_dtype_np = numpy_dtype_from_onnx_meta(out_name_A[0])
 
 
 def normalise_audio(audio: np.ndarray, input_dtype_np, target_rms=None) -> np.ndarray:
@@ -252,28 +248,31 @@ def normalise_audio(audio: np.ndarray, input_dtype_np, target_rms=None) -> np.nd
         rms = np.sqrt(np.mean(_audio * _audio, dtype=np.float32), dtype=np.float32)
         if rms > 0.0:
             _audio *= (target_rms / (rms + 1e-7))
-        if input_dtype_np == np.int16:
-            np.clip(_audio, -32768.0, 32767.0, out=_audio)
-            return _audio.astype(np.int16)
-        # _audio is already float32, so only a float16 model input needs a further cast.
-        if input_dtype_np == np.float16:
-            return _audio.astype(np.float16)
-        return _audio
-    if input_dtype_np == np.int16:
-        return audio
+        target_dtype = np.dtype(input_dtype_np)
+        if np.issubdtype(target_dtype, np.integer):
+            limits = np.iinfo(target_dtype)
+            np.clip(_audio, limits.min, limits.max, out=_audio)
+        return _audio.astype(target_dtype, copy=False)
     return audio.astype(input_dtype_np, copy=False)
 
 
 # Load the input audio
 print(f"\nTest Input Audio: {test_audio}")
-audio = np.array(AudioSegment.from_file(test_audio).set_channels(1).set_frame_rate(ORIGINAL_SAMPLE_RATE).get_array_of_samples(), dtype=np.int16)
+audio_segment = AudioSegment.from_file(test_audio).set_frame_rate(ORIGINAL_SAMPLE_RATE)
+input_shape = in_name_A[0].shape
+if len(input_shape) != 3:
+    raise ValueError(f"Expected a rank-3 ONNX audio input, got shape {input_shape}.")
+input_channels = input_shape[1] if isinstance(input_shape[1], int) else audio_segment.channels
+audio = np.array(
+    audio_segment.set_channels(input_channels).get_array_of_samples(),
+    dtype=np.int16,
+)
 audio = normalise_audio(audio, input_dtype_np)
-audio_len = len(audio)
-audio = audio.reshape(1, 1, -1)
-shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
-shape_value_out = ort_session_A._outputs_meta[0].shape[-1]
-if isinstance(shape_value_in, str):
-    INPUT_AUDIO_LENGTH = min(80000, audio_len)
+audio = audio.reshape(-1, input_channels).T[np.newaxis, ...]
+audio_len = audio.shape[-1]
+shape_value_in = input_shape[-1]
+if not isinstance(shape_value_in, int):
+    INPUT_AUDIO_LENGTH = min(MAX_DYNAMIC_AUDIO_SECONDS * ORIGINAL_SAMPLE_RATE, audio_len)
 else:
     INPUT_AUDIO_LENGTH = shape_value_in
 
@@ -289,7 +288,10 @@ else:
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / STEP_IN)) + 1
 total_in = (num_windows - 1) * STEP_IN + INPUT_AUDIO_LENGTH
 if total_in > audio_len:
-    audio = np.concatenate((audio, np.zeros((1, 1, total_in - audio_len), dtype=audio.dtype)), axis=-1)
+    audio = np.concatenate(
+        (audio, np.zeros((*audio.shape[:-1], total_in - audio_len), dtype=audio.dtype)),
+        axis=-1,
+    )
 super_audio_len = audio_len * SUPER_SAMPLE_RATE // ORIGINAL_SAMPLE_RATE
 
 taper = np.ones(OUT_LEN, dtype=np.float32)
@@ -299,19 +301,21 @@ if RAMP_OUT > 0:
     taper[-RAMP_OUT:] = hann[RAMP_OUT:]
 
 
-output_audio_length = shape_value_out if isinstance(shape_value_out, int) else OUT_LEN
-input_buffer = _ort_zeros((1, 1, INPUT_AUDIO_LENGTH), input_dtype_np)
-output_buffer = _ort_zeros((1, 1, output_audio_length), output_dtype_np)
+input_buffer = _ortvalue_from_meta(
+    in_name_A[0],
+    audio[..., :INPUT_AUDIO_LENGTH].shape,
+)
 binding_A = ort_session_A.io_binding()
 binding_A.bind_ortvalue_input(in_name_A0, input_buffer)
-binding_A.bind_ortvalue_output(out_name_A0, output_buffer)
+binding_A.bind_output(out_name_A0, device_type, DEVICE_ID)
 
 
 def process_segment(_slice_start, _audio):
     seg = _audio[:, :, _slice_start: _slice_start + INPUT_AUDIO_LENGTH]
     _update_ortvalue(input_buffer, seg)
     _run_iobinding(ort_session_A, binding_A)
-    return _slice_start, np.array(output_buffer.numpy(), copy=True).reshape(-1)
+    output = binding_A.get_outputs()[0]
+    return _slice_start, np.array(output.numpy(), copy=True).reshape(-1)
 
 
 # Start to run MossFormer_SR

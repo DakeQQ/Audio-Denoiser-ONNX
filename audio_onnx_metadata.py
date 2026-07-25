@@ -2,6 +2,7 @@ import gc
 import shutil
 from pathlib import Path
 
+import numpy as np
 import onnx
 
 
@@ -310,6 +311,63 @@ def _static_int_dim(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+_ONNX_TENSOR_TYPE_TO_NUMPY = {
+    "tensor(bool)": np.bool_,
+    "tensor(complex64)": np.complex64,
+    "tensor(complex128)": np.complex128,
+    "tensor(double)": np.float64,
+    "tensor(float)": np.float32,
+    "tensor(float16)": np.float16,
+    "tensor(int8)": np.int8,
+    "tensor(int16)": np.int16,
+    "tensor(int32)": np.int32,
+    "tensor(int64)": np.int64,
+    "tensor(string)": np.str_,
+    "tensor(uint8)": np.uint8,
+    "tensor(uint16)": np.uint16,
+    "tensor(uint32)": np.uint32,
+    "tensor(uint64)": np.uint64,
+}
+
+
+def numpy_dtype_from_onnx_meta(node_arg):
+    try:
+        return _ONNX_TENSOR_TYPE_TO_NUMPY[node_arg.type]
+    except KeyError as error:
+        raise TypeError(
+            f"Unsupported ONNX tensor type {node_arg.type!r} for {node_arg.name!r}."
+        ) from error
+
+
+def resolve_onnx_shape(node_arg, runtime_shape):
+    model_shape = tuple(node_arg.shape)
+    runtime_shape = tuple(runtime_shape)
+    if len(runtime_shape) != len(model_shape):
+        raise ValueError(
+            f"ONNX value {node_arg.name!r} has rank {len(model_shape)}, "
+            f"but runtime shape {runtime_shape} has rank {len(runtime_shape)}."
+        )
+
+    resolved_shape = []
+    for axis, (model_dim, runtime_dim) in enumerate(zip(model_shape, runtime_shape)):
+        static_dim = _static_int_dim(model_dim)
+        if static_dim is not None:
+            if runtime_dim is not None and int(runtime_dim) != static_dim:
+                raise ValueError(
+                    f"ONNX value {node_arg.name!r} axis {axis} requires {static_dim}, "
+                    f"but runtime shape {runtime_shape} requests {runtime_dim}."
+                )
+            resolved_shape.append(static_dim)
+            continue
+        if runtime_dim is None:
+            raise ValueError(
+                f"ONNX value {node_arg.name!r} axis {axis} ({model_dim!r}) is dynamic; "
+                "provide its runtime dimension."
+            )
+        resolved_shape.append(int(runtime_dim))
+    return tuple(resolved_shape)
 
 
 def validate_audio_metadata(reader, session):

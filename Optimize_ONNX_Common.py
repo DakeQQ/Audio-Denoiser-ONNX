@@ -9,13 +9,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import onnx
 import onnx.version_converter
 from onnx import TensorProto
-from onnxruntime.quantization import QuantType, quant_utils, quantize_dynamic
+from onnxruntime.quantization import (
+    QuantType,
+    matmul_nbits_quantizer,
+    quant_utils,
+    quantize_dynamic,
+)
 from onnxslim import slim
 
 from audio_onnx_metadata import preserve_optimized_metadata, read_source_metadata
+from k_quant_helpers import quantize_matmul_model
 
 
 NodeSelector = list[str] | Callable[[str], list[str] | None] | None
@@ -24,8 +31,20 @@ NoShapeInfer = bool | Literal["auto"]
 SymbolicShapeInfer = bool | Literal["auto"]
 
 _DYNAMIC_METHODS = {"DYNAMIC", "DYNAMIC_Q8"}
-_VALID_METHODS = {"F32", "F16", *_DYNAMIC_METHODS}
+_WEIGHT_ONLY_BITS = {"Q4": 4, "Q8": 8}
+_VALID_METHODS = {"F32", "F16", *_DYNAMIC_METHODS, *_WEIGHT_ONLY_BITS}
 _DYNAMIC_WEIGHT_TYPES = {"QUINT8": QuantType.QUInt8, "QINT8": QuantType.QInt8}
+_WEIGHT_ONLY_ALGORITHMS = {
+    "AFFINE_REFINE_V2": frozenset({4, 8}),
+    "DEFAULT": frozenset({4, 8}),
+    "HQQ": frozenset({4, 8}),
+    "RTN": frozenset({4}),
+    "k_quant": frozenset({4}),
+}
+_QUANT_FORMATS = {
+    "QOPERATOR": quant_utils.QuantFormat.QOperator,
+    "QDQ": quant_utils.QuantFormat.QDQ,
+}
 _DEFAULT_F16_OP_BLOCK_LIST = [
     "DynamicQuantizeLinear",
     "DequantizeLinear",
@@ -47,7 +66,14 @@ _DEFAULT_F16_OP_BLOCK_LIST = [
 class Plan:
     """Per-model optimization recipe; ``None`` fields inherit ``OptimizerConfig`` defaults."""
 
-    method: str = "F32"  # F32 | F16 | DYNAMIC | DYNAMIC_Q8
+    method: str = "F32"  # Q4 | Q8 | F32 | F16 | DYNAMIC | DYNAMIC_Q8
+    algo: str | None = None
+    op_types: tuple[str, ...] | None = None
+    axes: tuple[int, ...] | None = None
+    block_size: int | None = None
+    accuracy_level: int | None = None
+    symmetric: bool | None = None
+    quant_format: str | None = None
     num_heads: IntValue = 0
     hidden_size: IntValue = 0
     opt_level: int | None = None
@@ -96,6 +122,15 @@ class OptimizerConfig:
     slim_skip_optimizations: object = None
     slim_size_threshold: int | None = None
     slim_no_constant_folding: bool = False
+    fuse_consecutive_reshapes: bool = True
+    # weight-only Q4/Q8 defaults
+    weight_only_algorithm: str = "AFFINE_REFINE_V2"
+    weight_only_op_types: tuple[str, ...] = ("MatMul",)
+    weight_only_axes: tuple[int, ...] = (0,)
+    weight_only_block_size: int = 32
+    weight_only_accuracy_level: int = 4
+    weight_only_symmetric: bool = False
+    weight_only_quant_format: str = "QOperator"
     # dynamic INT8 defaults, used only for explicit DYNAMIC/DYNAMIC_Q8 plans
     dynamic_weight_type: str = "QInt8"
     dynamic_per_channel: bool = True
@@ -116,6 +151,13 @@ class OptimizerConfig:
 @dataclass
 class ResolvedPlan:
     method: str
+    algo: str
+    op_types: tuple[str, ...]
+    axes: tuple[int, ...]
+    block_size: int
+    accuracy_level: int
+    symmetric: bool
+    quant_format: str
     num_heads: IntValue
     hidden_size: IntValue
     opt_level: int | None
@@ -151,6 +193,13 @@ def _uses_fp16(plan: Plan) -> bool:
 def resolve_plan(plan: Plan, config: OptimizerConfig) -> ResolvedPlan:
     return ResolvedPlan(
         method=plan.method.upper(),
+        algo=_pick(plan.algo, config.weight_only_algorithm),
+        op_types=_pick(plan.op_types, config.weight_only_op_types),
+        axes=_pick(plan.axes, config.weight_only_axes),
+        block_size=_pick(plan.block_size, config.weight_only_block_size),
+        accuracy_level=_pick(plan.accuracy_level, config.weight_only_accuracy_level),
+        symmetric=_pick(plan.symmetric, config.weight_only_symmetric),
+        quant_format=_pick(plan.quant_format, config.weight_only_quant_format).upper(),
         num_heads=plan.num_heads,
         hidden_size=plan.hidden_size,
         opt_level=plan.opt_level,
@@ -179,11 +228,30 @@ def resolve_plan(plan: Plan, config: OptimizerConfig) -> ResolvedPlan:
 def validate_plan(name: str, rp: ResolvedPlan) -> None:
     if rp.method not in _VALID_METHODS:
         raise ValueError(
-            f"[{name}] unknown method {rp.method!r}; use 'F32', 'F16', 'DYNAMIC', or 'DYNAMIC_Q8'. "
-            "Weight-only Q2/Q4/Q8 quantization is intentionally not part of the audio-denoiser default path."
+            f"[{name}] unknown method {rp.method!r}; choose one of {sorted(_VALID_METHODS)}."
         )
     if rp.method in _DYNAMIC_METHODS and rp.dynamic_weight_type not in _DYNAMIC_WEIGHT_TYPES:
         raise ValueError(f"[{name}] unknown dynamic_weight_type; choose 'QUInt8' or 'QInt8'.")
+    if rp.method in _WEIGHT_ONLY_BITS:
+        bits = _WEIGHT_ONLY_BITS[rp.method]
+        if rp.algo not in _WEIGHT_ONLY_ALGORITHMS:
+            raise ValueError(
+                f"[{name}] unknown weight-only algorithm {rp.algo!r}; "
+                f"choose one of {sorted(_WEIGHT_ONLY_ALGORITHMS)}."
+            )
+        if bits not in _WEIGHT_ONLY_ALGORITHMS[rp.algo]:
+            raise ValueError(f"[{name}] {rp.algo} does not support {rp.method}.")
+        if rp.op_types != ("MatMul",) or rp.axes != (0,):
+            raise ValueError(
+                f"[{name}] the audio weight-only path currently supports constant MatMul weights "
+                f"on axis 0 only; got op_types={rp.op_types}, axes={rp.axes}."
+            )
+        if rp.block_size < 16 or rp.block_size > 256 or rp.block_size & (rp.block_size - 1):
+            raise ValueError(f"[{name}] block_size must be a power of two in [16, 256].")
+        if rp.quant_format not in _QUANT_FORMATS:
+            raise ValueError(f"[{name}] quant_format must be 'QOperator' or 'QDQ'.")
+        if rp.quant_format == "QDQ" and (rp.algo != "DEFAULT" or bits != 4):
+            raise ValueError(f"[{name}] QDQ supports only DEFAULT Q4.")
 
 
 def _remove_external_files(model_path: str) -> None:
@@ -278,6 +346,50 @@ def _resolve_symbolic_shape_infer(setting: SymbolicShapeInfer, dynamic_axes: boo
     return bool(setting)
 
 
+def fuse_consecutive_reshapes(model_path: str) -> int:
+    """Remove a first Reshape when the sole following Reshape has an explicit shape."""
+    model = onnx.load(model_path)
+    graph = model.graph
+    graph_outputs = {value.name for value in graph.output}
+    fused = 0
+    while True:
+        producer = {output: node for node in graph.node for output in node.output}
+        consumers: dict[str, list] = {}
+        for node in graph.node:
+            for value in node.input:
+                consumers.setdefault(value, []).append(node)
+        initializers = {tensor.name: tensor for tensor in graph.initializer}
+        first_to_remove = None
+        for second in graph.node:
+            if second.op_type != "Reshape" or len(second.input) < 2:
+                continue
+            first = producer.get(second.input[0])
+            shape_tensor = initializers.get(second.input[1])
+            if first is None or first.op_type != "Reshape" or shape_tensor is None:
+                continue
+            middle = first.output[0]
+            if middle in graph_outputs or len(consumers.get(middle, ())) != 1:
+                continue
+            allowzero = next((attr.i for attr in second.attribute if attr.name == "allowzero"), 0)
+            shape = np.asarray(onnx.numpy_helper.to_array(shape_tensor)).reshape(-1)
+            if allowzero or np.any(shape == 0) or np.count_nonzero(shape == -1) > 1:
+                continue
+            second.input[0] = first.input[0]
+            first_to_remove = first
+            break
+        if first_to_remove is None:
+            break
+        kept = [node for node in graph.node if id(node) != id(first_to_remove)]
+        graph.ClearField("node")
+        graph.node.extend(kept)
+        fused += 1
+    if fused:
+        _save_model(model, model_path, os.path.exists(model_path + ".data"))
+    del model
+    gc.collect()
+    return fused
+
+
 def run_onnxslim(model_path: str, external: bool, config: OptimizerConfig, no_shape_infer: bool) -> None:
     def _slim() -> None:
         slim(
@@ -291,6 +403,10 @@ def run_onnxslim(model_path: str, external: bool, config: OptimizerConfig, no_sh
             save_as_external_data=external,
             verbose=False,
         )
+        if config.fuse_consecutive_reshapes:
+            fused = fuse_consecutive_reshapes(model_path)
+            if fused:
+                print(f"  Fused {fused} semantics-safe consecutive Reshape pairs.")
 
     data_path = model_path + ".data"
     if not external or not os.path.exists(data_path):
@@ -460,6 +576,74 @@ def quantize_dynamic_int8(src_path: str, dst_path: str, rp: ResolvedPlan, extern
     gc.collect()
 
 
+def quantize_weight_only(src_path: str, dst_path: str, rp: ResolvedPlan, external: bool) -> None:
+    bits = _WEIGHT_ONLY_BITS[rp.method]
+    print(
+        f"  Quantizing weights ({rp.algo}, {bits}-bit, block={rp.block_size}, "
+        f"symmetric={rp.symmetric}, format={rp.quant_format})..."
+    )
+    model = quant_utils.load_model_with_shape_infer(Path(src_path))
+    include = set(_resolve_nodes(rp.nodes_to_include, src_path) or ()) or None
+    exclude = set(_resolve_nodes(rp.nodes_to_exclude, src_path) or ()) or None
+    if rp.algo in ("AFFINE_REFINE_V2", "k_quant", "RTN"):
+        quantize_matmul_model(
+            model,
+            bits=bits,
+            block_size=rp.block_size,
+            algorithm=rp.algo,
+            symmetric=rp.symmetric,
+            accuracy_level=rp.accuracy_level,
+            nodes_to_include=include,
+            nodes_to_exclude=exclude,
+        )
+        _save_model(model, dst_path, external)
+        del model
+        gc.collect()
+        return
+
+    quant_axes = tuple(zip(rp.op_types, rp.axes))
+    common = {
+        "quant_format": _QUANT_FORMATS[rp.quant_format],
+        "op_types_to_quantize": rp.op_types,
+    }
+    if rp.algo == "RTN":
+        algorithm = matmul_nbits_quantizer.RTNWeightOnlyQuantConfig(**common)
+    elif rp.algo == "HQQ":
+        algorithm = matmul_nbits_quantizer.HQQWeightOnlyQuantConfig(
+            block_size=rp.block_size,
+            bits=bits,
+            axis=rp.axes[0],
+            quant_axes=quant_axes,
+            **common,
+        )
+    else:
+        algorithm = matmul_nbits_quantizer.DefaultWeightOnlyQuantConfig(
+            block_size=rp.block_size,
+            is_symmetric=rp.symmetric,
+            accuracy_level=rp.accuracy_level,
+            quant_axes=quant_axes,
+            bits=bits,
+            **common,
+        )
+    quantizer = matmul_nbits_quantizer.MatMulNBitsQuantizer(
+        model,
+        bits=bits,
+        block_size=rp.block_size,
+        is_symmetric=rp.symmetric,
+        accuracy_level=rp.accuracy_level,
+        quant_format=_QUANT_FORMATS[rp.quant_format],
+        op_types_to_quantize=rp.op_types,
+        quant_axes=quant_axes,
+        algo_config=algorithm,
+        nodes_to_include=list(include) if include else None,
+        nodes_to_exclude=list(exclude) if exclude else None,
+    )
+    quantizer.process()
+    quantizer.model.save_model_to_file(dst_path, external)
+    del model, quantizer
+    gc.collect()
+
+
 def upgrade_opset_version(model_path: str, version: int, external: bool) -> None:
     print(f"  Upgrading opset to {version}...")
     try:
@@ -505,7 +689,10 @@ def process_model(name: str, rp: ResolvedPlan, config: OptimizerConfig) -> bool:
     if dynamic_axes:
         print("  Dynamic axes detected; using dynamic-safe shape-inference settings where configured.")
 
-    resave(src_path, dst_path, external)
+    if rp.method in _WEIGHT_ONLY_BITS:
+        quantize_weight_only(src_path, dst_path, rp, external)
+    else:
+        resave(src_path, dst_path, external)
 
     if rp.optimize:
         print("  Simplifying (onnxslim, pass 1)...")

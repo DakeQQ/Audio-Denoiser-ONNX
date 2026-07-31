@@ -34,8 +34,8 @@ STATIC_SIGNAL_LENGTH  = None if DYNAMIC_AXES else (INPUT_AUDIO_LENGTH + 2 * (NFF
 MAX_SIGNAL_LENGTH     = 2048 if DYNAMIC_AXES else STATIC_SIGNAL_LENGTH # Exact centered-STFT frame count for static export.
 ALPHA_K               = 10                            # The SDAEC parameter, do not edit the value.
 
-IN_AUDIO_DTYPE        = 'INT16'                       # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE       = 'INT16'                       # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
+IN_AUDIO_DTYPE        = 'F32'                         # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+OUT_AUDIO_DTYPE       = 'F32'                         # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16             = float(1.0 / 32768.0)
 OPSET                 = 20                            # ONNX opset.
 

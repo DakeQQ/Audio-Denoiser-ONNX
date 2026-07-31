@@ -28,8 +28,8 @@ IN_SAMPLE_RATE          = 16000        # [8000, 16000, 22500, 24000, 44000, 4800
 OUT_SAMPLE_RATE         = 16000        # [8000, 16000, 22500, 24000, 44000, 48000]; output audio sample rate.
 INPUT_AUDIO_LENGTH      = 32000        # Maximum input audio length in IN_SAMPLE_RATE samples. Higher values yield better quality but time consume.
 PAD_HEAD                = 8000         # ~0.5 Seconds
-IN_AUDIO_DTYPE          = 'INT16'      # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE         = 'INT16'      # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
+IN_AUDIO_DTYPE          = 'F32'        # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+OUT_AUDIO_DTYPE         = 'F32'        # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16               = float(1.0 / 32768.0)
 
 

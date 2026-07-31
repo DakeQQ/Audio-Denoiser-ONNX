@@ -32,8 +32,8 @@ save_generated_audio = str(parent_path / "super_resolution.wav")                
 
 DYNAMIC_AXES         = False    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
 OPSET                = 20
-IN_AUDIO_DTYPE       = 'INT16'  # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE      = 'INT16'  # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
+IN_AUDIO_DTYPE       = 'F32'    # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+OUT_AUDIO_DTYPE      = 'F32'    # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16            = float(1.0 / 32768.0)
 
 ORIGINAL_SAMPLE_RATE = 16000    # The input audio sample rate. This value cannot be changed after the ONNX model is exported.

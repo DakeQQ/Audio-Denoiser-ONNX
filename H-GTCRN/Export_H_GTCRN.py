@@ -49,8 +49,8 @@ WPE_ITER             = 1                              # WPE number of iterations
 IVA_ITER             = 10                             # AuxIVA number of iterations (must match training: 10 iterations for proper source separation).
 CG_SOLVE_ITER        = 6                              # Inner CG steps for the WPE linear solve.
 
-IN_AUDIO_DTYPE       = 'INT16'                         # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE      = 'INT16'                         # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
+IN_AUDIO_DTYPE       = 'F32'                          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+OUT_AUDIO_DTYPE      = 'F32'                          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16            = float(1.0 / 32768.0)
 FOLD_INPUT_PCM_SCALE = False  # Keep PCM normalization before the DFT kernel for exact checkpointed output parity.
 FOLD_OUTPUT_PCM_SCALE = False  # Reassociating COLA division with the non-power-of-two PCM scale can change int16 rounding.

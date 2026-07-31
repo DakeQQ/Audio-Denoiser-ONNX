@@ -40,8 +40,8 @@ HOP_LENGTH            = 960                     # Number of samples between succ
 if HOP_LENGTH > INPUT_AUDIO_LENGTH:
     HOP_LENGTH        = INPUT_AUDIO_LENGTH
 
-IN_AUDIO_DTYPE        = 'INT16'                 # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE       = 'INT16'                 # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
+IN_AUDIO_DTYPE        = 'F32'                   # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+OUT_AUDIO_DTYPE       = 'F32'                   # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INT16_SCALE           = 32768.0
 INV_INT16             = float(1.0 / INT16_SCALE)
 

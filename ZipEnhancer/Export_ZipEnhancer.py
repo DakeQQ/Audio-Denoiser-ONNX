@@ -32,8 +32,8 @@ DYNAMIC_AXES = False              # The default dynamic_axes is the input audio 
 OPSET        = 20                 # The ONNX opset version to export.
 
 # --- Audio I/O dtype --------------------------------------------------------
-IN_AUDIO_DTYPE  = 'INT16'         # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE = 'INT16'         # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
+IN_AUDIO_DTYPE  = 'F32'           # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+OUT_AUDIO_DTYPE = 'F32'           # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 
 # --- Sample rates -----------------------------------------------------------
 MODEL_SAMPLE_RATE = 16000         # ZipEnhancer runs at 16kHz internally.

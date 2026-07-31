@@ -53,8 +53,8 @@ FC_DIM              = 18             # Fully-connected layer dimension, do not e
 RNN_LAYERS          = 1              # Number of GRU layers, do not edit the value.
 RNN_DIM             = 18             # GRU hidden dimension, do not edit the value.
 
-IN_AUDIO_DTYPE      = 'INT16'        # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE     = 'INT16'        # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
+IN_AUDIO_DTYPE      = 'F32'          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+OUT_AUDIO_DTYPE     = 'F32'          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16           = float(1.0 / 32768.0)
 OPSET               = 20             # ONNX opset.
 

@@ -52,8 +52,8 @@ EXPORT_AUDIO_LENGTH  = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_W
 MAX_SIGNAL_LENGTH    = 2048 if DYNAMIC_AXES else (((FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else MODEL_AUDIO_LENGTH) + HOP_LENGTH - 1) // HOP_LENGTH + 1)  # STFT frame count (per-window in fold mode). Sizes the precomputed rotary / diagonal-mask tables and the ISTFT trim.
 
 
-IN_AUDIO_DTYPE       = 'INT16'             # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE      = 'INT16'             # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
+IN_AUDIO_DTYPE       = 'F32'               # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+OUT_AUDIO_DTYPE      = 'F32'               # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16            = float(1.0 / 32768.0)
 
 

@@ -241,11 +241,13 @@ def validate_plan(name: str, rp: ResolvedPlan) -> None:
             )
         if bits not in _WEIGHT_ONLY_ALGORITHMS[rp.algo]:
             raise ValueError(f"[{name}] {rp.algo} does not support {rp.method}.")
-        if rp.op_types != ("MatMul",) or rp.axes != (0,):
+        if any(op_type not in ("MatMul", "Gemm") for op_type in rp.op_types):
             raise ValueError(
-                f"[{name}] the audio weight-only path currently supports constant MatMul weights "
-                f"on axis 0 only; got op_types={rp.op_types}, axes={rp.axes}."
+                f"[{name}] the audio weight-only path supports MatMul and Gemm weights; "
+                f"got op_types={rp.op_types}."
             )
+        if len(rp.op_types) != len(rp.axes) or any(axis != 0 for axis in rp.axes):
+            raise ValueError(f"[{name}] each quantized operator requires axis 0.")
         if rp.block_size < 16 or rp.block_size > 256 or rp.block_size & (rp.block_size - 1):
             raise ValueError(f"[{name}] block_size must be a power of two in [16, 256].")
         if rp.quant_format not in _QUANT_FORMATS:
@@ -593,6 +595,7 @@ def quantize_weight_only(src_path: str, dst_path: str, rp: ResolvedPlan, externa
             algorithm=rp.algo,
             symmetric=rp.symmetric,
             accuracy_level=rp.accuracy_level,
+            op_types=rp.op_types,
             nodes_to_include=include,
             nodes_to_exclude=exclude,
         )

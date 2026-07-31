@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Callable
 
 import numpy as np
@@ -102,6 +103,135 @@ def quant_tensor_k_quant_cpu(
     return best_codes, scale.astype(np.float32), zero_point
 
 
+@lru_cache(maxsize=1)
+def _numba_refine_kernel():
+    """Build the optional parallel refinement kernel lazily."""
+    try:
+        from numba import njit, prange
+    except ImportError:
+        return None
+
+    @njit(parallel=True, nogil=True, cache=True)
+    def refine(
+        weight,
+        quantized,
+        scales,
+        zero_points,
+        clip_ratios,
+        iterations,
+        tolerance,
+        tiny,
+        maxq,
+        midpoint,
+        sweep_limit,
+        symmetric,
+    ):
+        block_count, width = weight.shape
+        baseline_errors = np.empty(block_count, dtype=np.float32)
+        refined_errors = np.empty(block_count, dtype=np.float32)
+        improved = np.zeros(block_count, dtype=np.bool_)
+
+        for block_index in prange(block_count):
+            rms_sum = np.float32(0.0)
+            positive_max = np.float32(0.0)
+            negative_max = np.float32(0.0)
+            for column in range(width):
+                value = np.float32(weight[block_index, column])
+                rms_sum += value * value
+                positive_max = max(positive_max, value)
+                negative_max = max(negative_max, -value)
+            rms = np.float32(np.sqrt(rms_sum / np.float32(width)))
+            seed_scale = np.float32(scales[block_index])
+            seed_zp_int = int(zero_points[block_index])
+            seed_zp = np.float32(seed_zp_int)
+            baseline_plain = np.float32(0.0)
+            baseline_weighted = np.float32(0.0)
+            for column in range(width):
+                value = np.float32(weight[block_index, column])
+                centered = np.float32(quantized[block_index, column]) - seed_zp
+                residual = value - seed_scale * centered
+                squared = residual * residual
+                baseline_plain += squared
+                baseline_weighted += (rms + np.abs(value)) * squared
+
+            local_plain = baseline_plain
+            weighted_bound = tolerance * baseline_weighted
+            if symmetric:
+                zp_lo = midpoint
+                zp_hi = midpoint
+            elif maxq + 1 <= sweep_limit:
+                zp_lo = 0
+                zp_hi = maxq
+            else:
+                zp_lo = seed_zp_int - sweep_limit // 2
+                zp_lo = max(0, min(zp_lo, maxq - sweep_limit + 1))
+                zp_hi = zp_lo + sweep_limit - 1
+
+            candidate_codes = np.empty(width, dtype=np.uint8)
+            for zero_point_int in range(zp_lo, zp_hi + 1):
+                zero_point = np.float32(zero_point_int)
+                positive_scale = (
+                    positive_max / np.float32(maxq - zero_point_int)
+                    if zero_point_int < maxq else np.float32(0.0)
+                )
+                negative_scale = (
+                    negative_max / np.float32(zero_point_int)
+                    if zero_point_int > 0 else np.float32(0.0)
+                )
+                coverage_scale = max(positive_scale, negative_scale)
+                if coverage_scale <= tiny:
+                    coverage_scale = np.float32(1.0)
+
+                for start_index in range(clip_ratios.size + 1):
+                    candidate_scale = (
+                        seed_scale if start_index == 0
+                        else coverage_scale * clip_ratios[start_index - 1]
+                    )
+                    for _ in range(iterations):
+                        denominator = np.float32(0.0)
+                        numerator = np.float32(0.0)
+                        for column in range(width):
+                            value = np.float32(weight[block_index, column])
+                            code = np.rint(value / candidate_scale + zero_point)
+                            code = min(np.float32(maxq), max(np.float32(0.0), code))
+                            centered = code - zero_point
+                            denominator += centered * centered
+                            numerator += centered * value
+                        if denominator <= tiny:
+                            break
+                        fitted_scale = numerator / denominator
+                        if not np.isfinite(fitted_scale) or fitted_scale <= tiny:
+                            break
+                        if fitted_scale == candidate_scale:
+                            break
+                        candidate_scale = fitted_scale
+
+                    candidate_plain = np.float32(0.0)
+                    candidate_weighted = np.float32(0.0)
+                    for column in range(width):
+                        value = np.float32(weight[block_index, column])
+                        code = np.rint(value / candidate_scale + zero_point)
+                        code = min(np.float32(maxq), max(np.float32(0.0), code))
+                        candidate_codes[column] = np.uint8(code)
+                        residual = value - candidate_scale * (code - zero_point)
+                        squared = residual * residual
+                        candidate_plain += squared
+                        candidate_weighted += (rms + np.abs(value)) * squared
+                    if candidate_plain < local_plain and candidate_weighted <= weighted_bound:
+                        local_plain = candidate_plain
+                        scales[block_index] = candidate_scale
+                        zero_points[block_index] = np.uint8(zero_point_int)
+                        for column in range(width):
+                            quantized[block_index, column] = candidate_codes[column]
+
+            baseline_errors[block_index] = baseline_plain
+            refined_errors[block_index] = local_plain
+            improved[block_index] = local_plain < baseline_plain
+        return baseline_errors, refined_errors, improved
+
+    return refine
+
+
 def affine_refine_v2_rows(
     values: np.ndarray,
     block_size: int,
@@ -109,7 +239,8 @@ def affine_refine_v2_rows(
     symmetric: bool = False,
     iterations: int = 6,
     weighted_tolerance: float = 0.15,
-    max_blocks_per_chunk: int = 8192,
+    max_blocks_per_chunk: int = 32768,
+    asymmetric_zero_point_sweep_limit: int = 32,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, RefineStats]:
     """Refine a weighted seed for minimum plain block MSE."""
     values = np.asarray(values)
@@ -121,6 +252,8 @@ def affine_refine_v2_rows(
         raise ValueError("AFFINE_REFINE_V2 supports Q4 and Q8.")
     if iterations < 1 or weighted_tolerance < 0 or max_blocks_per_chunk < 1:
         raise ValueError("invalid AFFINE_REFINE_V2 refinement settings.")
+    if asymmetric_zero_point_sweep_limit < 16:
+        raise ValueError("asymmetric_zero_point_sweep_limit must be at least 16.")
 
     rows, columns = values.shape
     blocks_per_row = (columns + block_size - 1) // block_size
@@ -132,6 +265,8 @@ def affine_refine_v2_rows(
     midpoint = 1 << (bits - 1)
 
     output_offset = 0
+    numba_kernel = _numba_refine_kernel()
+    clip_ratios = np.asarray((1.0, 0.94, 0.82, 0.70, 0.55), dtype=np.float32)
     for _, _, weight in _iter_blocks(values, block_size, max_blocks_per_chunk):
         seed_codes, seed_scale, seed_zp = quant_tensor_k_quant_cpu(weight, bits, block_size)
         if symmetric:
@@ -147,13 +282,57 @@ def affine_refine_v2_rows(
         best_scale = seed_scale.copy()
         best_zp = seed_zp.copy()
         best_mse = np.sum(np.square(seed_dequantized - weight), axis=1, dtype=np.float32)
+        max_abs = np.max(np.abs(weight), axis=1)
 
-        zero_point_candidates = (midpoint,) if symmetric else range(maxq + 1)
-        for zero_point in zero_point_candidates:
-            zp = np.full(weight.shape[0], zero_point, dtype=np.uint8)
+        if numba_kernel is not None:
+            baseline, refined, improved = numba_kernel(
+                weight,
+                best_codes,
+                best_scale,
+                best_zp,
+                clip_ratios,
+                iterations,
+                np.float32(1.0 + weighted_tolerance),
+                np.float32(np.finfo(np.float32).tiny),
+                maxq,
+                midpoint,
+                asymmetric_zero_point_sweep_limit,
+                symmetric,
+            )
+            count = weight.shape[0]
+            output_codes[output_offset:output_offset + count] = best_codes
+            output_scales[output_offset:output_offset + count] = best_scale
+            output_zero_points[output_offset:output_offset + count] = best_zp
+            stats.improved_blocks += int(np.count_nonzero(improved))
+            stats.seed_error += float(baseline.sum(dtype=np.float64))
+            stats.refined_error += float(refined.sum(dtype=np.float64))
+            output_offset += count
+            continue
+
+        if symmetric:
+            zero_point_candidates = [np.full(weight.shape[0], midpoint, dtype=np.uint8)]
+        elif maxq + 1 <= asymmetric_zero_point_sweep_limit:
+            zero_point_candidates = (
+                np.full(weight.shape[0], zero_point, dtype=np.uint8)
+                for zero_point in range(maxq + 1)
+            )
+        else:
+            # Q8 has 256 possible zero points. Match Qwen-v3 by searching a
+            # bounded window centered independently on each block's k-quant seed.
+            half_window = asymmetric_zero_point_sweep_limit // 2
+            window_start = np.clip(
+                seed_zp.astype(np.int16) - half_window,
+                0,
+                maxq - asymmetric_zero_point_sweep_limit + 1,
+            )
+            zero_point_candidates = (
+                (window_start + offset).astype(np.uint8)
+                for offset in range(asymmetric_zero_point_sweep_limit)
+            )
+        for zp in zero_point_candidates:
             for ratio in (1.0, 0.94, 0.82, 0.70, 0.55):
                 scale = np.maximum(
-                    np.max(np.abs(weight), axis=1) * np.float32(ratio) / max(1, midpoint - 1),
+                    max_abs * np.float32(ratio) / max(1, midpoint - 1),
                     np.finfo(np.float32).tiny,
                 )
                 codes = None
@@ -230,10 +409,11 @@ def quantize_matmul_model(
     algorithm: str,
     symmetric: bool,
     accuracy_level: int,
+    op_types: tuple[str, ...] = ("MatMul",),
     nodes_to_include: set[str] | None = None,
     nodes_to_exclude: set[str] | None = None,
 ) -> RefineStats:
-    """Rewrite selected constant 2-D MatMuls as MatMulNBits nodes."""
+    """Rewrite selected constant MatMul/Gemm weights as MatMulNBits nodes."""
     total = RefineStats()
     rewritten = 0
 
@@ -250,7 +430,7 @@ def quantize_matmul_model(
                 for subgraph in attribute.graphs:
                     rewrite_graph(subgraph)
             selected = (
-                node.op_type == "MatMul"
+                node.op_type in op_types
                 and len(node.input) >= 2
                 and node.input[1] in initializers
                 and (not nodes_to_include or node.name in nodes_to_include)
@@ -261,18 +441,44 @@ def quantize_matmul_model(
                 continue
             weight_tensor = initializers[node.input[1]]
             weight = numpy_helper.to_array(weight_tensor)
-            if weight.ndim != 2 or weight.dtype.kind != "f":
+            if weight.ndim not in (2, 3) or weight.dtype.kind != "f":
                 replacements.append(node)
                 continue
-            input_features, output_features = weight.shape
+            is_gemm = node.op_type == "Gemm"
+            attributes_by_name = {
+                attribute.name: helper.get_attribute_value(attribute)
+                for attribute in node.attribute
+            }
+            if is_gemm:
+                trans_a = int(attributes_by_name.get("transA", 0))
+                trans_b = int(attributes_by_name.get("transB", 0))
+                alpha = float(attributes_by_name.get("alpha", 1.0))
+                beta = float(attributes_by_name.get("beta", 1.0))
+                if weight.ndim != 2 or trans_a or alpha != 1.0 or beta != 1.0:
+                    replacements.append(node)
+                    continue
+                logical_weight = weight.T if trans_b else weight
+            else:
+                logical_weight = weight
+            input_features, output_features = logical_weight.shape[-2:]
             if algorithm == "AFFINE_REFINE_V2":
                 codes, scales, zero_points, stats = affine_refine_v2_rows(
-                    weight.T, block_size, bits, symmetric
+                    logical_weight.swapaxes(-1, -2).reshape(-1, input_features),
+                    block_size,
+                    bits,
+                    symmetric,
                 )
+                if logical_weight.ndim == 3:
+                    batch = logical_weight.shape[0]
+                    blocks = codes.shape[-2]
+                    codes = codes.reshape(batch, output_features, blocks, block_size)
+                    scales = scales.reshape(batch, output_features, blocks)
+                    zero_points = zero_points.reshape(batch, output_features, blocks)
                 total.add(stats)
             elif algorithm in ("k_quant", "RTN"):
                 block_count = (input_features + block_size - 1) // block_size
-                padded = np.pad(weight.T, ((0, 0), (0, block_count * block_size - input_features)))
+                rows = logical_weight.swapaxes(-1, -2).reshape(-1, input_features)
+                padded = np.pad(rows, ((0, 0), (0, block_count * block_size - input_features)))
                 blocks = padded.reshape(-1, block_size)
                 if algorithm == "k_quant":
                     flat_codes, flat_scales, flat_zp = quant_tensor_k_quant_cpu(
@@ -299,23 +505,13 @@ def quantize_matmul_model(
                     flat_codes, _ = _quantize_with_params(
                         blocks, flat_scales, flat_zp, maxq
                     )
-                codes = flat_codes.reshape(output_features, block_count, block_size)
-                scales = flat_scales.reshape(output_features, block_count)
-                zero_points = flat_zp.reshape(output_features, block_count)
+                leading_shape = (*logical_weight.shape[:-2], output_features)
+                codes = flat_codes.reshape(*leading_shape, block_count, block_size)
+                scales = flat_scales.reshape(*leading_shape, block_count)
+                zero_points = flat_zp.reshape(*leading_shape, block_count)
             else:
                 raise ValueError(f"unsupported helper algorithm {algorithm!r}.")
 
-            weight_name = make_name("weight")
-            scale_name = make_name("scales")
-            zero_point_name = make_name("zero_points")
-            graph.initializer.extend([
-                numpy_helper.from_array(_pack_codes(codes, bits), name=weight_name),
-                numpy_helper.from_array(scales.astype(weight.dtype, copy=False), name=scale_name),
-                numpy_helper.from_array(
-                    _pack_codes(zero_points, bits, pad_value=1 << (bits - 1)),
-                    name=zero_point_name,
-                ),
-            ])
             attributes = {
                 "K": input_features,
                 "N": output_features,
@@ -324,14 +520,70 @@ def quantize_matmul_model(
             }
             if accuracy_level:
                 attributes["accuracy_level"] = accuracy_level
-            replacements.append(helper.make_node(
-                "MatMulNBits",
-                [node.input[0], weight_name, scale_name, zero_point_name],
-                list(node.output),
-                name=f"{node.name}_{algorithm}_Q{bits}" if node.name else make_name("matmul"),
-                domain="com.microsoft",
-                **attributes,
-            ))
+
+            def append_nbits(weight_codes, weight_scales, weight_zero_points, data_name, output_name, suffix):
+                weight_name = make_name(f"weight_{suffix}")
+                scale_name = make_name(f"scales_{suffix}")
+                zero_point_name = make_name(f"zero_points_{suffix}")
+                graph.initializer.extend([
+                    numpy_helper.from_array(_pack_codes(weight_codes, bits), name=weight_name),
+                    numpy_helper.from_array(
+                        weight_scales.astype(weight.dtype, copy=False), name=scale_name
+                    ),
+                    numpy_helper.from_array(
+                        _pack_codes(weight_zero_points, bits, pad_value=1 << (bits - 1)),
+                        name=zero_point_name,
+                    ),
+                ])
+                replacements.append(helper.make_node(
+                    "MatMulNBits",
+                    [data_name, weight_name, scale_name, zero_point_name],
+                    [output_name],
+                    name=(f"{node.name}_{algorithm}_Q{bits}_{suffix}" if node.name else make_name("matmul")),
+                    domain="com.microsoft",
+                    **attributes,
+                ))
+
+            if logical_weight.ndim == 3:
+                batch = logical_weight.shape[0]
+                split_outputs = [make_name(f"batch_input_{index}") for index in range(batch)]
+                replacements.append(helper.make_node(
+                    "Split",
+                    [node.input[0]],
+                    split_outputs,
+                    name=make_name("batch_split"),
+                    axis=0,
+                    num_outputs=batch,
+                ))
+                batch_outputs = []
+                for index, split_output in enumerate(split_outputs):
+                    batch_output = make_name(f"batch_output_{index}")
+                    append_nbits(
+                        codes[index], scales[index], zero_points[index],
+                        split_output, batch_output, f"batch_{index}",
+                    )
+                    batch_outputs.append(batch_output)
+                replacements.append(helper.make_node(
+                    "Concat",
+                    batch_outputs,
+                    list(node.output),
+                    name=make_name("batch_concat"),
+                    axis=0,
+                ))
+            elif is_gemm:
+                matmul_output = make_name("gemm_matmul_output")
+                append_nbits(codes, scales, zero_points, node.input[0], matmul_output, "gemm")
+                if len(node.input) >= 3 and node.input[2]:
+                    replacements.append(helper.make_node(
+                        "Add",
+                        [matmul_output, node.input[2]],
+                        list(node.output),
+                        name=make_name("gemm_bias_add"),
+                    ))
+                else:
+                    replacements[-1].output[0] = node.output[0]
+            else:
+                append_nbits(codes, scales, zero_points, node.input[0], node.output[0], "matmul")
             removed_initializers.add(weight_tensor.name)
             rewritten += 1
 
@@ -351,7 +603,7 @@ def quantize_matmul_model(
         model.opset_import.append(helper.make_opsetid("com.microsoft", 1))
     ratio = total.refined_error / total.seed_error if total.seed_error else 1.0
     print(
-        f"  {algorithm}: {rewritten} MatMul -> MatMulNBits; "
+        f"  {algorithm}: {rewritten} MatMul/Gemm weights -> MatMulNBits; "
         f"refined {total.improved_blocks}/{total.blocks} blocks, MSE ratio={ratio:.6f}."
     )
     return total

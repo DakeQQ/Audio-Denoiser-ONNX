@@ -38,8 +38,8 @@ MODEL_PLANS = {
     "MelBandRoformer": Plan(
         method=QUANT_METHOD,
         algo=WEIGHT_ONLY_ALGORITHM,
-        op_types=("MatMul",),
-        axes=(0,),
+        op_types=("MatMul", "Gemm"),
+        axes=(0, 0),
         block_size=BLOCK_SIZE,
         accuracy_level=ACCURACY_LEVEL,
         symmetric=QUANT_SYMMETRIC,

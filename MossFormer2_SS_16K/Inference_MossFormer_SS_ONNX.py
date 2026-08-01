@@ -23,7 +23,7 @@ from audio_onnx_metadata import (
 from Example_Audio import model_audio_path
 
 parent_path      = Path(__file__).resolve().parent                                    # The folder that contains this script.
-onnx_model_A     = str(parent_path / "MossFormer_Optimized" / "MossFormer2_SS_16K.onnx") # The optimized onnx model path.
+onnx_model_A     = str(parent_path / "MossFormer_Optimized_F16" / "MossFormer2_SS_16K.onnx") # The optimized onnx model path.
 test_mixed_audio = model_audio_path("mossformer2_ss_16k")                            # The mixed audio path.
 save_separated_0 = str(parent_path / "separated_0.wav")                               # The output separated audio path.
 save_separated_1 = str(parent_path / "separated_1.wav")                               # The output separated audio path.
@@ -41,7 +41,7 @@ def _resolve_onnx_model_path(default_model_path: str) -> str:
 onnx_model_A = _resolve_onnx_model_path(onnx_model_A)
 
 
-ORT_Accelerate_Providers = []          # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
+ORT_Accelerate_Providers = ["CUDAExecutionProvider"]          # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                        # else keep empty.
 ORT_LOG                  = False       # Enable ONNX Runtime logging for debugging. Set to False for best performance.
 ORT_FP16                 = False       # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.
@@ -64,9 +64,7 @@ def align_to_multiple(value, multiple):
 def normalise_audio(audio: np.ndarray, input_dtype_np, target_rms=None) -> np.ndarray:
     if target_rms is None:
         target_rms = NORMALIZE_TARGET_RMS
-    # Fuse the pydub int16 samples, the optional RMS normalisation and the single cast to the
-    # model input dtype. pydub returns int16 PCM; for a float model input those int16 values are
-    # cast straight to float, the ZipEnhancer require [-32768, 32767] float values.
+    # This exporter performs its waveform normalization in-graph for every input dtype.
     if NORMALIZE_AUDIO:
         _audio = audio.astype(np.float32)
         rms = np.sqrt(np.mean(_audio * _audio, dtype=np.float32), dtype=np.float32)

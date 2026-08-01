@@ -3,6 +3,8 @@
 from pathlib import Path
 import sys
 
+import onnx
+
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 for _candidate in (_SCRIPT_DIR, *_SCRIPT_DIR.parents):
@@ -16,51 +18,99 @@ from Optimize_ONNX_Common import OptimizerConfig, Plan, run_optimizer
 
 
 ORIGINAL_FOLDER_PATH = str(_SCRIPT_DIR / "ZipEnhancer_ONNX")
-OPTIMIZED_FOLDER_PATH = str(_SCRIPT_DIR / "ZipEnhancer_Optimized")
+OPTIMIZED_FOLDER_PATH = str(_SCRIPT_DIR / "ZipEnhancer_Optimized_F16")
 
-ENABLE_FP16 = False      # Mixed FP16/FP32 CUDA graph;
+ENABLE_FP16 = True      # Mixed FP16/FP32 CUDA graph;
 UPGRADE_OPSET = 0
 
 
-# A blanket FP16 conversion changes the INT16 input Cast to FP16, so the first
-# audio * audio overflows for |sample| > sqrt(65504). Keep the complete input RMS
-# path and final waveform rescale/sanitize path in FP32. Node names are from the
-# checked static ZipEnhancer export and remain stable through the first slim/ORT
-# optimization passes.
-FP16_NODE_BLOCK_LIST = [
-    "/Cast",
-    "/Reshape",
-    "/Mul",
-    "/ReduceMean",
-    "/Add",
-    "/Sqrt",
-    "/Div",
-    # Sparse/zero-padded windows can normalize an STFT coefficient above
-    # sqrt(65504). Compute real^2 + imag^2 and magnitude compression in FP32.
-    "/Mul_1",
-    "/Mul_2",
-    "/Add_1",
-    "/Add_2",
-    "/Pow",
-    "/Mul_9",
-    "/Reshape_41",
-    "/IsNaN",
-    "/Where_4",
-    "/Clip",
-    "/Cast_1",
-]
+def _fp16_sensitive_nodes(src_path: str) -> list[str]:
+    """Select two contiguous FP32 regions around the FP16 Zipformer body.
 
-# Dense encoder/decoder activations can exceed 20,000 before normalization.
-# CUDA's true FP16 InstanceNormalization variance path then overflows or loses
-# enough precision to collapse output quality. Keep only these reductions FP32;
-# Conv/Gemm/attention and the rest of the network remain FP16.
+    Raw-amplitude RMS/STFT arithmetic and dense-block InstanceNormalization need
+    FP32 before the first Zipformer projection. Decoder InstanceNormalization,
+    phase reconstruction, ISTFT, RMS restoration and sanitization also need FP32.
+    Keeping each side contiguous avoids local F32 -> F16 -> F32 cast sandwiches.
+    """
+
+    simplified_path = Path(OPTIMIZED_FOLDER_PATH) / Path(src_path).name
+    selection_path = simplified_path if simplified_path.exists() else Path(src_path)
+    graph = onnx.load(selection_path, load_external_data=False).graph
+    nodes = list(graph.node)
+    producers = {
+        output: node
+        for node in nodes
+        for output in node.output
+        if output
+    }
+    consumers: dict[str, list[onnx.NodeProto]] = {}
+    for node in nodes:
+        for input_value in node.input:
+            consumers.setdefault(input_value, []).append(node)
+
+    normalizations = [node for node in nodes if node.op_type == "InstanceNormalization"]
+    if len(normalizations) != 11:
+        raise RuntimeError(
+            "Unexpected ZipEnhancer InstanceNormalization topology; refusing "
+            f"fragmented FP16 conversion: count={len(normalizations)}"
+        )
+
+    encoder_norms = normalizations[:6]
+    decoder_norms = normalizations[6:]
+    encoder_exit = [
+        node
+        for node in consumers.get(encoder_norms[-1].output[0], [])
+        if node.op_type == "PRelu"
+    ]
+    decoder_entry = producers.get(decoder_norms[0].input[0])
+    if len(encoder_exit) != 1 or decoder_entry is None or decoder_entry.op_type != "Conv":
+        raise RuntimeError(
+            "Could not identify ZipEnhancer FP32 region boundaries: "
+            f"encoder_exit={[node.op_type for node in encoder_exit]}, "
+            f"decoder_entry={decoder_entry.op_type if decoder_entry else None}"
+        )
+
+    node_indices = {id(node): index for index, node in enumerate(nodes)}
+    encoder_end = node_indices[id(encoder_exit[0])]
+    decoder_start = node_indices[id(decoder_entry)]
+    if encoder_end >= decoder_start:
+        raise RuntimeError(
+            "Unexpected ZipEnhancer FP32 region ordering; refusing unsafe FP16: "
+            f"encoder_end={encoder_end}, decoder_start={decoder_start}"
+        )
+
+    output_names = {value.name for value in graph.output}
+    decoder_outputs = {
+        value
+        for node in nodes[decoder_start:]
+        for value in node.output
+    }
+    if not output_names.issubset(decoder_outputs):
+        raise RuntimeError("ZipEnhancer decoder FP32 region does not reach every graph output")
+
+    protected = [
+        node.name
+        for node in nodes[:encoder_end + 1]
+        if node.name and node.op_type != "Constant"
+    ]
+    protected.extend(
+        node.name
+        for node in nodes[decoder_start:]
+        if node.name and node.op_type != "Constant"
+    )
+    print(
+        "  Keeping contiguous ZipEnhancer frontend/decoder regions in FP32: "
+        f"{encoder_end + 1} frontend nodes, {len(nodes) - decoder_start} decoder nodes"
+    )
+    return protected
+
+# InstanceNormalization is covered by the two contiguous node regions above.
 FP16_OP_BLOCK_LIST = [
     "DynamicQuantizeLinear",
     "DequantizeLinear",
     "DynamicQuantizeMatMul",
     "Range",
     "MatMulIntegerToFloat",
-    "InstanceNormalization",
 ]
 
 
@@ -69,11 +119,13 @@ MODEL_PLANS = {
         method="F16" if ENABLE_FP16 else "F32",
         num_heads=4,
         hidden_size=112,
-        opt_level=2,
+        # Preserve pass-1 node boundaries until after precision conversion.
+        opt_level=0,
+        only_onnxruntime=True,
         first_slim_no_shape_infer="auto",
         second_slim_no_shape_infer="auto",
         fp16_symbolic_shape_infer="auto",
-        f16_node_block_list=FP16_NODE_BLOCK_LIST,
+        f16_node_block_list=_fp16_sensitive_nodes if ENABLE_FP16 else None,
         f16_op_block_list=FP16_OP_BLOCK_LIST,
     ),
 }
@@ -91,52 +143,69 @@ CONFIG = OptimizerConfig(
 )
 
 
-def _validate_fp16_source_contract() -> None:
-    """Fail closed if an exporter change invalidates an exact node exclusion."""
-    if not ENABLE_FP16:
-        return
-    source_path = Path(ORIGINAL_FOLDER_PATH) / "ZipEnhancer.onnx"
-    if not source_path.is_file():
-        return  # Preserve the common optimizer's skip-missing behavior.
+def _collapse_sanitization_casts(model_path: Path) -> None:
+    """Remove converter hops before float-compatible IsInf checks."""
 
-    import onnx
+    model = onnx.load(model_path, load_external_data=False)
+    inferred = onnx.shape_inference.infer_shapes(model, strict_mode=True, data_prop=True)
+    value_types = {
+        value.name: value.type.tensor_type.elem_type
+        for values in (inferred.graph.input, inferred.graph.output, inferred.graph.value_info)
+        for value in values
+    }
+    producers = {
+        output: node
+        for node in model.graph.node
+        for output in node.output
+        if output
+    }
+    consumers: dict[str, list[onnx.NodeProto]] = {}
+    for node in model.graph.node:
+        for input_value in node.input:
+            consumers.setdefault(input_value, []).append(node)
 
-    expected_ops = {
-        "/Cast": "Cast",
-        "/Reshape": "Reshape",
-        "/Mul": "Mul",
-        "/ReduceMean": "ReduceMean",
-        "/Add": "Add",
-        "/Sqrt": "Sqrt",
-        "/Div": "Div",
-        "/Mul_1": "Mul",
-        "/Mul_2": "Mul",
-        "/Add_1": "Add",
-        "/Add_2": "Add",
-        "/Pow": "Pow",
-        "/Mul_9": "Mul",
-        "/Reshape_41": "Reshape",
-        "/IsNaN": "IsNaN",
-        "/Where_4": "Where",
-        "/Clip": "Clip",
-        "/Cast_1": "Cast",
-    }
-    if set(expected_ops) != set(FP16_NODE_BLOCK_LIST):
-        raise RuntimeError("FP16 safety-node validation is out of sync with its block list.")
-    nodes = {node.name: node.op_type for node in onnx.load(str(source_path)).graph.node}
-    mismatches = {
-        name: {"expected": op_type, "actual": nodes.get(name)}
-        for name, op_type in expected_ops.items()
-        if nodes.get(name) != op_type
-    }
-    if mismatches:
+    removed: set[int] = set()
+    collapsed = 0
+    for is_inf in (node for node in model.graph.node if node.op_type == "IsInf"):
+        double_cast = producers.get(is_inf.input[0])
+        fp16_cast = producers.get(double_cast.input[0]) if double_cast is not None else None
+        if (
+            double_cast is None
+            or double_cast.op_type != "Cast"
+            or fp16_cast is None
+            or fp16_cast.op_type != "Cast"
+        ):
+            continue
+        double_to = next((attr.i for attr in double_cast.attribute if attr.name == "to"), None)
+        fp16_to = next((attr.i for attr in fp16_cast.attribute if attr.name == "to"), None)
+        source_value = fp16_cast.input[0]
+        if (
+            double_to != onnx.TensorProto.DOUBLE
+            or fp16_to != onnx.TensorProto.FLOAT16
+            or value_types.get(source_value) != onnx.TensorProto.FLOAT
+            or consumers.get(fp16_cast.output[0]) != [double_cast]
+            or consumers.get(double_cast.output[0]) != [is_inf]
+        ):
+            continue
+        is_inf.input[0] = source_value
+        removed.update((id(fp16_cast), id(double_cast)))
+        collapsed += 1
+
+    if collapsed != 2:
         raise RuntimeError(
-            "ZipEnhancer FP16 safety-node contract changed; refusing an unsafe "
-            f"conversion: {mismatches}"
+            "Unexpected ZipEnhancer sanitization cast topology; refusing rewrite: "
+            f"collapsed={collapsed}"
         )
+    kept_nodes = [node for node in model.graph.node if id(node) not in removed]
+    del model.graph.node[:]
+    model.graph.node.extend(kept_nodes)
+    onnx.checker.check_model(model)
+    onnx.save(model, model_path)
+    print("  Removed 2 redundant F32 -> F16 -> F64 sanitization cast chains.")
 
 
 if __name__ == "__main__":
-    _validate_fp16_source_contract()
     run_optimizer(CONFIG)
+    if ENABLE_FP16:
+        _collapse_sanitization_casts(Path(OPTIMIZED_FOLDER_PATH) / "ZipEnhancer.onnx")
 

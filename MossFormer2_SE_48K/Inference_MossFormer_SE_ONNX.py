@@ -42,7 +42,7 @@ onnx_model_A = _resolve_onnx_model_path(onnx_model_A)
 
 
 # --- ONNX Runtime settings --------------------------------------------------
-ORT_Accelerate_Providers = []  # MossFormer2 SE FP16 is validated with CUDA. Use [] for CPU fallback.
+ORT_Accelerate_Providers = ["CUDAExecutionProvider"]  # MossFormer2 SE FP16 is validated with CUDA. Use [] for CPU fallback.
 ORT_LOG                  = False    # Enable ONNX Runtime logging for debugging. Set to False for best performance.
 ORT_FP16                 = False    # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.
 CPU_DISABLE_MATMUL_ADD_FUSION = True  # ORT 1.27 wraps rank-3 MatMul+Add in costly Reshape/Gemm/Reshape chains.
@@ -58,6 +58,7 @@ MAX_THREADS              = 0        # Number of ONNX Runtime/OpenVINO worker thr
 
 
 # --- Derived constants ------------------------------------------------------
+INV_INT16 = float(1.0 / 32768.0)
 
 
 def align_to_multiple(value, multiple):
@@ -128,20 +129,22 @@ _ort_device_obj = C.OrtDevice(_ort_device_type, C.OrtDevice.default_memory(), DE
 def normalise_audio(audio: np.ndarray, input_dtype_np, target_rms=None) -> np.ndarray:
     if target_rms is None:
         target_rms = NORMALIZE_TARGET_RMS
-    # Fuse the pydub int16 samples, the optional RMS normalisation and the single cast to the
-    # model input dtype. pydub returns int16 PCM; for a float model input those int16 values are
-    # cast straight to float, the ZipEnhancer require [-32768, 32767] float values.
+    # pydub returns int16 PCM. Integer models consume that scale directly, while float
+    # models consume normalized PCM in [-1, 1], matching the export wrapper's contract.
+    target_dtype = np.dtype(input_dtype_np)
     if NORMALIZE_AUDIO:
         _audio = audio.astype(np.float32)
         rms = np.sqrt(np.mean(_audio * _audio, dtype=np.float32), dtype=np.float32)
         if rms > 0.0:
             _audio *= (target_rms / (rms + 1e-7))
-        target_dtype = np.dtype(input_dtype_np)
         if np.issubdtype(target_dtype, np.integer):
             limits = np.iinfo(target_dtype)
             np.clip(_audio, limits.min, limits.max, out=_audio)
-        return _audio.astype(target_dtype, copy=False)
-    return audio.astype(input_dtype_np, copy=False)
+    else:
+        _audio = audio
+    if np.issubdtype(target_dtype, np.floating):
+        _audio = _audio.astype(np.float32, copy=False) * INV_INT16
+    return _audio.astype(target_dtype, copy=False)
 
 
 def _build_run_options(silent: bool) -> onnxruntime.RunOptions:

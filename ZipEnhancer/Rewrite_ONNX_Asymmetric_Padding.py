@@ -214,26 +214,36 @@ def rewrite_asymmetric_causal_convs(
         "dynamic_axes": "0",
         "nfft": "400",
         "pad_mode": "reflect",
-        "use_batch_fold": "1",
     }
     for key, expected in expected_metadata.items():
         if metadata.get(key) != expected:
             raise ValueError(
                 f"Required metadata {key!r}={expected!r}, got {metadata.get(key)!r}."
             )
-    export_audio_length = int(metadata.get("export_audio_length", "0"))
-    fold_window_length = int(metadata.get("fold_window_length", "0"))
-    if (
-        export_audio_length <= 0
-        or fold_window_length <= 0
-        or export_audio_length % fold_window_length != 0
-    ):
-        raise ValueError("Export metadata does not describe whole static fold windows.")
-    expected_pad_input_shape = (
-        export_audio_length // fold_window_length,
-        1,
-        fold_window_length,
-    )
+    use_batch_fold = metadata.get("use_batch_fold")
+    if use_batch_fold not in {"0", "1"}:
+        raise ValueError(
+            f"Required metadata 'use_batch_fold' must be '0' or '1', got {use_batch_fold!r}."
+        )
+    if use_batch_fold == "1":
+        export_audio_length = int(metadata.get("export_audio_length", "0"))
+        fold_window_length = int(metadata.get("fold_window_length", "0"))
+        if (
+            export_audio_length <= 0
+            or fold_window_length <= 0
+            or export_audio_length % fold_window_length != 0
+        ):
+            raise ValueError("Export metadata does not describe whole static fold windows.")
+        expected_pad_input_shape = (
+            export_audio_length // fold_window_length,
+            1,
+            fold_window_length,
+        )
+    else:
+        model_audio_length = int(metadata.get("model_audio_length", "0"))
+        if model_audio_length <= 0:
+            raise ValueError("Export metadata does not describe a static model audio length.")
+        expected_pad_input_shape = (1, 1, model_audio_length)
 
     def require_private_producer(
         tensor_name: str,

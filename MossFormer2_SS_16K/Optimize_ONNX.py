@@ -18,9 +18,9 @@ from Optimize_ONNX_Common import OptimizerConfig, Plan, run_optimizer
 
 
 ORIGINAL_FOLDER_PATH = str(_SCRIPT_DIR / "MossFormer_ONNX")
-OPTIMIZED_FOLDER_PATH = str(_SCRIPT_DIR / "MossFormer_Optimized_F16")
+OPTIMIZED_FOLDER_PATH = str(_SCRIPT_DIR / "MossFormer_Optimized")
 
-ENABLE_FP16 = True     # Mixed FP16/FP32 with the wide output RMS path guarded below.
+ENABLE_FP16 = False     # Mixed FP16/FP32 with the wide output RMS path guarded below.
 UPGRADE_OPSET = 0
 
 

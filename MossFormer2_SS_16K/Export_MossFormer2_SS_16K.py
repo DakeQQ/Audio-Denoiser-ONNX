@@ -41,8 +41,8 @@ INPUT_TO_OUTPUT_SCALE   = float(OUT_SAMPLE_RATE / IN_SAMPLE_RATE)
 BATCH_WINDOW_SECONDS    = 1.5          # When the configured input length is >= this many seconds, fold into fixed-length windows and batch-process them together (each window runs the full network independently, i.e. per-window attention + per-window RMS normalization).
 MAX_DYNAMIC_AUDIO_SECONDS = 6          # Bounded dynamic profile; positional/rotary tables are sized to this maximum.
 FOLD_WINDOW_LENGTH      = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + 8 - 1) // 8) * 8  # Per-window model-rate length, rounded UP to the encoder stride (8) so (W - enc_kernel16)//8 frames reconstruct exactly via the ConvTranspose decoder.
-USE_BATCH_FOLD          = True         # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
-EXPORT_AUDIO_LENGTH     = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length rounded up to whole windows; the tail is padded OUTSIDE the model (numpy) by the windowing loop.
+USE_BATCH_FOLD          = False         # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
+EXPORT_AUDIO_LENGTH     = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length rounded up to whole windows; the tail is zero-padded OUTSIDE the model (numpy) by the windowing loop.
 
 # Standalone model construction: import the pristine MossFormer2_SS_16K network
 # directly from the installed clearvoice package (no site-package patching).

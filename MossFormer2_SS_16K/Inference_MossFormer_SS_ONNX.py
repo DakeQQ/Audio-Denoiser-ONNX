@@ -23,7 +23,7 @@ from audio_onnx_metadata import (
 from Example_Audio import model_audio_path
 
 parent_path      = Path(__file__).resolve().parent                                    # The folder that contains this script.
-onnx_model_A     = str(parent_path / "MossFormer_Optimized" / "MossFormer2_SS_16K.onnx") # The optimized onnx model path.
+onnx_model_A     = str(parent_path / "MossFormer_Optimized_F32" / "MossFormer2_SS_16K.onnx") # The optimized onnx model path.
 test_mixed_audio = model_audio_path("mossformer2_ss_16k")                            # The mixed audio path.
 save_separated_0 = str(parent_path / "separated_0.wav")                               # The output separated audio path.
 save_separated_1 = str(parent_path / "separated_1.wav")                               # The output separated audio path.
@@ -297,18 +297,10 @@ if audio_len > INPUT_AUDIO_LENGTH:
     num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / stride_step)) + 1
     total_length_needed = (num_windows - 1) * stride_step + INPUT_AUDIO_LENGTH
     pad_amount = total_length_needed - audio_len
-    if fold_active:
-        pad_block = np.zeros((*audio.shape[:-1], pad_amount), dtype=audio.dtype)
-    else:
-        final_slice = audio[:, :, -pad_amount:].astype(np.float32)
-        pad_block = (np.sqrt(np.mean(final_slice * final_slice, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(*audio.shape[:-1], pad_amount))).astype(audio.dtype)
+    pad_block = np.zeros((*audio.shape[:-1], pad_amount), dtype=audio.dtype)
     audio = np.concatenate((audio, pad_block), axis=-1)
 elif audio_len < INPUT_AUDIO_LENGTH:
-    if fold_active:
-        pad_block = np.zeros((*audio.shape[:-1], INPUT_AUDIO_LENGTH - audio_len), dtype=audio.dtype)
-    else:
-        audio_float = audio.astype(np.float32)
-        pad_block = (np.sqrt(np.mean(audio_float * audio_float, dtype=np.float32), dtype=np.float32) * np.random.normal(loc=0.0, scale=1.0, size=(*audio.shape[:-1], INPUT_AUDIO_LENGTH - audio_len))).astype(audio.dtype)
+    pad_block = np.zeros((*audio.shape[:-1], INPUT_AUDIO_LENGTH - audio_len), dtype=audio.dtype)
     audio = np.concatenate((audio, pad_block), axis=-1)
 aligned_len = audio.shape[-1]
 inv_audio_len = float(100.0 / aligned_len)

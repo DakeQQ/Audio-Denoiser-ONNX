@@ -25,7 +25,7 @@ from Example_Audio import model_audio_path
 
 parent_path = Path(__file__).resolve().parent
 
-onnx_model_A        = str(parent_path / "MossFormer_Optimized" / "MossFormerGAN_SE_16K.onnx") # The optimized onnx model path.
+onnx_model_A        = str(parent_path / "MossFormer_Optimized_F16" / "MossFormerGAN_SE_16K.onnx") # The optimized onnx model path.
 test_noisy_audio    = model_audio_path("mossformergan_se_16k")                              # The noisy audio path.
 save_denoised_audio = str(parent_path / "speech_with_noise1_denoised.wav")                   # The output denoised audio path.
 
@@ -42,7 +42,7 @@ def _resolve_onnx_model_path(default_model_path: str) -> str:
 onnx_model_A = _resolve_onnx_model_path(onnx_model_A)
 
 
-ORT_Accelerate_Providers = []           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
+ORT_Accelerate_Providers = ["CUDAExecutionProvider"]           # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                         # else keep empty.
 ORT_LOG                  = False        # Enable ONNX Runtime logging for debugging. Set to False for best performance.
 ORT_FP16                 = False        # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.
@@ -56,6 +56,7 @@ MAX_THREADS              = 0            # Number of ONNX Runtime/OpenVINO worker
 DEVICE_ID                = 0            # The GPU id, default to 0.
 NORMALIZE_AUDIO          = False        # Set True to RMS-normalize input audio before inference.
 NORMALIZE_TARGET_RMS     = 4096.0       # Target RMS when NORMALIZE_AUDIO is True.
+INV_INT16                = float(1.0 / 32768.0)
 
 
 def align_to_multiple(value, multiple):
@@ -191,20 +192,20 @@ def _make_session(path: str) -> onnxruntime.InferenceSession:
 def normalise_audio(audio: np.ndarray, input_dtype_np, target_rms=None) -> np.ndarray:
     if target_rms is None:
         target_rms = NORMALIZE_TARGET_RMS
-    # Fuse the pydub int16 samples, the optional RMS normalisation and the single cast to the
-    # model input dtype. pydub returns int16 PCM; for a float model input those int16 values are
-    # cast straight to float, the ZipEnhancer require [-32768, 32767] float values.
+    target_dtype = np.dtype(input_dtype_np)
     if NORMALIZE_AUDIO:
         _audio = audio.astype(np.float32)
         rms = np.sqrt(np.mean(_audio * _audio, dtype=np.float32), dtype=np.float32)
         if rms > 0.0:
             _audio *= (target_rms / (rms + 1e-7))
-        target_dtype = np.dtype(input_dtype_np)
         if np.issubdtype(target_dtype, np.integer):
             limits = np.iinfo(target_dtype)
             np.clip(_audio, limits.min, limits.max, out=_audio)
-        return _audio.astype(target_dtype, copy=False)
-    return audio.astype(input_dtype_np, copy=False)
+    else:
+        _audio = audio
+    if np.issubdtype(target_dtype, np.floating):
+        _audio = _audio.astype(np.float32, copy=False) * INV_INT16
+    return _audio.astype(target_dtype, copy=False)
   
 
 session_opts_ort = _build_session_opts_ort()

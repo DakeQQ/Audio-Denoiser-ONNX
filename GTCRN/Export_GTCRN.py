@@ -44,8 +44,8 @@ EXPORT_AUDIO_LENGTH  = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_W
 STATIC_MODEL_BATCH   = None if DYNAMIC_AXES else (EXPORT_AUDIO_LENGTH // FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else 1)
 STATIC_SIGNAL_LENGTH = None if DYNAMIC_AXES else ((FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else EXPORT_AUDIO_LENGTH) // HOP_LENGTH + 1)
 MAX_SIGNAL_LENGTH    = 4096 if DYNAMIC_AXES else STATIC_SIGNAL_LENGTH  # Exact static frame count enables precomputed ISTFT COLA normalization.
-IN_AUDIO_DTYPE       = 'F32'                          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE      = 'F32'                          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
+IN_AUDIO_DTYPE       = 'INT16'                        # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+OUT_AUDIO_DTYPE      = 'INT16'                        # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16            = float(1.0 / 32768.0)
 FUSE_SFE_POINTWISE   = False                          # Changes Conv accumulation order; CUDA stress tests exceeded the exact INT16 contract.
 FUSE_GROUPED_GRUS    = False                          # Block-diagonal packing changes provider reduction order; keep independent grouped GRUs for exact output.
@@ -644,7 +644,6 @@ class GTCRN_CUSTOM(torch.nn.Module):
             )
         if "int" in IN_AUDIO_DTYPE.lower() and not self.input_scale_folded:
             audio = audio * INV_INT16      # int16 PCM -> [-1, 1]; F16/F32 inputs already arrive normalized.
-        audio = audio - torch.mean(audio) # Remove DC Offset
         if self.resample_after_centering:
             audio = torch.nn.functional.interpolate(
                 audio,

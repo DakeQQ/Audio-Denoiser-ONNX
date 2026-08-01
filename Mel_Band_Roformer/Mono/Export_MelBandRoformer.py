@@ -43,10 +43,10 @@ NFFT                  = 2048        # Number of FFT components for the STFT proc
 WINDOW_LENGTH         = 2048        # Length of windowing, edit it carefully.
 HOP_LENGTH            = 441         # Number of samples between successive frames in the STFT
 
-USE_BATCH_FOLD        = True        # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
+USE_BATCH_FOLD        = False        # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
 BATCH_WINDOW_SECONDS  = 1.5         # When the configured input length is >= this many seconds, fold into fixed-length windows and batch-process them together (each window is a separate clip -> per-window attention).
 FOLD_WINDOW_LENGTH    = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH  # Per-window model-rate length, rounded UP to a HOP multiple so the center-pad STFT -> ISTFT reconstructs W samples per window.
-EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length rounded up to whole windows; the tail is padded OUTSIDE the model (numpy) by the windowing loop.
+EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length rounded up to whole windows; the tail is zero-padded OUTSIDE the model (numpy) by the windowing loop.
 MAX_SIGNAL_LENGTH     = 2048 if DYNAMIC_AXES else (((FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH) // HOP_LENGTH) + 1)  # Max STFT frames (per-window count in fold mode). Sizes the scatter base and the ISTFT trim.
 
 INPUT_TO_MODEL_SCALE  = float(MODEL_SAMPLE_RATE / IN_SAMPLE_RATE)

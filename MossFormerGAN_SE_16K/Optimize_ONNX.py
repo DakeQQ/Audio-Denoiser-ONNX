@@ -19,9 +19,9 @@ from Optimize_ONNX_Common import OptimizerConfig, Plan, run_optimizer
 
 
 ORIGINAL_FOLDER_PATH = str(_SCRIPT_DIR / "MossFormer_ONNX")
-OPTIMIZED_FOLDER_PATH = str(_SCRIPT_DIR / "MossFormer_Optimized")
+OPTIMIZED_FOLDER_PATH = str(_SCRIPT_DIR / "MossFormer_Optimized_F16")
 
-ENABLE_FP16 = False    # Mixed FP16: CUDA-safe FP32 guards are selected below.
+ENABLE_FP16 = True    # Mixed FP16: CUDA-safe FP32 guards are selected below.
 UPGRADE_OPSET = 0
 
 
@@ -78,8 +78,13 @@ def _input_normalization_nodes(model: onnx.ModelProto) -> list[str]:
 
     nodes = [node.name for node in model.graph.node if node.name in selected]
     ops = [node.op_type for node in model.graph.node if node.name in selected]
-    expected = ["Cast", "Reshape", "Mul", "ReduceMean", "Add", "Sqrt", "Div"]
-    if not reaches_audio or ops != expected:
+    expected = {
+        ("Cast", "Mul", "ReduceMean", "Add", "Sqrt", "Div"),
+        ("Cast", "Reshape", "Mul", "ReduceMean", "Add", "Sqrt", "Div"),
+        ("Cast", "Mul", "Mul", "ReduceMean", "Add", "Sqrt", "Div"),
+        ("Cast", "Mul", "Reshape", "Mul", "ReduceMean", "Add", "Sqrt", "Div"),
+    }
+    if not reaches_audio or tuple(ops) not in expected:
         raise RuntimeError(
             "Unexpected input-normalization topology; refusing unsafe FP16: "
             f"reaches_audio={reaches_audio}, ops={ops}, nodes={nodes}"
@@ -165,5 +170,3 @@ CONFIG = OptimizerConfig(
 
 if __name__ == "__main__":
     run_optimizer(CONFIG)
-
-

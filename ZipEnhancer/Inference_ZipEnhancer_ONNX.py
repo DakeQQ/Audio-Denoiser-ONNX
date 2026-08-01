@@ -62,6 +62,7 @@ MAX_THREADS              = 0            # Number of ONNX Runtime/OpenVINO worker
 # --- Audio normalization ----------------------------------------------------
 
 # --- Derived constants ------------------------------------------------------
+INV_INT16 = float(1.0 / 32768.0)
 
 
 def align_to_multiple(value, multiple):
@@ -197,20 +198,20 @@ def _make_session(path: str) -> onnxruntime.InferenceSession:
 def normalise_audio(audio: np.ndarray, input_dtype_np, target_rms=None) -> np.ndarray:
     if target_rms is None:
         target_rms = NORMALIZE_TARGET_RMS
-    # Fuse the pydub int16 samples, the optional RMS normalisation and the single cast to the
-    # model input dtype. pydub returns int16 PCM; for a float model input those int16 values are
-    # cast straight to float, the ZipEnhancer require [-32768, 32767] float values.
+    target_dtype = np.dtype(input_dtype_np)
     if NORMALIZE_AUDIO:
         _audio = audio.astype(np.float32)
         rms = np.sqrt(np.mean(_audio * _audio, dtype=np.float32), dtype=np.float32)
         if rms > 0.0:
             _audio *= (target_rms / (rms + 1e-7))
-        target_dtype = np.dtype(input_dtype_np)
         if np.issubdtype(target_dtype, np.integer):
             limits = np.iinfo(target_dtype)
             np.clip(_audio, limits.min, limits.max, out=_audio)
-        return _audio.astype(target_dtype, copy=False)
-    return audio.astype(input_dtype_np, copy=False)
+    else:
+        _audio = audio
+    if np.issubdtype(target_dtype, np.floating):
+        _audio = _audio.astype(np.float32, copy=False) * INV_INT16
+    return _audio.astype(target_dtype, copy=False)
 
 
 session_opts_ort = _build_session_opts_ort()

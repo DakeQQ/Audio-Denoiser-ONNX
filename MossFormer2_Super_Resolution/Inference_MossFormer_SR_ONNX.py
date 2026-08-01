@@ -240,9 +240,7 @@ output_dtype_np = numpy_dtype_from_onnx_meta(out_name_A[0])
 def normalise_audio(audio: np.ndarray, input_dtype_np, target_rms=None) -> np.ndarray:
     if target_rms is None:
         target_rms = NORMALIZE_TARGET_RMS
-    # Fuse the pydub int16 samples, the optional RMS normalisation and the single cast to the
-    # model input dtype. pydub returns int16 PCM; for a float model input those int16 values are
-    # cast straight to float, the ZipEnhancer require [-32768, 32767] float values.
+    # This exporter performs its waveform normalization in-graph for every input dtype.
     if NORMALIZE_AUDIO:
         _audio = audio.astype(np.float32)
         rms = np.sqrt(np.mean(_audio * _audio, dtype=np.float32), dtype=np.float32)

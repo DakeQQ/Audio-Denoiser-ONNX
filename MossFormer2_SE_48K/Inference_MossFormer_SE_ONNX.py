@@ -42,7 +42,7 @@ onnx_model_A = _resolve_onnx_model_path(onnx_model_A)
 
 
 # --- ONNX Runtime settings --------------------------------------------------
-ORT_Accelerate_Providers = ["CUDAExecutionProvider"]  # MossFormer2 SE FP16 is validated with CUDA. Use [] for CPU fallback.
+ORT_Accelerate_Providers = []  # MossFormer2 SE FP16 is validated with CUDA. Use [] for CPU fallback.
 ORT_LOG                  = False    # Enable ONNX Runtime logging for debugging. Set to False for best performance.
 ORT_FP16                 = False    # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.
 CPU_DISABLE_MATMUL_ADD_FUSION = True  # ORT 1.27 wraps rank-3 MatMul+Add in costly Reshape/Gemm/Reshape chains.

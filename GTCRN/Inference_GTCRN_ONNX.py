@@ -24,7 +24,7 @@ from Example_Audio import model_audio_path
 
 
 parent_path          = Path(__file__).resolve().parent                          # The folder that contains this script.
-onnx_model_A         = str(parent_path / "GTCRN_Optimized_F32" / "GTCRN.onnx")     # The optimized onnx model path.
+onnx_model_A         = str(parent_path / "GTCRN_Optimized" / "GTCRN.onnx")     # The optimized onnx model path.
 test_noisy_audio     = model_audio_path("gtcrn")                               # The noisy audio path.
 save_denoised_audio  = str(parent_path / "denoised.wav")                        # The output denoised audio path.
 

@@ -25,7 +25,7 @@ from Example_Audio import model_audio_path
 
 # --- File paths -------------------------------------------------------------
 parent_path         = Path(__file__).resolve().parent                                                                  # The folder that contains this script.
-onnx_model_A        = str(parent_path / "ZipEnhancer_ONNX" / "ZipEnhancer.onnx")                                # The optimized onnx model path.
+onnx_model_A        = str(parent_path / "ZipEnhancer_Optimized" / "ZipEnhancer.onnx")                                # The optimized onnx model path.
 test_noisy_audio    = model_audio_path("zipenhancer")                                                                 # The noisy audio path.
 save_denoised_audio = str(parent_path / "speech_with_noise1_denoised.wav")                                              # The output denoised audio path.
 

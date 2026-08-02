@@ -28,7 +28,7 @@ IN_SAMPLE_RATE          = 16000        # [8000, 16000, 22500, 24000, 44000, 4800
 OUT_SAMPLE_RATE         = 16000        # [8000, 16000, 22500, 24000, 44000, 48000]; output audio sample rate.
 INPUT_AUDIO_LENGTH      = 32000        # Maximum input audio length in IN_SAMPLE_RATE samples. Higher values yield better quality but time consume.
 PAD_HEAD                = 8000         # ~0.5 Seconds
-IN_AUDIO_DTYPE          = 'F32'        # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+IN_AUDIO_DTYPE          = 'F32'        # ['F16', 'F32'] use normalized audio [-1, 1]; 'INT16' uses PCM [-32768, 32767].
 OUT_AUDIO_DTYPE         = 'F32'        # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16               = float(1.0 / 32768.0)
 
@@ -561,6 +561,8 @@ class MOSSFORMER_SS(torch.nn.Module):
 
     def forward(self, audio):
         audio = audio.float()
+        if "int" not in IN_AUDIO_DTYPE.lower():
+            audio = audio * 32767.0
         if self.in_sample_rate > MODEL_SAMPLE_RATE:
             audio = torch.nn.functional.interpolate(
                 audio,
@@ -680,7 +682,10 @@ with torch.inference_mode():
         IN_TORCH_DTYPE = torch.int16
     else:
         IN_TORCH_DTYPE = torch.float16
-    audio = torch.randint(low=-32768, high=32767, size=(1, 1, EXPORT_AUDIO_LENGTH), dtype=torch.int16).to(IN_TORCH_DTYPE)
+    if "int" in IN_AUDIO_DTYPE.lower():
+        audio = torch.randint(low=-32768, high=32768, size=(1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
+    else:
+        audio = torch.rand((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE) * 2.0 - 1.0
 
     torch.onnx.export(
         mossformer,

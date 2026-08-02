@@ -45,9 +45,9 @@ ORT_Accelerate_Providers = []          # If you have accelerate devices for : ['
                                        # else keep empty.
 ORT_LOG                  = False       # Enable ONNX Runtime logging for debugging. Set to False for best performance.
 ORT_FP16                 = False       # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.
-CPU_DISABLE_MATMUL_ADD_FUSION = True  # ORT 1.27 wraps rank-3 MatMul+Add in costly Reshape/Gemm/Reshape chains.
-CPU_DISABLE_NCHWC = True              # NCHWc reorders regress mean/tail latency on the target i7-1165G7.
-CPU_EXTRA_DISABLED_OPTIMIZERS = [     # Individually benchmarked on the same CPU / ORT build.
+CPU_DISABLE_MATMUL_ADD_FUSION = True   # ORT 1.27 wraps rank-3 MatMul+Add in costly Reshape/Gemm/Reshape chains.
+CPU_DISABLE_NCHWC = True               # NCHWc reorders regress mean/tail latency on the target i7-1165G7.
+CPU_EXTRA_DISABLED_OPTIMIZERS = [      # Individually benchmarked on the same CPU / ORT build.
     "ConvAddActivationFusion",
     "MatmulTransposeFusion",
 ]
@@ -65,17 +65,19 @@ def normalise_audio(audio: np.ndarray, input_dtype_np, target_rms=None) -> np.nd
     if target_rms is None:
         target_rms = NORMALIZE_TARGET_RMS
     # This exporter performs its waveform normalization in-graph for every input dtype.
+    _audio = audio.astype(np.float32)
     if NORMALIZE_AUDIO:
-        _audio = audio.astype(np.float32)
         rms = np.sqrt(np.mean(_audio * _audio, dtype=np.float32), dtype=np.float32)
         if rms > 0.0:
             _audio *= (target_rms / (rms + 1e-7))
-        target_dtype = np.dtype(input_dtype_np)
-        if np.issubdtype(target_dtype, np.integer):
-            limits = np.iinfo(target_dtype)
-            np.clip(_audio, limits.min, limits.max, out=_audio)
-        return _audio.astype(target_dtype, copy=False)
-    return audio.astype(input_dtype_np, copy=False)
+    target_dtype = np.dtype(input_dtype_np)
+    if np.issubdtype(target_dtype, np.integer):
+        limits = np.iinfo(target_dtype)
+        np.clip(_audio, limits.min, limits.max, out=_audio)
+    else:
+        _audio *= (1.0 / 32768.0)
+        np.clip(_audio, -1.0, 1.0, out=_audio)
+    return _audio.astype(target_dtype, copy=False)
 
 
 def _build_run_options(silent: bool) -> onnxruntime.RunOptions:

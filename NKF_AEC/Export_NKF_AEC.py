@@ -18,45 +18,40 @@ from Rewrite_ONNX_Initializer_Identities import rewrite_initializer_identities
 
 
 parent_path          = Path(__file__).resolve().parent                     # The folder that contains this script.
+# User settings.
 project_path         = str(Path.home() / "Downloads" / "NKF-AEC-gh-pages") # The NKF-AEC GitHub project download path. https://github.com/jfsean/NKF-AEC
-checkpoint_path      = project_path + "/src/nkf_epoch70.pt"               # The pretrained checkpoint path.
-onnx_model_A         = str(parent_path / "NKF_AEC_ONNX" / "NKF_AEC.onnx") # Final targeted-rewrite deployment model.
-onnx_model_Metadata  = str(metadata_path_for_model(onnx_model_A))          # The metadata carrier onnx model path.
-
-
-DYNAMIC_AXES        = False          # Only support static axes. Do not edit.
+checkpoint_path      = project_path + "/src/nkf_epoch70.pt"                # The pretrained checkpoint path.
+onnx_model_A         = str(parent_path / "NKF_AEC_ONNX" / "NKF_AEC.onnx")  # Final targeted-rewrite deployment model.
 IN_SAMPLE_RATE      = 16000          # The NKF-AEC model runs internally at 16 kHz and resamples the input when needed.
 OUT_SAMPLE_RATE     = 16000          # Output sample rate after the internal 16 kHz Kalman-filter model finishes.
 INPUT_AUDIO_LENGTH  = 32000          # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 32000.
+USE_BATCH_FOLD      = False          # Batch-fold long audio into fixed windows.
+BATCH_WINDOW_SECONDS = 1.5           # Minimum input length (seconds) that triggers window folding.
+IN_AUDIO_DTYPE      = 'F32'          # ['F16', 'F32', 'INT16']
+OUT_AUDIO_DTYPE     = 'F32'          # ['F16', 'F32', 'INT16']
+
+# Fixed NKF model, STFT, and ONNX export parameters.
+DYNAMIC_AXES        = False          # NKF supports static axes only.
+OPSET               = 20             # ONNX opset.
+MODEL_SAMPLE_RATE   = 16000          # NKF runs internally at 16 kHz.
 WINDOW_TYPE         = 'hann'         # Type of window function used in the STFT
 NFFT                = 1024           # Number of FFT components for the STFT process
 WINDOW_LENGTH       = 1024           # Length of windowing, edit it carefully.
 HOP_LENGTH          = 256            # Number of samples between successive frames in the STFT
-MAX_SIGNAL_LENGTH   = INPUT_AUDIO_LENGTH // HOP_LENGTH + 1  # Exact center-padded frame count for the static export shape.
-
-# Batch-fold constants
-USE_BATCH_FOLD      = False          # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
-MODEL_SAMPLE_RATE   = 16000          # NKF runs internally at 16 kHz.
-BATCH_WINDOW_SECONDS = 1.5           # Minimum input length (seconds) that triggers window folding.
-FOLD_WINDOW_LENGTH  = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH  # Per-window model-rate length rounded UP to HOP_LENGTH.
-EXPORT_AUDIO_LENGTH = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH
-if USE_BATCH_FOLD:
-    # In fold mode NKF sees one window per batch row. The ISTFT (center_pad=True) derives its
-    # output length statically from max_frames, so for NKF's even NFFT (1024, half=512) an
-    # oversized max_frames would make each window emit half_n_fft extra samples (shape_out !=
-    # shape_in). max_frames must equal the exact per-window frame count = W // HOP + 1.
-    MAX_SIGNAL_LENGTH = FOLD_WINDOW_LENGTH // HOP_LENGTH + 1
-
-# NKF model parameters
 FILTER_ORDER        = 4              # Kalman filter order (L), do not edit the value.
 FC_DIM              = 18             # Fully-connected layer dimension, do not edit the value.
 RNN_LAYERS          = 1              # Number of GRU layers, do not edit the value.
 RNN_DIM             = 18             # GRU hidden dimension, do not edit the value.
-
-IN_AUDIO_DTYPE      = 'F32'          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE     = 'F32'          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16           = float(1.0 / 32768.0)
-OPSET               = 20             # ONNX opset.
+
+# Derived export dimensions.
+onnx_model_Metadata = str(metadata_path_for_model(onnx_model_A))
+FOLD_WINDOW_LENGTH  = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH
+EXPORT_AUDIO_LENGTH = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH
+MAX_SIGNAL_LENGTH   = INPUT_AUDIO_LENGTH // HOP_LENGTH + 1
+if USE_BATCH_FOLD:
+    # NKF sees one window per batch row and needs the exact per-window frame count.
+    MAX_SIGNAL_LENGTH = FOLD_WINDOW_LENGTH // HOP_LENGTH + 1
 
 
 class ComplexGRU_Real(nn.Module):

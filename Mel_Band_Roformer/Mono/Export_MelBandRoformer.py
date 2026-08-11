@@ -25,39 +25,39 @@ for _candidate in Path(__file__).resolve().parents:
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
 
 
-project_path          = str(Path.home() / "Downloads" / "Mel-Band-Roformer-Vocal-Model-main")            # The Mel-Band-Roformer GitHub project path.
+# User settings.
+project_path          = str(Path.home() / "Downloads" / "Mel-Band-Roformer-Vocal-Model-main")           # The Mel-Band-Roformer GitHub project path.
 model_path            = str(Path(project_path) / "MelBandRoformer.ckpt")                                # The downloaded model.
 config_path           = str(Path(project_path) / "configs" / "config_vocals_mel_band_roformer.yaml")    # The model configuration.
-parent_path           = Path(__file__).resolve().parent                                                 # The folder that contains this script.
-onnx_model_A          = str(parent_path / "MelBandRoformer_ONNX" / "MelBandRoformer.onnx")              # The exported onnx model path.
-onnx_model_Metadata   = str(metadata_path_for_model(onnx_model_A))                                      # The metadata carrier onnx model path.
-
-DYNAMIC_AXES          = False       # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-OPSET                 = 20          # Opset 20 exports exact GELU as one standard ONNX Gelu operator.
-MODEL_SAMPLE_RATE     = 44100       # Mel-Band Roformer runs at 44.1kHz internally.
+onnx_model_A          = str(Path(__file__).resolve().parent / "MelBandRoformer_ONNX" / "MelBandRoformer.onnx")
+DYNAMIC_AXES          = False       # Set True to export a dynamic audio-length graph when supported.
 IN_SAMPLE_RATE        = 44100       # [8000, 16000, 22500, 24000, 44000, 48000]; input audio sample rate.
 OUT_SAMPLE_RATE       = 44100       # [8000, 16000, 22500, 24000, 44000, 48000]; output audio sample rate.
 INPUT_AUDIO_LENGTH    = 88200       # Maximum input audio length in IN_SAMPLE_RATE samples. Higher values yield better quality but time consume. It is better to set an integer multiple of the HOP_LENGTH value.
-WINDOW_TYPE           = 'hann'      # Type of window function used in the STFT
-NFFT                  = 2048        # Number of FFT components for the STFT process
-WINDOW_LENGTH         = 2048        # Length of windowing, edit it carefully.
-HOP_LENGTH            = 441         # Number of samples between successive frames in the STFT
-
-USE_BATCH_FOLD        = False        # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
+USE_BATCH_FOLD        = False       # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
 BATCH_WINDOW_SECONDS  = 1.5         # When the configured input length is >= this many seconds, fold into fixed-length windows and batch-process them together (each window is a separate clip -> per-window attention).
-FOLD_WINDOW_LENGTH    = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH  # Per-window model-rate length, rounded UP to a HOP multiple so the center-pad STFT -> ISTFT reconstructs W samples per window.
-EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length rounded up to whole windows; the tail is zero-padded OUTSIDE the model (numpy) by the windowing loop.
-MAX_SIGNAL_LENGTH     = 2048 if DYNAMIC_AXES else (((FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH) // HOP_LENGTH) + 1)  # Max STFT frames (per-window count in fold mode). Sizes the scatter base and the ISTFT trim.
+IN_AUDIO_DTYPE        = 'F32'       # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+OUT_AUDIO_DTYPE       = 'F32'       # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 
+# Fixed Mel-Band Roformer model and ONNX export parameters.
+OPSET                 = 20
+MODEL_SAMPLE_RATE     = 44100
+WINDOW_TYPE           = 'hann'
+NFFT                  = 2048
+WINDOW_LENGTH         = 2048
+HOP_LENGTH            = 441
+INV_INT16             = float(1.0 / 32768.0)
+
+# Derived export dimensions.
+onnx_model_Metadata   = str(metadata_path_for_model(onnx_model_A))
+FOLD_WINDOW_LENGTH    = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH
+EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH
+MAX_SIGNAL_LENGTH     = 2048 if DYNAMIC_AXES else (((FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH) // HOP_LENGTH) + 1)
 INPUT_TO_MODEL_SCALE  = float(MODEL_SAMPLE_RATE / IN_SAMPLE_RATE)
 MODEL_TO_OUTPUT_SCALE = float(OUT_SAMPLE_RATE / MODEL_SAMPLE_RATE)
 INPUT_TO_OUTPUT_SCALE = float(OUT_SAMPLE_RATE / IN_SAMPLE_RATE)
 MODEL_AUDIO_LENGTH    = int(round(EXPORT_AUDIO_LENGTH * INPUT_TO_MODEL_SCALE))
 OUTPUT_AUDIO_LENGTH   = int(round(EXPORT_AUDIO_LENGTH * INPUT_TO_OUTPUT_SCALE))
-
-IN_AUDIO_DTYPE        = 'F32'       # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE       = 'F32'       # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
-INV_INT16             = float(1.0 / 32768.0)
 
 
 def exists(val):

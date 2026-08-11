@@ -15,34 +15,34 @@ for _candidate in Path(__file__).resolve().parents:
         break
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
 
-parent_path             = Path(__file__).resolve().parent                                    # The folder that contains this script.
+# User settings.
 model_path              = str(Path.home() / "Downloads" / "MossFormer2_SS_16K")             # The MossFormer2_SS_16K download folder.
-onnx_model_A            = str(parent_path / "MossFormer_ONNX" / "MossFormer2_SS_16K.onnx")  # The exported onnx model path.
-onnx_model_Metadata     = str(metadata_path_for_model(onnx_model_A))                         # The metadata carrier onnx model path.
-
-
-DYNAMIC_AXES            = False        # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-OPSET                   = 20
-MODEL_SAMPLE_RATE       = 16000        # MossFormer2_SS_16K runs at 16kHz internally.
+onnx_model_A            = str(Path(__file__).resolve().parent / "MossFormer_ONNX" / "MossFormer2_SS_16K.onnx")
+DYNAMIC_AXES            = False        # Set True to export a dynamic audio-length graph when supported.
 IN_SAMPLE_RATE          = 16000        # [8000, 16000, 22500, 24000, 44000, 48000]; input audio sample rate.
 OUT_SAMPLE_RATE         = 16000        # [8000, 16000, 22500, 24000, 44000, 48000]; output audio sample rate.
-INPUT_AUDIO_LENGTH      = 32000        # Maximum input audio length in IN_SAMPLE_RATE samples. Higher values yield better quality but time consume.
+INPUT_AUDIO_LENGTH      = 32000        # Maximum input audio length in input-rate samples.
 PAD_HEAD                = 8000         # ~0.5 Seconds
 IN_AUDIO_DTYPE          = 'F32'        # ['F16', 'F32'] use normalized audio [-1, 1]; 'INT16' uses PCM [-32768, 32767].
 OUT_AUDIO_DTYPE         = 'F32'        # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
+BATCH_WINDOW_SECONDS    = 1.5          # Minimum input length (seconds) that triggers window folding.
+USE_BATCH_FOLD          = False        # Batch-fold long audio into fixed windows.
+
+# Fixed MossFormer2 separation model and ONNX export parameters.
+OPSET                   = 20
+MODEL_SAMPLE_RATE       = 16000
 INV_INT16               = float(1.0 / 32768.0)
+MAX_DYNAMIC_AUDIO_SECONDS = 6
 
-
+# Derived export dimensions.
+onnx_model_Metadata     = str(metadata_path_for_model(onnx_model_A))
 MODEL_AUDIO_LENGTH      = INPUT_AUDIO_LENGTH if DYNAMIC_AXES else int(round(INPUT_AUDIO_LENGTH * MODEL_SAMPLE_RATE / IN_SAMPLE_RATE))
 OUTPUT_AUDIO_LENGTH     = INPUT_AUDIO_LENGTH if DYNAMIC_AXES else int(round(INPUT_AUDIO_LENGTH * OUT_SAMPLE_RATE / IN_SAMPLE_RATE))
 INPUT_TO_MODEL_SCALE    = float(MODEL_SAMPLE_RATE / IN_SAMPLE_RATE)
 MODEL_TO_OUTPUT_SCALE   = float(OUT_SAMPLE_RATE / MODEL_SAMPLE_RATE)
 INPUT_TO_OUTPUT_SCALE   = float(OUT_SAMPLE_RATE / IN_SAMPLE_RATE)
-BATCH_WINDOW_SECONDS    = 1.5          # When the configured input length is >= this many seconds, fold into fixed-length windows and batch-process them together (each window runs the full network independently, i.e. per-window attention + per-window RMS normalization).
-MAX_DYNAMIC_AUDIO_SECONDS = 6          # Bounded dynamic profile; positional/rotary tables are sized to this maximum.
-FOLD_WINDOW_LENGTH      = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + 8 - 1) // 8) * 8  # Per-window model-rate length, rounded UP to the encoder stride (8) so (W - enc_kernel16)//8 frames reconstruct exactly via the ConvTranspose decoder.
-USE_BATCH_FOLD          = False         # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
-EXPORT_AUDIO_LENGTH     = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length rounded up to whole windows; the tail is zero-padded OUTSIDE the model (numpy) by the windowing loop.
+FOLD_WINDOW_LENGTH      = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + 8 - 1) // 8) * 8
+EXPORT_AUDIO_LENGTH     = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH
 
 # Standalone model construction: import the pristine MossFormer2_SS_16K network
 # directly from the installed clearvoice package (no site-package patching).

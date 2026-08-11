@@ -16,19 +16,20 @@ from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path
 
 
 parent_path          = Path(__file__).resolve().parent                                                     # The folder that contains this script.
+
+# User settings.
 project_path         = str(Path.home() / "Downloads" / "Deep-echo-path-modeling-for-acoustic-echo-cancellation-main")  # The Deep_Echo_AEC GitHub project download path. https://github.com/ZhaoF-i/Deep-echo-path-modeling-for-acoustic-echo-cancellation
-onnx_model_A         = str(parent_path / "Deep_Echo_AEC_ONNX" / "Deep_Echo_AEC.onnx")                      # The exported onnx model path.
-onnx_model_Metadata  = str(metadata_path_for_model(onnx_model_A))                                          # The metadata carrier onnx model path.
-
-
-DYNAMIC_AXES         = False                                                                      # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
+onnx_model_A         = str(parent_path / "Deep_Echo_AEC_ONNX" / "Deep_Echo_AEC.onnx")             # The exported onnx model path.
+DYNAMIC_AXES         = False                                                                      # Set True to export a dynamic audio-length graph when supported.
 IN_SAMPLE_RATE       = 16000                                                                      # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 OUT_SAMPLE_RATE      = 16000                                                                      # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 INPUT_AUDIO_LENGTH   = 32000                                                                      # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
-MAX_SIGNAL_LENGTH    = 2048 if DYNAMIC_AXES else 256                                              # Max frames for audio length after STFT processed. Set an appropriate larger value for long audio input, such as 4096.
-IN_AUDIO_DTYPE       = 'F32'                                                                    # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE      = 'F32'                                                                    # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
-INV_INT16            = float(1.0 / 32768.0)
+IN_AUDIO_DTYPE       = 'F32'                                                                      # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
+OUT_AUDIO_DTYPE      = 'F32'                                                                      # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
+USE_BATCH_FOLD       = False                                                                      # Batch-fold long audio into fixed windows.
+BATCH_WINDOW_SECONDS = 1.5                                                                        # Minimum input length (seconds) that triggers window folding.
+
+# Fixed Deep Echo model and ONNX export parameters.
 OPSET                = 20                                                                         # ONNX opset.
 WINDOW_TYPE          = 'hamming'                                                                  # Type of window function used in the STFT.
 NFFT                 = 319                                                                        # Number of FFT components for the STFT process.
@@ -36,11 +37,12 @@ WINDOW_LENGTH        = 319                                                      
 HOP_LENGTH           = 160                                                                        # Number of samples between successive frames in the STFT.
 ECHO_ORDER           = 10                                                                         # Number of Deep_Echo path orders. Do not edit.
 MODEL_SAMPLE_RATE    = 16000                                                                      # The Deep_Echo model runs internally at 16 kHz.
-BATCH_WINDOW_SECONDS = 1.5                                                                        # Minimum input length (seconds) that triggers window folding.
-FOLD_WINDOW_LENGTH   = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH  # Per-window model-rate length rounded UP to a HOP multiple.
-USE_BATCH_FOLD       = False                                                                      # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
-EXPORT_AUDIO_LENGTH  = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH
+INV_INT16            = float(1.0 / 32768.0)
 
+# Derived export dimensions.
+onnx_model_Metadata  = str(metadata_path_for_model(onnx_model_A))
+FOLD_WINDOW_LENGTH   = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH
+EXPORT_AUDIO_LENGTH  = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH
 if USE_BATCH_FOLD:
     MAX_SIGNAL_LENGTH = FOLD_WINDOW_LENGTH // HOP_LENGTH + 10  # Per-window STFT frame count (+margin); the default 128 would truncate a folded window's backend STFT.
 
@@ -49,6 +51,7 @@ MODEL_AUDIO_LENGTH   = FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else (EXPORT_AUDIO_L
 MODEL_STFT_FRAMES    = (MODEL_AUDIO_LENGTH + 2 * (NFFT // 2) - NFFT) // HOP_LENGTH + 1
 STATIC_AUDIO_LENGTH  = 0 if DYNAMIC_AXES else MODEL_AUDIO_LENGTH
 STATIC_STFT_FRAMES   = 0 if DYNAMIC_AXES else MODEL_STFT_FRAMES
+MAX_SIGNAL_LENGTH    = 2048 if DYNAMIC_AXES else MODEL_STFT_FRAMES
 if not DYNAMIC_AXES:
     MAX_SIGNAL_LENGTH = MODEL_STFT_FRAMES
 

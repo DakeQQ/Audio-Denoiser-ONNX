@@ -28,7 +28,7 @@ flowchart LR
 ```
 
 - **Input / 输入:** noisy · mixed audio &nbsp;→&nbsp; **Output / 输出:** clean, enhanced audio
-- **14 models / 14 个模型** across 5 tasks / 覆盖 5 类任务 — each folder ships `Export`, `Inference`, and `Optimize` scripts.
+- **15 models / 15 个模型** across 5 tasks / 覆盖 5 类任务 — each folder ships `Export`, `Inference`, and `Optimize` scripts.
 - More projects / 更多项目: **[DakeQQ Repositories / 仓库](https://github.com/DakeQQ?tab=repositories)**
 
 ---
@@ -41,6 +41,7 @@ flowchart LR
 | Denoise / SE<br>降噪 · 增强 | MossFormerGAN-SE | 16 kHz | [`MossFormerGAN_SE_16K`](./MossFormerGAN_SE_16K) | [ModelScope](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K) |
 | Denoise / SE<br>降噪 · 增强 | MossFormer2-SE | 48 kHz | [`MossFormer2_SE_48K`](./MossFormer2_SE_48K) | [ModelScope](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K) |
 | Denoise / SE<br>降噪 · 增强 | DFSMN | 48 kHz | [`DFSMN`](./DFSMN) | [ModelScope](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary) |
+| Denoise / SE<br>降噪 · 增强 | DPDFNet | 16 kHz | [`DPDFNet`](./DPDFNet) | [GitHub](https://github.com/ceva-ip/DPDFNet) |
 | Denoise / SE<br>降噪 · 增强 | GTCRN | 16 kHz | [`GTCRN`](./GTCRN) | [GitHub](https://github.com/Xiaobin-Rong/gtcrn) |
 | Denoise / SE<br>降噪 · 增强 | H-GTCRN | 16 kHz | [`H-GTCRN`](./H-GTCRN) | [GitHub](https://github.com/max1wz/h-gtcrn) |
 | Denoise / SE<br>降噪 · 增强 | UL-UNAS | 16 kHz | [`UL-UNAS`](./UL-UNAS) | [GitHub](https://github.com/Xiaobin-Rong/ul-unas) |
@@ -83,6 +84,7 @@ flowchart LR
 | Ubuntu 24.04 | Laptop · i7-1165G7 | CPU | MossFormer2-SS-16K | f32 | 2.63 |
 | Ubuntu 24.04 | Laptop · i7-1165G7 | CPU | Mel-Band-Roformer | q8f32 | 1.40 |
 | Ubuntu 24.04 | Desktop · i3-12300 | CPU | MossFormer2-SR | f32 | 1.49 |
+| Ubuntu 24.04 | Laptop · i7-1165G7 | CPU | DPDFNet | f32 | 0.08 |
 
 > † NKF-AEC measured with a `2000 ms` chunk size. · NKF-AEC 采用 `2000 毫秒` 分块测得。
 

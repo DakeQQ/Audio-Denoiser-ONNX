@@ -28,28 +28,33 @@ from Rewrite_ONNX_Export_Limitations import (
 
 
 parent_path         = Path(__file__).resolve().parent                               # The folder that contains this script.
+
+# User settings.
 project_path_A      = str(Path.home() / "Downloads" / "speech_dfsmn_aec_psm_16k")    # The DFSMN AEC download path.
 project_path_B      = str(Path.home() / "Downloads" / "SDAEC-main")                  # The light-AEC project download path. Keywords in this path select the backend.
                                                                                     # [SDAEC, Deep_Echo, NKF] are supported. https://github.com/ZhaoF-i/SDAEC ; https://github.com/ZhaoF-i/Deep-echo-path-modeling-for-acoustic-echo-cancellation ; https://github.com/jfsean/NKF-AEC
 onnx_model_A        = str(parent_path / "DFSMN_AEC_ONNX" / "DFSMN_AEC.onnx")        # Targeted-rewrite final model.
-onnx_model_Metadata = str(metadata_path_for_model(onnx_model_A))                    # The metadata carrier onnx model path.
-temporary_export_paths = set()
-
-
-DYNAMIC_AXES         = False                          # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
+DYNAMIC_AXES        = False                           # Set True to export a dynamic audio-length graph when supported.
 IN_SAMPLE_RATE       = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 OUT_SAMPLE_RATE      = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as output.
 IN_AUDIO_DTYPE       = 'F32'                          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
 OUT_AUDIO_DTYPE      = 'F32'                          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 OUTPUT_VAD_RESULT    = False                          # If true, expose the DFSMN speech probability as a second ONNX output.
-INV_INT16            = float(1.0 / 32768.0)
-MAX_SIGNAL_LENGTH    = 2048 if DYNAMIC_AXES else 256  # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
-OPSET                = 20                             # ONNX opset.
 USE_BATCH_FOLD       = True                           # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
 BATCH_WINDOW_SECONDS = 1.5                            # Minimum input length (seconds) that triggers window folding.
 INPUT_AUDIO_LENGTH   = 32000                          # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
 
+# VAD post-processing settings.
+FUSION_THRESHOLD    = 0.3                             # Merge adjacent speech segments separated by no more than this many seconds.
+MIN_SPEECH_DURATION = 0.2                             # Drop speech segments shorter than this many seconds.
+SPEAKING_SCORE      = 0.5                             # Probability threshold used to enter the speaking state.
+SILENCE_SCORE       = 0.5                             # Probability threshold used to return to silence.
+LOOK_AHEAD          = 0.3                             # Seconds of future VAD frames used to smooth state transitions.
 
+# Fixed DFSMN-AEC model, backend, and ONNX export parameters.
+temporary_export_paths = set()
+OPSET                = 20
+INV_INT16            = float(1.0 / 32768.0)
 # DFSMN_AEC
 MODEL_SAMPLE_RATE = 16000                           # The DFSMN AEC model runs internally at 16 kHz; the Kaldi fbank is computed at this rate.
 WINDOW_TYPE     = 'hamming_symmetric'               # Mask STFT/ISTFT window: symmetric hamming, matching the original torch.hamming_window(640, periodic=False).
@@ -59,11 +64,6 @@ WINDOW_LENGTH_A = 640                               # Kaldi frame length (40 ms 
 HOP_LENGTH_A    = 320                               # Frame shift (20 ms @ 16 kHz) for both the Kaldi fbank and the mask STFT.
 N_MELS          = 80                                # Number of Mel bands (= feature_size in dey_mini.yaml), edit it carefully.
 PRE_EMPHASIZE   = 0.97                              # Kaldi per-frame pre-emphasis coefficient.
-FUSION_THRESHOLD    = 0.3                           # Merge adjacent speech segments separated by no more than this many seconds.
-MIN_SPEECH_DURATION = 0.2                           # Drop speech segments shorter than this many seconds.
-SPEAKING_SCORE      = 0.5                           # Probability threshold used to enter the speaking state.
-SILENCE_SCORE       = 0.5                           # Probability threshold used to return to silence.
-LOOK_AHEAD          = 0.3                           # Seconds of future VAD frames used to smooth state transitions.
 
 
 # Light-AEC backend
@@ -112,6 +112,8 @@ else:
     raise ValueError(f"Unknown LIGHT_AEC_MODEL: {LIGHT_AEC_MODEL}. Choose from 'SDAEC', 'Deep_Echo', 'NKF'.")
 
 
+# Derived export dimensions.
+onnx_model_Metadata = str(metadata_path_for_model(onnx_model_A))
 # Batch-fold: for a static, same-rate (in==model==out) input at least BATCH_WINDOW_SECONDS long, fold the near/far
 # waveforms into fixed-length windows and batch-process them together (each window is an independent AEC clip -> the
 # adaptive filter / recurrent state stays WITHIN a window; the window count rides in the batch dimension).

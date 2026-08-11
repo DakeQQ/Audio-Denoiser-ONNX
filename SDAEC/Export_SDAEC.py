@@ -14,34 +14,33 @@ for _candidate in Path(__file__).resolve().parents:
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
 
 
+# User settings.
 project_path           = str(Path.home() / "Downloads" / "SDAEC-main") # The SDAEC GitHub project download path. https://github.com/ZhaoF-i/SDAEC
-parent_path            = Path(__file__).resolve().parent               # The folder that contains this script.
-onnx_model_A           = str(parent_path / "SDAEC_ONNX" / "SDAEC.onnx") # The exported onnx model path.
-onnx_model_Metadata    = str(metadata_path_for_model(onnx_model_A))      # The metadata carrier onnx model path.
-
-
-DYNAMIC_AXES          = False                         # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
+onnx_model_A           = str(Path(__file__).resolve().parent / "SDAEC_ONNX" / "SDAEC.onnx") # The exported onnx model path.
 IN_SAMPLE_RATE        = 16000                         # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 OUT_SAMPLE_RATE       = 16000                         # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
-MODEL_SAMPLE_RATE     = 16000                         # The SDAEC model runs internally at 16 kHz.
 INPUT_AUDIO_LENGTH    = 32000                         # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
-
-WINDOW_TYPE           = 'hamming'                     # Type of window function used in the STFT
-NFFT                  = 319                           # Number of FFT components for the STFT process
-WINDOW_LENGTH         = 319                           # Length of windowing, edit it carefully.
-HOP_LENGTH            = 160                           # Number of samples between successive frames in the STFT
-STATIC_SIGNAL_LENGTH  = None if DYNAMIC_AXES else (INPUT_AUDIO_LENGTH + 2 * (NFFT // 2) - NFFT) // HOP_LENGTH + 1
-MAX_SIGNAL_LENGTH     = 2048 if DYNAMIC_AXES else STATIC_SIGNAL_LENGTH # Exact centered-STFT frame count for static export.
-ALPHA_K               = 10                            # The SDAEC parameter, do not edit the value.
-
 IN_AUDIO_DTYPE        = 'F32'                         # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
 OUT_AUDIO_DTYPE       = 'F32'                         # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
-INV_INT16             = float(1.0 / 32768.0)
-OPSET                 = 20                            # ONNX opset.
-
 BATCH_WINDOW_SECONDS  = 1.5                           # Minimum input length (seconds) that triggers window folding.
-FOLD_WINDOW_LENGTH    = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH  # Per-window model-rate length rounded UP to a HOP multiple.
 USE_BATCH_FOLD        = False                         # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
+
+# Fixed SDAEC model and ONNX export parameters.
+DYNAMIC_AXES          = False
+OPSET                 = 20
+MODEL_SAMPLE_RATE     = 16000
+WINDOW_TYPE           = 'hamming'
+NFFT                  = 319
+WINDOW_LENGTH         = 319
+HOP_LENGTH            = 160
+ALPHA_K               = 10
+INV_INT16             = float(1.0 / 32768.0)
+
+# Derived export dimensions.
+onnx_model_Metadata   = str(metadata_path_for_model(onnx_model_A))
+STATIC_SIGNAL_LENGTH  = None if DYNAMIC_AXES else (INPUT_AUDIO_LENGTH + 2 * (NFFT // 2) - NFFT) // HOP_LENGTH + 1
+MAX_SIGNAL_LENGTH     = 2048 if DYNAMIC_AXES else STATIC_SIGNAL_LENGTH
+FOLD_WINDOW_LENGTH    = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH
 EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH
 STATIC_MODEL_BATCH    = None if DYNAMIC_AXES else (EXPORT_AUDIO_LENGTH // FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else 1)
 if DYNAMIC_AXES:

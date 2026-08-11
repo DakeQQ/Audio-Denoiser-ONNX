@@ -21,39 +21,38 @@ from Example_Audio import model_audio_path
 from Rewrite_ONNX_Reflect_Padding import rewrite_reflect_padding
 
 
+# User settings.
 model_path           = str(Path.home() / "Downloads" / "MossFormer2_SR_48K")
-parent_path          = Path(__file__).resolve().parent                                      # The folder that contains this script.
-onnx_model_Raw       = str(parent_path / "MossFormer_ONNX" / "MossFormer2_SR.raw.onnx")    # Immutable source-optimized PyTorch export.
-onnx_model_A         = str(parent_path / "MossFormer_ONNX" / "MossFormer2_SR.onnx")        # Final model after the targeted Pad rewrite.
-onnx_model_Metadata  = str(metadata_path_for_model(onnx_model_A))                           # The metadata carrier onnx model path.
+parent_path          = Path(__file__).resolve().parent
+onnx_model_Raw       = str(parent_path / "MossFormer_ONNX" / "MossFormer2_SR.raw.onnx")     # Immutable source-optimized PyTorch export.
+onnx_model_A         = str(parent_path / "MossFormer_ONNX" / "MossFormer2_SR.onnx")         # Final model after the targeted Pad rewrite.
 test_audio           = model_audio_path("mossformer2_super_resolution")                     # The original audio path.
 save_generated_audio = str(parent_path / "super_resolution.wav")                            # The output super resolution audio path.
+DYNAMIC_AXES         = False    # Set True to export a dynamic audio-length graph when supported.
+INPUT_AUDIO_LENGTH   = 32000    # Maximum input audio length in input-rate samples.
+IN_AUDIO_DTYPE       = 'F32'    # ['F16', 'F32', 'INT16']
+OUT_AUDIO_DTYPE      = 'F32'    # ['F16', 'F32', 'INT16']
 
-
-DYNAMIC_AXES         = False    # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
+# Fixed MossFormer super-resolution model and ONNX export parameters.
 OPSET                = 20
-IN_AUDIO_DTYPE       = 'F32'    # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE      = 'F32'    # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16            = float(1.0 / 32768.0)
+ORIGINAL_SAMPLE_RATE = 16000
+SUPER_SAMPLE_RATE    = 48000
+WINDOW_TYPE          = 'hann'
+N_MELS               = 80
+NFFT                 = 1024
+WINDOW_LENGTH        = 1024
+HOP_LENGTH           = 256
+MAX_SIGNAL_LENGTH    = 1280
+NFFT_POST            = 256
+WINDOW_LENGTH_POST   = 256
+HOP_LENGTH_POST      = 128
 
-ORIGINAL_SAMPLE_RATE = 16000    # The input audio sample rate. This value cannot be changed after the ONNX model is exported.
-SUPER_SAMPLE_RATE    = 48000    # The target audio sample rate, do not edit the value.
-INPUT_AUDIO_LENGTH   = 32000    # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 8000. Higher values yield better quality but time consume. It is better to set an integer multiple of the NFFT value.
-
-WINDOW_TYPE          = 'hann'   # Type of window function used in the STFT (clearvoice mel_spectrogram and bandwidth_sub both use a Hann window)
-N_MELS               = 80       # Number of Mel bands to generate in the Mel-spectrogram
-NFFT                 = 1024     # Number of FFT components for the STFT process
-WINDOW_LENGTH        = 1024     # Length of windowing, edit it carefully.
-HOP_LENGTH           = 256      # Number of samples between successive frames in the STFT
-MAX_SIGNAL_LENGTH    = 1280     # Max frames for audio length after STFT processed. Set a appropriate larger value for long audio input, such as 4096.
-
-NFFT_POST            = 256      # The MossFormer_SR parameter, do not edit the value.
-WINDOW_LENGTH_POST   = 256      # The MossFormer_SR parameter, do not edit the value.
-HOP_LENGTH_POST      = 128      # The MossFormer_SR parameter, do not edit the value.
-
-IN_SAMPLE_RATE       = ORIGINAL_SAMPLE_RATE    # Input audio sample rate (16 kHz).
-MODEL_SAMPLE_RATE    = SUPER_SAMPLE_RATE       # Internal STFT/network rate (48 kHz).
-OUT_SAMPLE_RATE      = SUPER_SAMPLE_RATE       # Output audio sample rate (48 kHz = 3x the input).
+# Derived export dimensions.
+onnx_model_Metadata  = str(metadata_path_for_model(onnx_model_A))
+IN_SAMPLE_RATE       = ORIGINAL_SAMPLE_RATE
+MODEL_SAMPLE_RATE    = SUPER_SAMPLE_RATE
+OUT_SAMPLE_RATE      = SUPER_SAMPLE_RATE
 
 from clearvoice.models.mossformer2_sr.mossformer2_sr_wrapper import MossFormer2_SR_48K
 

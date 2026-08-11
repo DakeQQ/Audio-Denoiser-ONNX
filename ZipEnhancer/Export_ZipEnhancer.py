@@ -20,48 +20,42 @@ from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path
 from Rewrite_ONNX_Asymmetric_Padding import rewrite_asymmetric_causal_convs
 
 
-# --- File paths -------------------------------------------------------------
+# --- User settings ----------------------------------------------------------
 model_path          = str(Path.home() / "Downloads" / "speech_zipenhancer_ans_multiloss_16k_base")  # The ZipEnhancer download path.
-parent_path         = Path(__file__).resolve().parent                                    # The folder that contains this script.
-onnx_model_A        = str(parent_path / "ZipEnhancer_ONNX" / "ZipEnhancer.onnx")        # The exported onnx model path.
-onnx_model_Metadata = str(metadata_path_for_model(onnx_model_A))                         # The metadata carrier onnx model path.
+DYNAMIC_AXES        = False        # Set True to export a dynamic audio-length graph when supported.
+IN_SAMPLE_RATE    = 16000          # [8000, 16000, 22500, 24000, 44100, 48000]; input audio sample rate.
+OUT_SAMPLE_RATE   = 16000          # [8000, 16000, 22500, 24000, 44100, 48000]; output audio sample rate.
+INPUT_AUDIO_LENGTH = 32000         # Maximum input audio length in IN_SAMPLE_RATE samples. Recommended to be greater than 4800 and less than 48000. Higher values yield better quality but time consume. It is better to set an integer multiple of the NFFT value.
+BATCH_WINDOW_SECONDS  = 1.5        # When the configured input audio length is >= this many seconds, fold into fixed-length windows and batch-process them together to accelerate inference. Dual-path attention then runs per window.
+USE_BATCH_FOLD        = False      # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
+IN_AUDIO_DTYPE        = 'F32'      # ['F16', 'F32', 'INT16']
+OUT_AUDIO_DTYPE       = 'F32'      # ['F16', 'F32', 'INT16']
+
+# Fixed ZipEnhancer model and ONNX export parameters.
+parent_path         = Path(__file__).resolve().parent
+onnx_model_A        = str(parent_path / "ZipEnhancer_ONNX" / "ZipEnhancer.onnx")
 onnx_rewrite_report = str(parent_path / "ZipEnhancer_ONNX" / "ZipEnhancer.rewrite_report.json")
+OPSET               = 20
+MODEL_SAMPLE_RATE   = 16000
+WINDOW_TYPE         = 'hann'
+N_MELS              = 100
+NFFT                = 400
+WINDOW_LENGTH       = 400
+HOP_LENGTH          = 100
+INV_INT16           = float(1.0 / 32768.0)
+USE_RECTANGULAR_ISTFT = True
 
-# --- Export settings --------------------------------------------------------
-DYNAMIC_AXES = False              # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
-OPSET        = 20                 # The ONNX opset version to export.
-
-# --- Audio I/O dtype --------------------------------------------------------
-IN_AUDIO_DTYPE  = 'F32'           # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE = 'F32'           # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
-
-# --- Sample rates -----------------------------------------------------------
-MODEL_SAMPLE_RATE = 16000         # ZipEnhancer runs at 16kHz internally.
-IN_SAMPLE_RATE    = 16000         # [8000, 16000, 22500, 24000, 44100, 48000]; input audio sample rate.
-OUT_SAMPLE_RATE   = 16000         # [8000, 16000, 22500, 24000, 44100, 48000]; output audio sample rate.
-
-# --- STFT / audio parameters ------------------------------------------------
-INPUT_AUDIO_LENGTH = 32000        # Maximum input audio length in IN_SAMPLE_RATE samples. Recommended to be greater than 4800 and less than 48000. Higher values yield better quality but time consume. It is better to set an integer multiple of the NFFT value.
-WINDOW_TYPE        = 'hann'       # Type of window function used in the STFT. ZipEnhancer's mag_pha_stft/mag_pha_istft use torch.hann_window, so this must be 'hann' (not 'hamming').
-N_MELS             = 100          # Number of Mel bands to generate in the Mel-spectrogram
-NFFT               = 400          # Number of FFT components for the STFT process
-WINDOW_LENGTH      = 400          # Length of windowing, edit it carefully.
-HOP_LENGTH         = 100          # Number of samples between successive frames in the STFT
-
-# --- Derived constants ------------------------------------------------------
+# Derived export dimensions.
+onnx_model_Metadata = str(metadata_path_for_model(onnx_model_A))
 INPUT_TO_MODEL_SCALE  = float(MODEL_SAMPLE_RATE / IN_SAMPLE_RATE)
 MODEL_TO_OUTPUT_SCALE = float(OUT_SAMPLE_RATE / MODEL_SAMPLE_RATE)
 INPUT_TO_OUTPUT_SCALE = float(OUT_SAMPLE_RATE / IN_SAMPLE_RATE)
 MODEL_AUDIO_LENGTH    = INPUT_AUDIO_LENGTH if DYNAMIC_AXES else int(round(INPUT_AUDIO_LENGTH * INPUT_TO_MODEL_SCALE))
 OUTPUT_AUDIO_LENGTH   = INPUT_AUDIO_LENGTH if DYNAMIC_AXES else int(round(INPUT_AUDIO_LENGTH * INPUT_TO_OUTPUT_SCALE))
-BATCH_WINDOW_SECONDS  = 1.5        # When the configured input audio length is >= this many seconds, fold into fixed-length windows and batch-process them together to accelerate inference. Dual-path attention then runs per window.
-USE_BATCH_FOLD        = True       # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
-FOLD_WINDOW_LENGTH    = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH  # Per-window model-rate length, rounded UP to a HOP multiple so STFT (center_pad) -> ISTFT reconstructs exactly W samples per window.
-EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length rounded up to whole windows; the tail is padded OUTSIDE the model (numpy) by the windowing loop.
-MAX_SIGNAL_LENGTH     = 1024 if DYNAMIC_AXES else ((FOLD_WINDOW_LENGTH // HOP_LENGTH + 1) if USE_BATCH_FOLD else (MODEL_AUDIO_LENGTH // HOP_LENGTH + 1))  # Max STFT frames (per-window count in fold mode). Sizes the precomputed dual-path attention position tables AND the ISTFT COLA trim; for static export it must equal the real per-window frame count.
-INV_INT16             = float(1.0 / 32768.0)
+FOLD_WINDOW_LENGTH    = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH
+EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH
+MAX_SIGNAL_LENGTH     = 1024 if DYNAMIC_AXES else ((FOLD_WINDOW_LENGTH // HOP_LENGTH + 1) if USE_BATCH_FOLD else (MODEL_AUDIO_LENGTH // HOP_LENGTH + 1))
 STATIC_SHAPE          = not DYNAMIC_AXES
-USE_RECTANGULAR_ISTFT = True       # CUDA EP 1.27 places Atan on CPU; rectangular ISTFT removes the decoder-side Atan fallback.
 
 
 def _validate_export_configuration():

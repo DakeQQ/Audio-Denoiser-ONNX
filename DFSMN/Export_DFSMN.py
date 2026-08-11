@@ -19,53 +19,49 @@ for _candidate in Path(__file__).resolve().parents:
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
 
 
+# User settings.
 model_path            = str(Path.home() / "Downloads" / "speech_dfsmn_ans_psm_48k_causal") # The DFSMN download path.
-parent_path           = Path(__file__).resolve().parent                              # The folder that contains this script.
-onnx_model_A          = str(parent_path / "DFSMN_ONNX" / "DFSMN.onnx")              # The exported onnx model path.
-onnx_model_Metadata   = str(metadata_path_for_model(onnx_model_A))                   # The metadata carrier onnx model path.
+onnx_model_A          = str(Path(__file__).resolve().parent / "DFSMN_ONNX" / "DFSMN.onnx")  # The exported ONNX model path.
+DYNAMIC_AXES          = False                   # Set True to export a dynamic audio-length graph when supported.
+IN_SAMPLE_RATE        = 48000                   # [8000, 16000, 22500, 24000, 44000, 48000]
+OUT_SAMPLE_RATE       = 48000                   # [8000, 16000, 22500, 24000, 44000, 48000]
+INPUT_AUDIO_LENGTH    = 96000                   # Maximum input length in input-rate samples.
+IN_AUDIO_DTYPE        = 'F32'                   # ['F16', 'F32', 'INT16']
+OUT_AUDIO_DTYPE       = 'F32'                   # ['F16', 'F32', 'INT16']
+USE_BATCH_FOLD        = False                   # Batch-fold long audio into fixed windows.
+BATCH_WINDOW_SECONDS  = 1.5                     # Minimum input length that triggers window folding.
 
-
-DYNAMIC_AXES          = False                   # The default dynamic_axes is the input audio length. Note that some providers only support static axes.
+# Fixed DFSMN, Kaldi, and ONNX export parameters.
 OPSET                 = 20
-MODEL_SAMPLE_RATE     = 48000                   # DFSMN runs at 48kHz internally.
-IN_SAMPLE_RATE        = 48000                   # [8000, 16000, 22500, 24000, 44000, 48000]; input audio sample rate.
-OUT_SAMPLE_RATE       = 48000                   # [8000, 16000, 22500, 24000, 44000, 48000]; output audio sample rate.
-INPUT_AUDIO_LENGTH    = 96000                   # The maximum input audio length in IN_SAMPLE_RATE samples.
-WINDOW_TYPE           = 'hamming'               # STFT analysis / Kaldi fbank window (symmetric hamming, matches torch.hamming_window(periodic=False))
-ISTFT_WINDOW_TYPE     = 'hamming_periodic'      # ISTFT synthesis window: the original post-process uses librosa.istft(window='hamming') == periodic hamming
-N_MELS                = 120                     # Number of Mel bands to generate in the Mel-spectrogram
-NFFT_STFT             = 1920                    # Number of FFT components for the STFT process, edit it carefully.
-WINDOW_LENGTH         = 1920                    # Length of windowing, edit it carefully.
-HOP_LENGTH            = 960                     # Number of samples between successive frames in the STFT
+MODEL_SAMPLE_RATE     = 48000
+WINDOW_TYPE           = 'hamming'
+ISTFT_WINDOW_TYPE     = 'hamming_periodic'
+N_MELS                = 120
+NFFT_STFT             = 1920
+WINDOW_LENGTH         = 1920
+HOP_LENGTH            = 960
+INT16_SCALE           = 32768.0
+INV_INT16             = float(1.0 / INT16_SCALE)
+KALDI_FRAME_LENGTH    = 1920
+KALDI_HOP_LENGTH      = 960
+KALDI_NFFT            = 2048
+PREEMPH_COEFF         = 0.97
+
 if HOP_LENGTH > INPUT_AUDIO_LENGTH:
     HOP_LENGTH        = INPUT_AUDIO_LENGTH
 
-IN_AUDIO_DTYPE        = 'F32'                   # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE       = 'F32'                   # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
-INT16_SCALE           = 32768.0
-INV_INT16             = float(1.0 / INT16_SCALE)
-
+# Derived export dimensions.
+onnx_model_Metadata   = str(metadata_path_for_model(onnx_model_A))
 MODEL_AUDIO_LENGTH    = INPUT_AUDIO_LENGTH if DYNAMIC_AXES else int(round(INPUT_AUDIO_LENGTH * MODEL_SAMPLE_RATE / IN_SAMPLE_RATE))
 OUTPUT_AUDIO_LENGTH   = INPUT_AUDIO_LENGTH if DYNAMIC_AXES else int(round(INPUT_AUDIO_LENGTH * OUT_SAMPLE_RATE / IN_SAMPLE_RATE))
 INPUT_TO_MODEL_SCALE  = float(MODEL_SAMPLE_RATE / IN_SAMPLE_RATE)
 MODEL_TO_OUTPUT_SCALE = float(OUT_SAMPLE_RATE / MODEL_SAMPLE_RATE)
 INPUT_TO_OUTPUT_SCALE = float(OUT_SAMPLE_RATE / IN_SAMPLE_RATE)
-BATCH_WINDOW_SECONDS  = 1.5                     # When the configured input audio length is >= this many seconds, the audio is folded into fixed-length windows and batch-processed together to accelerate inference.
-FOLD_WINDOW_LENGTH    = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH  # Per-window model-rate length, rounded UP to a HOP multiple. center=False needs (W-NFFT)%HOP==0 -> holds since W%HOP==0 and NFFT_STFT%HOP==0.
-USE_BATCH_FOLD        = False                   # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
-EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length rounded up to whole windows; the tail is padded OUTSIDE the model (numpy) by the windowing loop.
+FOLD_WINDOW_LENGTH    = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH
+EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH
 STATIC_MODEL_BATCH    = EXPORT_AUDIO_LENGTH // FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else 1
-
-# ---- Kaldi-fbank (feature extractor) parameters — must match the original pipeline exactly ----
-KALDI_FRAME_LENGTH    = 1920                    # 40 ms @ 48 kHz analysis frame (samples)
-KALDI_HOP_LENGTH      = 960                     # 20 ms @ 48 kHz frame shift (samples)
-KALDI_NFFT            = 2048                    # next power of two of the 40 ms frame (Kaldi round_to_power_of_two)
-PREEMPH_COEFF         = 0.97                    # Kaldi pre-emphasis coefficient
-
-# Frame count after the mask STFT (center=False / snip-edges, computed in the 48 kHz domain).
-# In fold mode this is the PER-WINDOW frame count (also sizes the ISTFT COLA bound per window).
-STFT_SIGNAL_LENGTH    = ((FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else MODEL_AUDIO_LENGTH) - NFFT_STFT) // HOP_LENGTH + 1   # frames (center=False)
-MAX_SIGNAL_LENGTH     = 2048 if DYNAMIC_AXES else STFT_SIGNAL_LENGTH        # ISTFT static frame bound (center=False)
+STFT_SIGNAL_LENGTH    = ((FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else MODEL_AUDIO_LENGTH) - NFFT_STFT) // HOP_LENGTH + 1
+MAX_SIGNAL_LENGTH     = 2048 if DYNAMIC_AXES else STFT_SIGNAL_LENGTH
 
 
 class DFSMN(torch.nn.Module):

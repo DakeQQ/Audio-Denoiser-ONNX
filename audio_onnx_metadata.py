@@ -291,13 +291,17 @@ def _parse_bool(value, key):
 def load_runtime_metadata(model_path, make_session, required_keys=REQUIRED_AUDIO_METADATA_KEYS):
     model_path = Path(model_path)
     metadata_path = metadata_path_for_model(model_path)
-    if not metadata_path.exists():
+    main_session = make_session(str(model_path))
+    metadata = main_session.get_modelmeta().custom_metadata_map or {}
+    has_required_metadata = all(metadata.get(key) not in {None, ""} for key in required_keys)
+    if not has_required_metadata and metadata_path.exists():
+        metadata_session = make_session(str(metadata_path))
+        metadata = metadata_session.get_modelmeta().custom_metadata_map or {}
+    if not metadata:
         raise FileNotFoundError(
-            f"Required metadata model is missing: {metadata_path}. "
-            "Re-export with the matching Export_*.py and rerun Optimize_ONNX.py."
+            f"Required ONNX metadata is missing from {model_path} and legacy sidecar {metadata_path}. "
+            "Re-export with the matching Export_*.py."
         )
-    metadata_session = make_session(str(metadata_path))
-    metadata = metadata_session.get_modelmeta().custom_metadata_map or {}
     reader = MetadataReader(metadata)
     for key in required_keys:
         reader.string(key, required=True)

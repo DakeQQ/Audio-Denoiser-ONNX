@@ -19,41 +19,43 @@ from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path
 
 
 parent_path          = Path(__file__).resolve().parent                             # The folder that contains this script.
-model_path           = str(Path.home() / "Downloads" / "H-GTCRN-main")            # The H-GTCRN download path.
+model_path           = str(Path.home() / "Downloads" / "H-GTCRN-main")             # The H-GTCRN download path.
 onnx_model_A         = str(parent_path / "H_GTCRN_ONNX" / "H_GTCRN.onnx")          # The exported onnx model path.
-onnx_model_Metadata  = str(metadata_path_for_model(onnx_model_A))                  # The metadata carrier onnx model path.
-
-
-DYNAMIC_AXES         = False                          # False exports a fixed windowed model; set True to keep dynamic audio length so WPE/AuxIVA can use full-sequence statistics.
-OPSET                = 20                             # ONNX opset.
+# User settings.
+DYNAMIC_AXES         = False                          # Set True to export a dynamic audio-length graph when supported.
 IN_SAMPLE_RATE       = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 OUT_SAMPLE_RATE      = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
-MODEL_SAMPLE_RATE    = 16000                          # The internal processing sample rate of the model. STFT/ISTFT, WPE/AuxIVA and the network always run at this rate; inputs are resampled to it.
 INPUT_AUDIO_LENGTH   = 32000                          # Dummy export length when dynamic axes are enabled. Keep it as an integer multiple of HOP_LENGTH.
-N_CHANNELS           = 2                              # Number of input microphone channels for the original WPE/AuxIVA stereo front-end.
+USE_BATCH_FOLD       = False                          # Batch-fold long audio into fixed windows.
+BATCH_WINDOW_SECONDS = 1.5                            # Minimum input length (seconds) that triggers window folding.
+IN_AUDIO_DTYPE       = 'F32'                          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor.
+OUT_AUDIO_DTYPE      = 'F32'                          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor.
+
+# Fixed H-GTCRN model and ONNX export parameters.
+OPSET                = 20                             # ONNX opset.
+MODEL_SAMPLE_RATE    = 16000                          # The internal processing sample rate of the model.
+N_CHANNELS           = 2                              # Number of input microphone channels for the original WPE/AuxIVA front-end.
 WINDOW_TYPE          = 'hann'                         # Type of window function used in the STFT (matches original H-GTCRN torch.hann_window).
 PAD_MODE             = 'reflect'                      # ['constant', 'reflect'] torch.stft defaults to 'reflect' (original repo uses the default), so match it.
 NFFT                 = 512                            # Number of FFT components for the STFT process.
 WINDOW_LENGTH        = 512                            # Length of windowing, edit it carefully.
 HOP_LENGTH           = 256                            # Number of samples between successive frames in the STFT.
-BATCH_WINDOW_SECONDS = 1.5                            # When the configured input audio length is >= this many seconds, the audio is folded into fixed-length windows and batch-processed together to accelerate inference. WPE/AuxIVA then run per window.
-FOLD_WINDOW_LENGTH   = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH  # Per-window length (model-rate samples) for batch folding, rounded up to a multiple of HOP_LENGTH so every window reconstructs exactly through STFT -> ISTFT.
-USE_BATCH_FOLD       = False                           # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
-EXPORT_AUDIO_LENGTH  = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length: in fold mode it is rounded UP to a whole number of windows; the tail is padded OUTSIDE the model (numpy) by the windowing loop.
-MODEL_AUDIO_LENGTH   = int(EXPORT_AUDIO_LENGTH * MODEL_SAMPLE_RATE / IN_SAMPLE_RATE) if not DYNAMIC_AXES else 0  # Static model-rate waveform length after interpolation.
-MAX_SIGNAL_LENGTH    = (FOLD_WINDOW_LENGTH // HOP_LENGTH + 1) if USE_BATCH_FOLD else (4096 if DYNAMIC_AXES else MODEL_AUDIO_LENGTH // HOP_LENGTH + 1)  # Max STFT frames (per-window count in fold mode). Sizes the WPE delay templates AND the ISTFT COLA trim.
-FRONTEND_BATCH       = (MODEL_AUDIO_LENGTH // FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else 1  # WPE/AuxIVA batch: one item per folded window.
 WPE_RT60             = 0.3                            # WPE reverberation time parameter.
 WPE_DELAY            = 2                              # WPE prediction delay parameter.
 WPE_ITER             = 1                              # WPE number of iterations.
 IVA_ITER             = 10                             # AuxIVA number of iterations (must match training: 10 iterations for proper source separation).
 CG_SOLVE_ITER        = 6                              # Inner CG steps for the WPE linear solve.
-
-IN_AUDIO_DTYPE       = 'F32'                          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
-OUT_AUDIO_DTYPE      = 'F32'                          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 INV_INT16            = float(1.0 / 32768.0)
 FOLD_INPUT_PCM_SCALE = False  # Keep PCM normalization before the DFT kernel for exact checkpointed output parity.
 FOLD_OUTPUT_PCM_SCALE = False  # Reassociating COLA division with the non-power-of-two PCM scale can change int16 rounding.
+
+# Derived export dimensions.
+onnx_model_Metadata  = str(metadata_path_for_model(onnx_model_A))
+FOLD_WINDOW_LENGTH   = ((int(BATCH_WINDOW_SECONDS * MODEL_SAMPLE_RATE) + HOP_LENGTH - 1) // HOP_LENGTH) * HOP_LENGTH
+EXPORT_AUDIO_LENGTH  = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH
+MODEL_AUDIO_LENGTH   = int(EXPORT_AUDIO_LENGTH * MODEL_SAMPLE_RATE / IN_SAMPLE_RATE) if not DYNAMIC_AXES else 0
+MAX_SIGNAL_LENGTH    = (FOLD_WINDOW_LENGTH // HOP_LENGTH + 1) if USE_BATCH_FOLD else (4096 if DYNAMIC_AXES else MODEL_AUDIO_LENGTH // HOP_LENGTH + 1)
+FRONTEND_BATCH       = (MODEL_AUDIO_LENGTH // FOLD_WINDOW_LENGTH) if USE_BATCH_FOLD else 1
 
 
 def pad_audio_tail_with_context(audio: np.ndarray, target_length: int) -> np.ndarray:

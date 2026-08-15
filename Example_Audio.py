@@ -7,6 +7,7 @@ _MODEL_AUDIO_FILES = {
     "deep_echo_aec": (("near_end", "aec/nearend_mic1.wav"), ("far_end", "aec/farend_speech1.wav")),
     "dfsmn": (("noisy", "denoise/speech_with_noise_48k.wav"),),
     "dfsmn_aec": (("near_end", "aec/nearend_mic1.wav"), ("far_end", "aec/farend_speech1.wav")),
+    "gap_urgenet": (("noisy", "denoise/speech_with_noise1.wav"),),
     "gtcrn": (("noisy", "denoise/gtcrn_mix.wav"),),
     "h_gtcrn": (("noisy", "denoise/h_gtcrn_noisy.wav"),),
     "mel_band_roformer": (("noisy", "denoise/mel_band_roformer.wav"),),

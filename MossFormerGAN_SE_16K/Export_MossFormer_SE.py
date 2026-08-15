@@ -129,8 +129,7 @@ def _ffconvm_parts(ff):
 
 
 def _mossformer_block(
-    p, x0, Q, BT, rotary_cos, rotary_sin, rotary_perm,
-    eye_mask, shift_zero, b=1
+    p, x0, Q, BT, rotary_cos, rotary_sin, eye_mask, shift_zero, b=1
 ):
     # Inlined ``MossFormer`` (GatedFormer) forward + cal_attention, expanded to leaf ops.
     # ``b`` is the window-fold batch: x0 has leading dim ``b * BT`` and cross-token attention
@@ -167,8 +166,8 @@ def _mossformer_block(
     hidden_state, qk = huv.split((hidden, qk_dim), dim=-1)
 
     # OffsetScale runs jointly for all four heads. Rotary tables are already expanded to the
-    # interleaved 32-channel convention; signed sine values plus one int32 Gather implement
-    # rotate_half without strided even/odd slices, Stack, Flatten, or a separate Sub.
+    # interleaved 32-channel convention; signed sine values plus a pair-axis flip implement
+    # rotate_half without a separate negation or index tensor.
     scaled = qk.unsqueeze(-2) * p['gamma'] + p['beta']
     if rotary_cos is not None:
         cos = rotary_cos
@@ -188,7 +187,9 @@ def _mossformer_block(
         ).flatten(start_dim=-2).reshape(1, Q, 1, rot)
     tm = scaled[..., :rot]
     rest = scaled[..., rot:]
-    rotp = tm * cos + torch.index_select(tm, -1, rotary_perm) * sin
+    rotated_tm = tm.reshape(-1, Q, 4, rot // 2, 2)
+    rotated_tm = rotated_tm.flip(-1).reshape(-1, Q, 4, rot)
+    rotp = tm * cos + rotated_tm * sin
     quad_q, lin_q, quad_k, lin_k = torch.cat(
         (rotp, rest), dim=-1
     ).unbind(dim=-2)
@@ -294,12 +295,8 @@ class MOSSFORMER_SE(torch.nn.Module):
 
         # ── Precompute rotary tables, diagonal masks, and token-shift zeros ──
         # Rotary cos/sin are stored in their final float32 compute dtype. Sine values include
-        # the [-sin,+sin] rotate-half signs, and the int32 permutation swaps each even/odd pair.
-        # This removes 24 runtime casts and the conventional slice/Stack/Flatten rotation.
-        self.register_buffer(
-            'rotary_perm',
-            torch.arange(mf_rot, dtype=torch.int32).reshape(-1, 2).flip(1).reshape(-1)
-        )
+        # the [-sin,+sin] rotate-half signs, and a pair-axis flip swaps each even/odd pair.
+        # This removes 24 runtime casts and the separate rotary index tensor.
         self.precompute_rotary = not DYNAMIC_AXES
         if self.precompute_rotary:
             inv_freq = blocks[0].intra_mossformer.rotary_pos_emb.freqs.detach()
@@ -668,7 +665,7 @@ class MOSSFORMER_SE(torch.nn.Module):
             # intra_mossformer: inlined fused MossFormer path (rotary along the frequency axis).
             t = _mossformer_block(
                 pb['intra_mf'], t, self.n_freqs, frames,
-                self.rotary_cos_intra, self.rotary_sin_intra, self.rotary_perm,
+                self.rotary_cos_intra, self.rotary_sin_intra,
                 self.intra_eye_mask, self.intra_shift_zero, bsz
             )
             # (B*T, F, C) -> (B, C, T, F)
@@ -725,7 +722,7 @@ class MOSSFORMER_SE(torch.nn.Module):
             # inter_mossformer: inlined fused MossFormer path (rotary along the time axis).
             t = _mossformer_block(
                 pb['inter_mf'], t, frames, self.n_freqs,
-                self.rotary_cos_inter, self.rotary_sin_inter, self.rotary_perm,
+                self.rotary_cos_inter, self.rotary_sin_inter,
                 self.inter_eye_mask, self.inter_shift_zero, bsz
             )
             # (B*F, T, C) -> (B, C, F, T) (SELayer runs in this layout, transposed to (B,C,T,F) after)

@@ -445,10 +445,6 @@ class MelBandRoformer(torch.nn.Module):
         self.register_buffer('time_sin', time_sin.contiguous())
         self.register_buffer('freq_cos', m.rotary_cos_freq.float().contiguous())
         self.register_buffer('freq_sin', (m.rotary_sin_freq.float() * rot_sign).contiguous())
-        self.register_buffer(
-            'rotate_indices',
-            torch.arange(self.dim_head, dtype=torch.int32).reshape(-1, 2).flip(1).flatten().contiguous(),
-        )
         self.register_buffer('norm_eps', torch.tensor(1e-12, dtype=torch.float32))
 
         # ---- BandSplit: fold each band RMSNorm (scale * gamma) into its Linear ----
@@ -536,10 +532,11 @@ class MelBandRoformer(torch.nn.Module):
         norm = torch.linalg.vector_norm(x, ord=2, dim=-1, keepdim=True)
         return x / torch.maximum(norm, self.norm_eps)
 
-    def _rotate_half(self, x):
-        # The alternating negation is already folded into the sin table. A constant
-        # int32 permutation exports as one Gather instead of flip's dynamic Slice graph.
-        return torch.index_select(x, -1, self.rotate_indices)
+    def _rotate_half(self, x, b, n):
+        # The alternating negation is already folded into the sin table.
+        x = x.reshape(2, b, self.heads, n, self.dim_head // 2, 2)
+        x = x.flip(-1)
+        return x.reshape(2, b, self.heads, n, self.dim_head)
 
     def _attention(self, x, p, rcos, rsin, b, n):
         normed = self._normalize(x)
@@ -551,7 +548,7 @@ class MelBandRoformer(torch.nn.Module):
         # then split; v never gains the old leading singleton dimension.
         qkv = qkv_flat.reshape(b, n, 3, self.heads, self.dim_head).permute(2, 0, 3, 1, 4)
         qk, v = qkv.split([2, 1], dim=0)                                # (2, b, heads, n, dim_head), (1, ...)
-        qk = qk * rcos + self._rotate_half(qk) * rsin                   # one batched rotary for q and k
+        qk = qk * rcos + self._rotate_half(qk, b, n) * rsin             # one batched rotary for q and k
         q, k = qk.unbind(dim=0)
         v = v.squeeze(0)
         attn = torch.matmul(q, k.transpose(-1, -2)).softmax(dim=-1)

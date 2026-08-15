@@ -519,12 +519,9 @@ class MelBandRoformer(torch.nn.Module):
             self.register_buffer('zero_mask', torch.zeros((self.fold_batch, 1, self.static_frames, 2), dtype=torch.float32))
 
         # ---- Rotary tables ----
-        # The GPT-J alternating sign [-1, +1, ...] is folded into the sin tables so
-        # rotate_half is one fixed int32 Gather rather than flip's large Slice subgraph.
+        # The GPT-J alternating sign [-1, +1, ...] is folded into the sin tables.
         rot_sign = torch.ones(self.dim_head, dtype=torch.float32)
         rot_sign[0::2] = -1.0
-        rotary_indices = torch.arange(self.dim_head, dtype=torch.int32).reshape(-1, 2).flip(1).reshape(-1)
-        self.register_buffer('rotary_indices', rotary_indices.contiguous())
         self.register_buffer('time_cos', m.cos_rotary_pos_emb[:, :, :self.static_frames].float().contiguous())
         self.register_buffer('time_sin', (m.sin_rotary_pos_emb[:, :, :self.static_frames].float() * rot_sign).half().float().contiguous())
         self.register_buffer('freq_cos', m.rotary_cos_freq.float().contiguous())
@@ -631,7 +628,9 @@ class MelBandRoformer(torch.nn.Module):
         # (3, b, heads, n, dim_head); split q/k (one batched rotary) from v.
         qkv = qkv_flat.reshape(b, -1, 3, self.heads, self.dim_head).permute(2, 0, 3, 1, 4)
         qk, v = qkv.split([2, 1], dim=0)                                # (2, b, heads, n, dim_head), (1, ...)
-        qk = qk * rcos + torch.index_select(qk, -1, self.rotary_indices) * rsin # one batched rotary for q and k
+        rotated_qk = qk.reshape(2, b, self.heads, -1, self.dim_head // 2, 2)
+        rotated_qk = rotated_qk.flip(-1).reshape(2, b, self.heads, -1, self.dim_head)
+        qk = qk * rcos + rotated_qk * rsin                               # one batched rotary for q and k
         q, k = qk.split(1, dim=0)                                       # each (1, b, heads, n, dim_head)
         attn = torch.matmul(q, k.transpose(-1, -2)).softmax(dim=-1)
         # Transpose heads out first so the gate (b, n, heads, 1) needs no transpose,

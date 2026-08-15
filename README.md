@@ -28,7 +28,7 @@ flowchart LR
 ```
 
 - **Input / 输入:** noisy · mixed audio &nbsp;→&nbsp; **Output / 输出:** clean, enhanced audio
-- **15 models / 15 个模型** across 5 tasks / 覆盖 5 类任务 — each folder ships `Export`, `Inference`, and `Optimize` scripts.
+- **17 models / 17 个模型** across 5 tasks / 覆盖 5 类任务 — each folder ships `Export`, `Inference`, and `Optimize` scripts.
 - More projects / 更多项目: **[DakeQQ Repositories / 仓库](https://github.com/DakeQQ?tab=repositories)**
 
 ---
@@ -45,6 +45,8 @@ flowchart LR
 | Denoise / SE<br>降噪 · 增强 | GTCRN | 16 kHz | [`GTCRN`](./GTCRN) | [GitHub](https://github.com/Xiaobin-Rong/gtcrn) |
 | Denoise / SE<br>降噪 · 增强 | H-GTCRN | 16 kHz | [`H-GTCRN`](./H-GTCRN) | [GitHub](https://github.com/max1wz/h-gtcrn) |
 | Denoise / SE<br>降噪 · 增强 | UL-UNAS | 16 kHz | [`UL-UNAS`](./UL-UNAS) | [GitHub](https://github.com/Xiaobin-Rong/ul-unas) |
+| Denoise / SE<br>降噪 · 增强 | UniPASE | 16 kHz<br>(optional 16 → 48 kHz) | [`Unipass`](./Unipass) | [GitHub](https://github.com/Xiaobin-Rong/unipase) |
+| Denoise / SE<br>降噪 · 增强 | GAP-URGENet | 16 kHz | [`Gap-Urgenet`](./Gap-Urgenet) | [GitHub](https://github.com/Xiaobin-Rong/gap-urgenet) |
 | Echo Cancellation<br>回声消除 | SDAEC | 16 kHz | [`SDAEC`](./SDAEC) | [GitHub](https://github.com/ZhaoF-i/SDAEC) |
 | Echo Cancellation<br>回声消除 | DFSMN-AEC | 16 kHz | [`DFSMN_AEC`](./DFSMN_AEC) | [ModelScope](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k) |
 | Echo Cancellation<br>回声消除 | NKF-AEC | 16 kHz | [`NKF_AEC`](./NKF_AEC) | [GitHub](https://github.com/fjiang9/NKF-AEC) |

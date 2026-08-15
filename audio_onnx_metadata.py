@@ -208,12 +208,12 @@ def build_audio_metadata_from_globals(
 
 def read_source_metadata(main_model_path):
     main_model_path = Path(main_model_path)
-    metadata = {}
-    if main_model_path.exists():
-        metadata = read_onnx_metadata(main_model_path)
     metadata_model_path = metadata_path_for_model(main_model_path)
-    if not metadata and metadata_model_path.exists():
+    metadata = {}
+    if metadata_model_path.exists():
         metadata = read_onnx_metadata(metadata_model_path)
+    if not metadata and main_model_path.exists():
+        metadata = read_onnx_metadata(main_model_path)
     return metadata
 
 
@@ -291,12 +291,14 @@ def _parse_bool(value, key):
 def load_runtime_metadata(model_path, make_session, required_keys=REQUIRED_AUDIO_METADATA_KEYS):
     model_path = Path(model_path)
     metadata_path = metadata_path_for_model(model_path)
-    main_session = make_session(str(model_path))
-    metadata = main_session.get_modelmeta().custom_metadata_map or {}
-    has_required_metadata = all(metadata.get(key) not in {None, ""} for key in required_keys)
-    if not has_required_metadata and metadata_path.exists():
+    metadata = {}
+    if metadata_path.exists():
         metadata_session = make_session(str(metadata_path))
         metadata = metadata_session.get_modelmeta().custom_metadata_map or {}
+    has_required_metadata = all(metadata.get(key) not in {None, ""} for key in required_keys)
+    if not has_required_metadata:
+        main_session = make_session(str(model_path))
+        metadata = main_session.get_modelmeta().custom_metadata_map or {}
     if not metadata:
         raise FileNotFoundError(
             f"Required ONNX metadata is missing from {model_path} and legacy sidecar {metadata_path}. "

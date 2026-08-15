@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""Run the exported static GAP-URGENet ONNX model."""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+from typing import Callable
+
+import numpy as np
+import onnxruntime
+import soundfile as sf
+from onnxruntime.capi import _pybind_state as C
+from pydub import AudioSegment
+
+for _candidate in Path(__file__).resolve().parents:
+    if (_candidate / "audio_onnx_metadata.py").exists():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
+
+from audio_onnx_metadata import (
+    load_runtime_metadata,
+    numpy_dtype_from_onnx_meta,
+    resolve_onnx_shape,
+)
+from Example_Audio import model_audio_path
+
+parent_path          = Path(__file__).resolve().parent                                  # The folder that contains this script.
+onnx_model_A         = str(parent_path / "GAP_URGENet_Optimized" / "GAP_URGENet.onnx")  # The source-optimized ONNX model path.
+test_noisy_audio     = model_audio_path("gap_urgenet")                                  # The noisy audio path.
+save_denoised_audio  = parent_path / "denoised.wav"                                     # The output denoised audio path.
+
+
+def _resolve_onnx_model_path(default_model_path: str) -> str:
+    if len(sys.argv) <= 1:
+        return default_model_path
+    candidate = Path(sys.argv[1]).expanduser()
+    if candidate.is_dir():
+        candidate = candidate / Path(default_model_path).name
+    return str(candidate)
+
+
+onnx_model_A = _resolve_onnx_model_path(onnx_model_A)
+
+
+ORT_Accelerate_Providers  = []          # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
+                                        # else keep empty.
+ORT_LOG                   = False       # Enable ONNX Runtime logging for debugging. Set to False for best performance.
+ORT_FP16                  = False       # Set to True for FP16 ONNX Runtime settings. For CPUs, this requires ARM64-v8.2a or newer.
+CPU_DISABLE_MATMUL_ADD_FUSION = True    # ORT 1.27 wraps rank-3 MatMul+Add in costly Reshape/Gemm/Reshape chains.
+CPU_DISABLE_NCHWC = True                # NCHWc reorders regress mean/tail latency on the target i7-1165G7.
+CPU_EXTRA_DISABLED_OPTIMIZERS = [       # Individually benchmarked on the same CPU / ORT build.
+    "ConvAddActivationFusion",
+    "MatmulTransposeFusion",
+]
+MAX_THREADS               = 0           # Number of ONNX Runtime/OpenVINO worker threads. Set 0 for auto.
+DEVICE_ID                 = 0           # The GPU id, default to 0.
+NORMALIZE_AUDIO           = False       # Set True to RMS-normalize input audio before inference.
+NORMALIZE_TARGET_RMS      = 4096.0      # Target RMS when NORMALIZE_AUDIO is True.
+
+INV_INT16 = float(1.0 / 32768.0)
+_RUNTIME_METADATA_KEYS = ("in_sample_rate", "out_sample_rate")
+
+
+# ONNX Runtime settings
+if "OpenVINOExecutionProvider" in ORT_Accelerate_Providers:
+    provider_options = [
+        {
+            'device_type':                  'CPU',        # [CPU, NPU, GPU, GPU.0, GPU.1]]
+            'precision':                    'ACCURACY',   # [FP32, FP16, ACCURACY]
+            'num_of_threads':               MAX_THREADS if MAX_THREADS != 0 else 8,
+            'num_streams':                  1,
+            'enable_opencl_throttling':     False,
+            'enable_qdq_optimizer':         False,        # Enable it carefully
+            'disable_dynamic_shapes':       False
+        }
+    ]
+    device_type      = 'cpu'
+    _ort_device_type = C.OrtDevice.cpu()
+elif "CUDAExecutionProvider" in ORT_Accelerate_Providers:
+    provider_options = [
+        {
+            'device_id':                              DEVICE_ID,
+            'gpu_mem_limit':                          24 * 1024 * 1024 * 1024,  # 24 GB
+            'arena_extend_strategy':                  'kNextPowerOfTwo',        # ["kNextPowerOfTwo", "kSameAsRequested"]
+            'cudnn_conv_algo_search':                 'EXHAUSTIVE',             # ["DEFAULT", "HEURISTIC", "EXHAUSTIVE"]
+            'sdpa_kernel':                            '2',                      # ["0", "1", "2"]
+            'use_tf32':                               '1',
+            'fuse_conv_bias':                         '0',                      # Set to '0' to avoid potential errors when enabled.
+            'cudnn_conv_use_max_workspace':           '1',
+            'cudnn_conv1d_pad_to_nc1d':               '0',
+            'tunable_op_enable':                      '0',
+            'tunable_op_tuning_enable':               '0',
+            'tunable_op_max_tuning_duration_ms':      10,
+            'do_copy_in_default_stream':              '0',
+            'enable_cuda_graph':                      '0',                      # Set to '0' to avoid potential errors when enabled.
+            'prefer_nhwc':                            '0',
+            'enable_skip_layer_norm_strict_mode':     '0',
+            'use_ep_level_unified_stream':            '0',
+        }
+    ]
+    device_type      = 'cuda'
+    _ort_device_type = C.OrtDevice.cuda()
+elif "DmlExecutionProvider" in ORT_Accelerate_Providers:
+    provider_options = [
+        {
+            'device_id':                    DEVICE_ID,
+            'performance_preference':       'high_performance',
+            'device_filter':                'gpu',
+            'disable_metacommands':         'false',
+            'enable_graph_capture':         'false',
+            'enable_graph_serialization':   'false',
+        }
+    ]
+    device_type      = 'dml'
+    _ort_device_type = C.OrtDevice.dml()
+else:
+    # Please config by yourself for others providers.
+    device_type      = 'cpu'
+    _ort_device_type = C.OrtDevice.cpu()
+    provider_options = None
+
+_ort_device_obj = C.OrtDevice(_ort_device_type, C.OrtDevice.default_memory(), DEVICE_ID)
+
+
+def normalise_audio(audio: np.ndarray, input_dtype_np, target_rms=None) -> np.ndarray:
+    if target_rms is None:
+        target_rms = NORMALIZE_TARGET_RMS
+    # Integer models consume raw int16 PCM; floating models consume normalized PCM.
+    if NORMALIZE_AUDIO:
+        _audio = audio.astype(np.float32)
+        rms = np.sqrt(np.mean(_audio * _audio, dtype=np.float32), dtype=np.float32)
+        if rms > 0.0:
+            _audio *= (target_rms / (rms + 1e-7))
+        target_dtype = np.dtype(input_dtype_np)
+        if np.issubdtype(target_dtype, np.integer):
+            limits = np.iinfo(target_dtype)
+            np.clip(_audio, limits.min, limits.max, out=_audio)
+        return _audio.astype(target_dtype, copy=False)
+
+    if input_dtype_np != np.int16:
+        audio = audio * INV_INT16
+    return audio.astype(input_dtype_np, copy=False)
+
+
+def _build_run_options(silent: bool) -> onnxruntime.RunOptions:
+    run_options = onnxruntime.RunOptions()
+    run_options.log_severity_level = 0 if not silent else 4
+    run_options.log_verbosity_level = 4
+    run_options.add_run_config_entry("disable_synchronize_execution_providers", "0")
+    return run_options
+
+
+def _build_session_opts_ort() -> onnxruntime.SessionOptions:
+    opts = onnxruntime.SessionOptions()
+    opts.log_severity_level = 0 if ORT_LOG else 4
+    opts.log_verbosity_level = 4
+    opts.inter_op_num_threads = MAX_THREADS
+    opts.intra_op_num_threads = MAX_THREADS
+    opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+    opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    cfgs = {
+        "session.set_denormal_as_zero":                     "1",
+        "session.intra_op.allow_spinning":                  "1",
+        "session.inter_op.allow_spinning":                  "1",
+        "session.enable_quant_qdq_cleanup":                 "1",
+        "session.qdq_matmulnbits_accuracy_level":           "2" if ORT_FP16 else "4",
+        "session.use_device_allocator_for_initializers":    "1",
+        "session.graph_optimizations_loop_level":           "2",
+        "optimization.enable_gelu_approximation":           "1",
+        "optimization.minimal_build_optimizations":         "",
+        "optimization.enable_cast_chain_elimination":       "1",
+        "optimization.disable_specified_optimizers":        (
+            "CastFloat16Transformer;FuseFp16InitializerToFp32NodeTransformer"
+            if ORT_FP16 else ""
+        ),
+    }
+    for key, value in cfgs.items():
+        opts.add_session_config_entry(key, value)
+    return opts
+
+
+def _ortvalue_from_meta(meta, runtime_shape):
+    return onnxruntime.OrtValue.ortvalue_from_numpy(
+        np.zeros(
+            resolve_onnx_shape(meta, runtime_shape),
+            dtype=numpy_dtype_from_onnx_meta(meta),
+        ),
+        device_type,
+        DEVICE_ID,
+    )
+
+
+def _update_ortvalue(ort_value, array):
+    array = np.ascontiguousarray(array)
+    if hasattr(ort_value, "update_inplace"):
+        ort_value.update_inplace(array)
+    else:
+        np.copyto(ort_value.numpy(), array)
+
+
+def _run_iobinding(session, binding):
+    session.run_with_iobinding(binding, run_options=run_options)
+
+
+def _make_session(path: str) -> onnxruntime.InferenceSession:
+    return onnxruntime.InferenceSession(path, **_packed)
+
+
+def _load_sample_rates(model_path: Path) -> tuple[int, int]:
+    metadata = load_runtime_metadata(
+        model_path,
+        _make_session,
+        required_keys=_RUNTIME_METADATA_KEYS,
+    )
+    return metadata.required_int("in_sample_rate"), metadata.required_int("out_sample_rate")
+
+
+def official_overlap_trim_windows(
+    audio: np.ndarray,
+    input_window_samples: int,
+    output_window_samples: int,
+    input_rate: int,
+    output_rate: int,
+    run_window: Callable[[np.ndarray], np.ndarray],
+) -> np.ndarray:
+    """Run static windows with GAP's first/middle/final overlap trimming policy."""
+    if audio.ndim != 3:
+        raise ValueError(f"Expected rank-3 audio [batch, channels, samples], got {audio.shape}.")
+    audio_length = audio.shape[-1]
+    input_hop = input_window_samples // 2
+    output_hop = int(round(output_window_samples * input_hop / input_window_samples))
+    output_trim = (output_window_samples - output_hop) // 2
+
+    if audio_length <= input_window_samples:
+        padded = np.pad(audio, ((0, 0), (0, 0), (0, input_window_samples - audio_length)))
+        output = run_window(padded)
+        valid_output = int(round(audio_length * output_rate / input_rate))
+        return np.ascontiguousarray(output[..., :valid_output], dtype=np.float32)
+
+    starts = [0]
+    while starts[-1] + input_window_samples < audio_length:
+        starts.append(starts[-1] + input_hop)
+    pieces: list[np.ndarray] = []
+    for index, start in enumerate(starts):
+        segment = audio[..., start : start + input_window_samples]
+        valid_input = segment.shape[-1]
+        padded = np.pad(segment, ((0, 0), (0, 0), (0, input_window_samples - valid_input)))
+        output = run_window(padded)
+        valid_output = int(round(valid_input * output_rate / input_rate))
+        output = output[..., :valid_output]
+        if index == 0:
+            piece = output[..., : min(valid_output, output_window_samples - output_trim)]
+        elif index == len(starts) - 1:
+            piece = output[..., min(output_trim, valid_output) :]
+        else:
+            piece = output[..., output_trim : min(valid_output, output_window_samples - output_trim)]
+        pieces.append(piece)
+        print(f"Complete: {start * 100.0 / audio_length:.3f}%")
+    joined = np.concatenate(pieces, axis=-1) if pieces else np.empty((*audio.shape[:-1], 0), dtype=np.float32)
+    expected_length = int(round(audio_length * output_rate / input_rate))
+    if joined.shape[-1] < expected_length:
+        joined = np.pad(joined, ((0, 0), (0, 0), (0, expected_length - joined.shape[-1])))
+    return np.ascontiguousarray(joined[..., :expected_length], dtype=np.float32)
+
+
+session_opts_ort = _build_session_opts_ort()
+run_options = _build_run_options(silent=not ORT_LOG)
+_CPU_EP_ONLY = not ORT_Accelerate_Providers or set(ORT_Accelerate_Providers) == {"CPUExecutionProvider"}
+disabled_opts = []
+if ORT_FP16:
+    disabled_opts.extend(["CastFloat16Transformer", "FuseFp16InitializerToFp32NodeTransformer"])
+if _CPU_EP_ONLY and CPU_DISABLE_MATMUL_ADD_FUSION:
+    disabled_opts.append("MatMulAddFusion")
+if _CPU_EP_ONLY and CPU_DISABLE_NCHWC:
+    disabled_opts.append("NchwcTransformer")
+if _CPU_EP_ONLY:
+    disabled_opts.extend(CPU_EXTRA_DISABLED_OPTIMIZERS)
+disabled_opts = disabled_opts or None
+_packed = {
+    'sess_options': session_opts_ort,
+    'providers': ORT_Accelerate_Providers or ["CPUExecutionProvider"],
+    'provider_options': provider_options,
+    'disabled_optimizers': disabled_opts,
+}
+
+ort_session_A = _make_session(onnx_model_A)
+IN_SAMPLE_RATE, OUT_SAMPLE_RATE = _load_sample_rates(Path(onnx_model_A))
+print(f"\nUsable Providers: {ort_session_A.get_providers()}")
+
+in_name_A = ort_session_A.get_inputs()
+out_name_A = ort_session_A.get_outputs()
+in_name_A0 = in_name_A[0].name
+out_name_A0 = out_name_A[0].name
+input_dtype_np = numpy_dtype_from_onnx_meta(in_name_A[0])
+output_dtype_np = numpy_dtype_from_onnx_meta(out_name_A[0])
+input_shape = in_name_A[0].shape
+output_shape = out_name_A[0].shape
+if len(input_shape) != 3 or len(output_shape) != 3:
+    raise ValueError(
+        f"Expected rank-3 ONNX audio input and output, got input={input_shape}, output={output_shape}."
+    )
+if not all(isinstance(dimension, int) for dimension in (*input_shape, *output_shape)):
+    raise ValueError(f"Expected static GAP-URGENet audio shapes, got input={input_shape}, output={output_shape}.")
+input_batch, input_channels, input_window = (int(dimension) for dimension in input_shape)
+output_batch, output_channels, output_window = (int(dimension) for dimension in output_shape)
+if (input_batch, input_channels) != (1, 1) or (output_batch, output_channels) != (1, 1):
+    raise ValueError(
+        "GAP-URGENet requires mono rank-3 audio [1, 1, samples], "
+        f"got input={input_shape}, output={output_shape}."
+    )
+
+print(f"\nTest Input Audio: {test_noisy_audio}")
+audio_segment = AudioSegment.from_file(test_noisy_audio).set_frame_rate(IN_SAMPLE_RATE)
+input_channels = input_shape[1] if isinstance(input_shape[1], int) else audio_segment.channels
+audio = np.array(
+    audio_segment.set_channels(input_channels).get_array_of_samples(),
+    dtype=np.int16,
+)
+audio = normalise_audio(audio, input_dtype_np)
+audio = audio.reshape(-1, input_channels).T[np.newaxis, ...]
+
+input_buffer = _ortvalue_from_meta(
+    in_name_A[0],
+    (input_batch, input_channels, input_window),
+)
+binding_A = ort_session_A.io_binding()
+binding_A.bind_ortvalue_input(in_name_A0, input_buffer)
+binding_A.bind_output(out_name_A0, device_type, DEVICE_ID)
+
+
+def process_segment(_audio):
+    expected_input_shape = (input_batch, input_channels, input_window)
+    if _audio.shape != expected_input_shape:
+        raise ValueError(f"Expected input window {expected_input_shape}, got {_audio.shape}.")
+    input_array = np.ascontiguousarray(_audio, dtype=input_dtype_np)
+    _update_ortvalue(input_buffer, input_array)
+    _run_iobinding(ort_session_A, binding_A)
+    output = np.array(binding_A.get_outputs()[0].numpy(), copy=True)
+    expected_output_shape = (output_batch, output_channels, output_window)
+    if output.shape != expected_output_shape:
+        raise ValueError(f"Expected output window {expected_output_shape}, got {output.shape}.")
+    return output
+
+
+print("\nRunning the GAP-URGENet by ONNX Runtime.")
+start_time = time.time()
+enhanced_wav = official_overlap_trim_windows(
+    audio,
+    input_window,
+    output_window,
+    IN_SAMPLE_RATE,
+    OUT_SAMPLE_RATE,
+    process_segment,
+)
+print("Complete: 100.00%")
+end_time = time.time()
+
+if output_dtype_np == np.float16:
+    enhanced_wav = enhanced_wav.astype(np.float32)
+
+if enhanced_wav.shape[0] != 1:
+    raise ValueError(f"Expected batch-one enhanced audio, got {enhanced_wav.shape}.")
+audio_for_file = np.ascontiguousarray(enhanced_wav[0].T)
+sf.write(save_denoised_audio, audio_for_file, OUT_SAMPLE_RATE, subtype='PCM_16' if output_dtype_np == np.int16 else 'FLOAT')
+audio_duration = audio_for_file.shape[0] / OUT_SAMPLE_RATE if OUT_SAMPLE_RATE > 0 else 0.0
+rtf = (end_time - start_time) / audio_duration if audio_duration > 0.0 else float("inf")
+print(f"\nDenoise Process Complete.\n\nSaving to: {save_denoised_audio}.\n\nReal-Time Factor (RTF): {rtf:.4f}")

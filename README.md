@@ -13,22 +13,33 @@
 
 ---
 
-`STFT` / `ISTFT` are baked into every ONNX graph — feed in noisy audio and get clean audio straight out, with **no external pre- or post-processing**.
+Audio processing is model-specific: waveform models such as FLA-SepReformer operate directly on audio samples, while spectral models use an STFT/ISTFT path.
 
-> `STFT` / `ISTFT` 已内置于每个 ONNX 计算图中：输入带噪音频，直接输出清晰音频，**无需任何额外的前后处理**。
+> 音频处理流程因模型而异：FLA-SepReformer 等时域模型直接处理音频采样点，频域模型则使用 STFT/ISTFT。
 
 ```mermaid
+%%{init:{"theme":"base","themeVariables":{"lineColor":"#94a3b8","edgeLabelBackground":"#e2e8f0","primaryTextColor":"#1e293b"}}}%%
 flowchart LR
-    A([Noisy / Mixed Audio]) --> S
-    subgraph G["End-to-End ONNX Graph"]
-        direction LR
-        S[STFT] --> M[Neural Model] --> I[ISTFT]
-    end
-    I --> O([Clean Audio])
+    A([Noisy / Mixed Audio]) --> D{Model path}
+    D -->|Waveform| W[Waveform model]
+    D -->|Spectral| S[STFT]
+    S --> M[ONNX separator]
+    M --> I[ISTFT]
+    W --> O([Enhanced / separated audio])
+    I --> O
+    classDef audio fill:#dcfce7,color:#14532d,stroke:#15803d
+    classDef choice fill:#f1f5f9,color:#1e293b,stroke:#64748b
+    classDef waveform fill:#e0f2fe,color:#0c2a3d,stroke:#0369a1
+    classDef spectral fill:#fef3c7,color:#713f12,stroke:#b45309
+    class A,O audio
+    class D choice
+    class W waveform
+    class S,I spectral
+    class M choice
 ```
 
-- **Input / 输入:** noisy · mixed audio &nbsp;→&nbsp; **Output / 输出:** clean, enhanced audio
-- **17 models / 17 个模型** across 5 tasks / 覆盖 5 类任务 — each folder ships `Export`, `Inference`, and `Optimize` scripts.
+- **Input / 输入:** noisy · mixed audio &nbsp;→&nbsp; **Output / 输出:** enhanced audio or separated sources / 增强音频或分离声源
+- **20 models / 20 个模型** across 5 tasks / 覆盖 5 类任务 — each folder ships `Export`, `Inference`, and `Optimize` scripts.
 - More projects / 更多项目: **[DakeQQ Repositories / 仓库](https://github.com/DakeQQ?tab=repositories)**
 
 ---
@@ -37,25 +48,26 @@ flowchart LR
 
 | Task · 任务 | Model · 模型 | Rate · 采样率 | Code · 代码 | Source · 来源 |
 | --- | --- | :---: | --- | --- |
-| Denoise / SE<br>降噪 · 增强 | ZipEnhancer | 16 kHz | [`ZipEnhancer`](./ZipEnhancer) | [ModelScope](https://modelscope.cn/models/iic/speech_zipenhancer_ans_multiloss_16k_base) |
-| Denoise / SE<br>降噪 · 增强 | MossFormerGAN-SE | 16 kHz | [`MossFormerGAN_SE_16K`](./MossFormerGAN_SE_16K) | [ModelScope](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K) |
-| Denoise / SE<br>降噪 · 增强 | MossFormer2-SE | 48 kHz | [`MossFormer2_SE_48K`](./MossFormer2_SE_48K) | [ModelScope](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K) |
+| Echo Cancellation<br>回声消除 | Deep Echo | 16 kHz | [`Deep_Echo_AEC`](./Deep_Echo_AEC) | [GitHub](https://github.com/ZhaoF-i/Deep-echo-path-modeling-for-acoustic-echo-cancellation) |
 | Denoise / SE<br>降噪 · 增强 | DFSMN | 48 kHz | [`DFSMN`](./DFSMN) | [ModelScope](https://modelscope.cn/models/iic/speech_dfsmn_ans_psm_48k_causal/summary) |
+| Echo Cancellation<br>回声消除 | DFSMN-AEC | 16 kHz | [`DFSMN_AEC`](./DFSMN_AEC) | [ModelScope](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k) |
 | Denoise / SE<br>降噪 · 增强 | DPDFNet | 16 kHz | [`DPDFNet`](./DPDFNet) | [GitHub](https://github.com/ceva-ip/DPDFNet) |
+| Speech Separation<br>语音分离 | FLA-SepReformer | 8 kHz | [`FLA_SepReformer_SS_8K`](./FLA_SepReformer_SS_8K) | [ModelScope](https://modelscope.cn/models/damo/speech_flatsepreformer_separation_temporal_8k_base_libri2mix100) |
+| Speech Separation<br>语音分离 | FLA-TFLocoformer-M | 8 kHz | [`FLA_TFLocoformer_SS_8K`](./FLA_TFLocoformer_SS_8K) | [ModelScope](https://modelscope.cn/models/damo/speech_flatflocoformer_separation_timefrequency_8k_middle_libri2mix360) |
+| Denoise / SE<br>降噪 · 增强 | GAP-URGENet | 16 kHz | [`Gap-Urgenet`](./Gap-Urgenet) | [GitHub](https://github.com/Xiaobin-Rong/gap-urgenet) |
 | Denoise / SE<br>降噪 · 增强 | GTCRN | 16 kHz | [`GTCRN`](./GTCRN) | [GitHub](https://github.com/Xiaobin-Rong/gtcrn) |
 | Denoise / SE<br>降噪 · 增强 | H-GTCRN | 16 kHz | [`H-GTCRN`](./H-GTCRN) | [GitHub](https://github.com/max1wz/h-gtcrn) |
+| Vocal Separation<br>人声分离 | Mel-Band-Roformer | 44.1 kHz | [`Mel_Band_Roformer`](./Mel_Band_Roformer) | [GitHub](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model) |
+| Denoise / SE<br>降噪 · 增强 | MossFormer2-SE | 48 kHz | [`MossFormer2_SE_48K`](./MossFormer2_SE_48K) | [ModelScope](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SE_48K) |
+| Super-Resolution<br>超分辨率 | MossFormer2-SR | 16 → 48 kHz | [`MossFormer2_Super_Resolution`](./MossFormer2_Super_Resolution) | [ModelScope](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SR_48K) |
+| Speech Separation<br>语音分离 | MossFormer2-SS | 16 kHz | [`MossFormer2_SS_16K`](./MossFormer2_SS_16K) | [ModelScope](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SS_16K) |
+| Denoise / SE<br>降噪 · 增强 | MossFormerGAN-SE | 16 kHz | [`MossFormerGAN_SE_16K`](./MossFormerGAN_SE_16K) | [ModelScope](https://www.modelscope.cn/models/alibabasglab/MossFormerGAN_SE_16K) |
+| Echo Cancellation<br>回声消除 | NKF-AEC | 16 kHz | [`NKF_AEC`](./NKF_AEC) | [GitHub](https://github.com/fjiang9/NKF-AEC) |
+| Echo Cancellation<br>回声消除 | RTAEC | 16 kHz | [`RTAEC`](./RTAEC) | SOTA-AIs |
+| Echo Cancellation<br>回声消除 | SDAEC | 16 kHz | [`SDAEC`](./SDAEC) | [GitHub](https://github.com/ZhaoF-i/SDAEC) |
 | Denoise / SE<br>降噪 · 增强 | UL-UNAS | 16 kHz | [`UL-UNAS`](./UL-UNAS) | [GitHub](https://github.com/Xiaobin-Rong/ul-unas) |
 | Denoise / SE<br>降噪 · 增强 | UniPASE | 16 kHz<br>(optional 16 → 48 kHz) | [`Unipass`](./Unipass) | [GitHub](https://github.com/Xiaobin-Rong/unipase) |
-| Denoise / SE<br>降噪 · 增强 | GAP-URGENet | 16 kHz | [`Gap-Urgenet`](./Gap-Urgenet) | [GitHub](https://github.com/Xiaobin-Rong/gap-urgenet) |
-| Echo Cancellation<br>回声消除 | SDAEC | 16 kHz | [`SDAEC`](./SDAEC) | [GitHub](https://github.com/ZhaoF-i/SDAEC) |
-| Echo Cancellation<br>回声消除 | DFSMN-AEC | 16 kHz | [`DFSMN_AEC`](./DFSMN_AEC) | [ModelScope](https://modelscope.cn/models/iic/speech_dfsmn_aec_psm_16k) |
-| Echo Cancellation<br>回声消除 | NKF-AEC | 16 kHz | [`NKF_AEC`](./NKF_AEC) | [GitHub](https://github.com/fjiang9/NKF-AEC) |
-| Echo Cancellation<br>回声消除 | Deep Echo | 16 kHz | [`Deep_Echo_AEC`](./Deep_Echo_AEC) | [GitHub](https://github.com/ZhaoF-i/Deep-echo-path-modeling-for-acoustic-echo-cancellation) |
-| Speech Separation<br>语音分离 | MossFormer2-SS | 16 kHz | [`MossFormer2_SS_16K`](./MossFormer2_SS_16K) | [ModelScope](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SS_16K) |
-| Vocal Separation<br>人声分离 | Mel-Band-Roformer | 44.1 kHz | [`Mel_Band_Roformer`](./Mel_Band_Roformer) | [GitHub](https://github.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model) |
-| Super-Resolution<br>超分辨率 | MossFormer2-SR | 16 → 48 kHz | [`MossFormer2_Super_Resolution`](./MossFormer2_Super_Resolution) | [ModelScope](https://www.modelscope.cn/models/alibabasglab/MossFormer2_SR_48K) |
-
-> **Mel-Band-Roformer** ships in both [Mono](./Mel_Band_Roformer/Mono) and [Stereo](./Mel_Band_Roformer/Stereo) variants. · 提供 [Mono](./Mel_Band_Roformer/Mono) 与 [Stereo](./Mel_Band_Roformer/Stereo) 两种版本。
+| Denoise / SE<br>降噪 · 增强 | ZipEnhancer | 16 kHz | [`ZipEnhancer`](./ZipEnhancer) | [ModelScope](https://modelscope.cn/models/iic/speech_zipenhancer_ans_multiloss_16k_base) |
 
 ---
 
@@ -83,7 +95,9 @@ flowchart LR
 | Ubuntu 24.04 | Laptop · i7-1165G7 | CPU | DFSMN-AEC | f32 | 0.11 |
 | Ubuntu 24.04 | Desktop · i3-12300 | CPU | NKF-AEC | f32 | 0.018 † |
 | Ubuntu 24.04 | Desktop · i3-12300 | CPU | Deep Echo-AEC | f32 | 0.024 |
+| Ubuntu 24.04 | Laptop · i7-1165G7 | CPU | RTAEC | f32 | 0.043 – 0.068 |
 | Ubuntu 24.04 | Laptop · i7-1165G7 | CPU | MossFormer2-SS-16K | f32 | 2.63 |
+| Ubuntu 24.04 | Laptop · i7-1165G7 | CPU | FLA-TFLocoformer-M | f32 | 2.5 – 3.0 |
 | Ubuntu 24.04 | Laptop · i7-1165G7 | CPU | Mel-Band-Roformer | q8f32 | 1.40 |
 | Ubuntu 24.04 | Desktop · i3-12300 | CPU | MossFormer2-SR | f32 | 1.49 |
 | Ubuntu 24.04 | Laptop · i7-1165G7 | CPU | DPDFNet | f32 | 0.08 |

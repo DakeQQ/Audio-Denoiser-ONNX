@@ -1,4 +1,5 @@
 import gc
+import math
 import subprocess
 import sys
 import os
@@ -8,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchaudio
 from STFT_Process import STFT_Process  # The custom STFT/ISTFT can be exported in ONNX format.
 
 for _candidate in Path(__file__).resolve().parents:
@@ -102,6 +102,46 @@ def load_mossformer2_sr_model(checkpoint_dir):
     return model
 
 
+def _hz_to_mel(freq: float) -> float:
+    f_min = 0.0
+    f_sp = 200.0 / 3.0
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = math.log(6.4) / 27.0
+    if freq >= min_log_hz:
+        return min_log_mel + math.log(freq / min_log_hz) / logstep
+    return (freq - f_min) / f_sp
+
+
+def _mel_to_hz(mels: torch.Tensor) -> torch.Tensor:
+    f_min = 0.0
+    f_sp = 200.0 / 3.0
+    freqs = f_min + f_sp * mels
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = math.log(6.4) / 27.0
+    log_t = mels >= min_log_mel
+    freqs[log_t] = min_log_hz * torch.exp(logstep * (mels[log_t] - min_log_mel))
+    return freqs
+
+
+def melscale_fbanks(n_freqs: int, f_min: float, f_max: float, n_mels: int, sample_rate: int) -> torch.Tensor:
+    """Create a Slaney mel filterbank matrix (pure PyTorch equivalent of torchaudio.functional.melscale_fbanks)."""
+    all_freqs = torch.linspace(0, sample_rate // 2, n_freqs)
+    m_min = _hz_to_mel(f_min)
+    m_max = _hz_to_mel(f_max)
+    m_pts = torch.linspace(m_min, m_max, n_mels + 2)
+    f_pts = _mel_to_hz(m_pts)
+    f_diff = f_pts[1:] - f_pts[:-1]
+    slopes = f_pts.unsqueeze(0) - all_freqs.unsqueeze(1)
+    down_slopes = (-1.0 * slopes[:, :-2]) / f_diff[:-1]
+    up_slopes = slopes[:, 2:] / f_diff[1:]
+    fb = torch.clamp(torch.min(down_slopes, up_slopes), min=0.0)
+    enorm = 2.0 / (f_pts[2 : n_mels + 2] - f_pts[:n_mels])
+    fb = fb * enorm.unsqueeze(0)
+    return fb
+
+
 class MOSSFORMER_SR(torch.nn.Module):
     def __init__(
         self,
@@ -126,7 +166,7 @@ class MOSSFORMER_SR(torch.nn.Module):
         self.stft_bins = pre_nfft // 2 + 1
         self.n_mels = int(n_mels)
         self.register_buffer('stft_kernel', pre_stft.stft_kernel.detach().contiguous())
-        fbank = torchaudio.functional.melscale_fbanks(pre_nfft // 2 + 1, 0, 8000, n_mels, super_sample_rate, 'slaney', 'slaney')
+        fbank = melscale_fbanks(pre_nfft // 2 + 1, 0, 8000, n_mels, super_sample_rate)
         self.register_buffer('fbank', fbank.transpose(0, 1).unsqueeze(0).contiguous())
         self.register_buffer('mel_power_epsilon', torch.tensor(1e-9, dtype=torch.float32))
         self.scale_factor = float(super_sample_rate / original_sample_rate)

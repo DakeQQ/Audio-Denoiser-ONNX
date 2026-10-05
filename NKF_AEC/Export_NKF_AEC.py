@@ -14,6 +14,7 @@ for _candidate in Path(__file__).resolve().parents:
             sys.path.insert(0, str(_candidate))
         break
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
+from aec_delay_align import DynamicDelayAlign
 from Rewrite_ONNX_Initializer_Identities import rewrite_initializer_identities
 
 
@@ -29,6 +30,8 @@ USE_BATCH_FOLD      = False          # Batch-fold long audio into fixed windows.
 BATCH_WINDOW_SECONDS = 1.5           # Minimum input length (seconds) that triggers window folding.
 IN_AUDIO_DTYPE      = 'F32'          # ['F16', 'F32', 'INT16']
 OUT_AUDIO_DTYPE     = 'F32'          # ['F16', 'F32', 'INT16']
+AUTO_DELAY_ALIGN    = True           # Track and align the near/far bulk delay per segment inside the graph; the 4-frame Kalman filter only spans 64 ms.
+TARGET_TDE_LAG      = 1              # Frames of the measured delay kept after alignment; 0 aligns the direct path.
 
 # Fixed NKF model, STFT, and ONNX export parameters.
 DYNAMIC_AXES        = False          # NKF supports static axes only.
@@ -199,7 +202,7 @@ class NKF(nn.Module):
     - Uses custom STFT_Process instead of torch.stft/istft
     - All operations are ONNX-compatible
     """
-    def __init__(self, L, fc_dim, rnn_layers, rnn_dim, custom_stft, custom_istft, max_frames, in_sample_rate, out_sample_rate, use_batch_fold=False, fold_window=0):
+    def __init__(self, L, fc_dim, rnn_layers, rnn_dim, custom_stft, custom_istft, max_frames, in_sample_rate, out_sample_rate, use_batch_fold=False, fold_window=0, auto_delay_align=False, target_tde_lag=0):
         super().__init__()
         self.L = L
         self.rnn_layers = rnn_layers
@@ -210,6 +213,12 @@ class NKF(nn.Module):
         self.kg_net = KGNet_Real(L, fc_dim, rnn_layers, rnn_dim, self.model_batch)
         self.n_freq = NFFT // 2 + 1  # 513 frequency bins
         self.max_frames = max_frames
+        self.auto_delay_align = auto_delay_align
+        if auto_delay_align:
+            self.delay_align = DynamicDelayAlign(
+                NFFT, HOP_LENGTH, MODEL_SAMPLE_RATE, max_frames,
+                batch=self.model_batch, residual_delay=target_tde_lag,
+            )
         self.input_pcm_scale_folded = "int" in IN_AUDIO_DTYPE.lower() and custom_stft.input_scale != 1.0
         self.output_pcm_scale_folded = "int" in OUT_AUDIO_DTYPE.lower() and custom_istft.output_scale != 1.0
         self.in_sample_rate = in_sample_rate
@@ -237,6 +246,13 @@ class NKF(nn.Module):
     def cache_export_constants_(self):
         self.kg_net.cache_prelu_weights_()
         self.kg_net.fuse_dense_weights_()
+
+    def _kg_input(self, input_real, input_imag):
+        if self.model_batch == 1:
+            return torch.cat((input_real, input_imag), dim=2).transpose(1, 2)
+        # KGNet's grouped Conv1d expects (1, [real, imag] channels, batch * frequency).
+        return torch.stack((input_real, input_imag), dim=0).permute(0, 3, 1, 2).reshape(
+            1, -1, self.model_batch * self.n_freq)
 
     def forward(self, far_end_audio, near_end_audio):
         """
@@ -274,6 +290,10 @@ class NKF(nn.Module):
         # ref: (1, F, T), mic: (1, F, T)
         ref_real, mic_real = pair_real.split(b, dim=0)
         ref_imag, mic_imag = pair_imag.split(b, dim=0)
+        if self.auto_delay_align:
+            ref_comp = self.delay_align(torch.stack([mic_real, mic_imag], dim=1),
+                                        torch.stack([ref_real, ref_imag], dim=1))
+            ref_real, ref_imag = ref_comp.unbind(dim=1)
 
         T = ref_real.shape[2] if DYNAMIC_AXES else self.max_frames
         if DYNAMIC_AXES and T > self.max_frames:
@@ -311,7 +331,7 @@ class NKF(nn.Module):
         # input = cat([xt, mic, zeros_L]) — reuse h_prior_real/imag as the L-wide zero block
         input_real = torch.cat([xt_real, mic_real_t, h_prior_real], dim=2)
         input_imag = torch.cat([xt_imag, mic_imag_t, h_prior_imag], dim=2)
-        input_pair = torch.cat((input_real, input_imag), dim=2).transpose(1, 2)
+        input_pair = self._kg_input(input_real, input_imag)
 
         # KGNet forward
         kg_pair, h_rr, h_ir, h_ri, h_ii = self.kg_net(input_pair, h_rr, h_ir, h_ri, h_ii)
@@ -350,7 +370,7 @@ class NKF(nn.Module):
             # xt: (1, F, L), e: (1, F, 1), dh: (1, F, L) -> total: (1, F, 2*L+1)
             input_real = torch.cat([xt_real, e_real, dh_real], dim=2)
             input_imag = torch.cat([xt_imag, e_imag, dh_imag], dim=2)
-            input_pair = torch.cat((input_real, input_imag), dim=2).transpose(1, 2)
+            input_pair = self._kg_input(input_real, input_imag)
 
             # KGNet forward
             kg_pair, h_rr, h_ir, h_ri, h_ii = self.kg_net(input_pair, h_rr, h_ir, h_ri, h_ii)
@@ -459,89 +479,98 @@ def _run_inference_demo():
     subprocess.run([sys.executable, str(inference_script), str(export_dir)], check=True)
 
 
-print('Export start ...')
-final_path = Path(onnx_model_A).expanduser().resolve()
-final_path.parent.mkdir(parents=True, exist_ok=True)
-# Remove raw artifacts produced by older versions of this exporter. The current
-# raw graph lives only in TemporaryDirectory and is deleted automatically.
-for legacy_raw_path in (
-    final_path.with_name(f'{final_path.stem}.raw.onnx'),
-    final_path.with_name(f'{final_path.stem}.raw_Metadata.onnx'),
-):
-    legacy_raw_path.unlink(missing_ok=True)
+def main():
+    print('Export start ...')
+    final_path = Path(onnx_model_A).expanduser().resolve()
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    # Remove raw artifacts produced by older versions of this exporter. The current
+    # raw graph lives only in TemporaryDirectory and is deleted automatically.
+    for legacy_raw_path in (
+        final_path.with_name(f'{final_path.stem}.raw.onnx'),
+        final_path.with_name(f'{final_path.stem}.raw_Metadata.onnx'),
+    ):
+        legacy_raw_path.unlink(missing_ok=True)
 
-with tempfile.TemporaryDirectory(prefix='nkf_aec_export_') as temp_dir:
-    raw_model_path = Path(temp_dir) / 'NKF_AEC.raw.onnx'
-    rewritten_model_path = Path(temp_dir) / final_path.name
-    with torch.inference_mode():
-        custom_stft = STFT_Process(
-            model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
-            max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
-            input_scale=INV_INT16 if "int" in IN_AUDIO_DTYPE.lower() else 1.0,
-        ).eval()
-        custom_istft = STFT_Process(
-            model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
-            max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
-            static_norm=not DYNAMIC_AXES,
-            output_scale=32767.0 if "int" in OUT_AUDIO_DTYPE.lower() else 1.0,
-        ).eval()
-        nkf_export = NKF(
-            L=FILTER_ORDER,
-            fc_dim=FC_DIM,
-            rnn_layers=RNN_LAYERS,
-            rnn_dim=RNN_DIM,
-            custom_stft=custom_stft,
-            custom_istft=custom_istft,
-            max_frames=MAX_SIGNAL_LENGTH,
-            in_sample_rate=IN_SAMPLE_RATE,
-            out_sample_rate=OUT_SAMPLE_RATE,
-            use_batch_fold=USE_BATCH_FOLD,
-            fold_window=FOLD_WINDOW_LENGTH
-        ).eval()
-        original_state_dict = torch.load(checkpoint_path, map_location='cpu')
-        nkf_export = load_nkf_weights(nkf_export, original_state_dict)
-        nkf_export = nkf_export.float().eval()
-        nkf_export.cache_export_constants_()
+    with tempfile.TemporaryDirectory(prefix='nkf_aec_export_') as temp_dir:
+        raw_model_path = Path(temp_dir) / 'NKF_AEC.raw.onnx'
+        rewritten_model_path = Path(temp_dir) / final_path.name
+        with torch.inference_mode():
+            custom_stft = STFT_Process(
+                model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
+                max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
+                input_scale=INV_INT16 if "int" in IN_AUDIO_DTYPE.lower() else 1.0,
+            ).eval()
+            custom_istft = STFT_Process(
+                model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
+                max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
+                static_norm=not DYNAMIC_AXES,
+                output_scale=32767.0 if "int" in OUT_AUDIO_DTYPE.lower() else 1.0,
+            ).eval()
+            nkf_export = NKF(
+                L=FILTER_ORDER,
+                fc_dim=FC_DIM,
+                rnn_layers=RNN_LAYERS,
+                rnn_dim=RNN_DIM,
+                custom_stft=custom_stft,
+                custom_istft=custom_istft,
+                max_frames=MAX_SIGNAL_LENGTH,
+                in_sample_rate=IN_SAMPLE_RATE,
+                out_sample_rate=OUT_SAMPLE_RATE,
+                use_batch_fold=USE_BATCH_FOLD,
+                fold_window=FOLD_WINDOW_LENGTH,
+                auto_delay_align=AUTO_DELAY_ALIGN,
+                target_tde_lag=TARGET_TDE_LAG,
+            ).eval()
+            original_state_dict = torch.load(checkpoint_path, map_location='cpu')
+            nkf_export = load_nkf_weights(nkf_export, original_state_dict)
+            nkf_export = nkf_export.float().eval()
+            nkf_export.cache_export_constants_()
 
-        if "32" in IN_AUDIO_DTYPE:
-            IN_TORCH_DTYPE = torch.float32
-        elif "int" in IN_AUDIO_DTYPE.lower():
-            IN_TORCH_DTYPE = torch.int16
-        else:
-            IN_TORCH_DTYPE = torch.float16
-        near_end_audio = torch.ones(1, 1, EXPORT_AUDIO_LENGTH, dtype=IN_TORCH_DTYPE)
-        far_end_audio = torch.ones(1, 1, EXPORT_AUDIO_LENGTH, dtype=IN_TORCH_DTYPE)
+            if "32" in IN_AUDIO_DTYPE:
+                IN_TORCH_DTYPE = torch.float32
+            elif "int" in IN_AUDIO_DTYPE.lower():
+                IN_TORCH_DTYPE = torch.int16
+            else:
+                IN_TORCH_DTYPE = torch.float16
+            near_end_audio = torch.ones(1, 1, EXPORT_AUDIO_LENGTH, dtype=IN_TORCH_DTYPE)
+            far_end_audio = torch.ones(1, 1, EXPORT_AUDIO_LENGTH, dtype=IN_TORCH_DTYPE)
 
-        torch.onnx.export(
-            nkf_export,
-            (far_end_audio, near_end_audio),
-            raw_model_path,
-            input_names=['far_end_audio', 'near_end_audio'],
-            output_names=['aec_audio'],
-            do_constant_folding=True,
-            dynamic_axes={
-                'far_end_audio': {2: 'audio_len'},
-                'near_end_audio': {2: 'audio_len'},
-                'aec_audio': {2: 'audio_len'}
-            } if DYNAMIC_AXES else None,
-            opset_version=OPSET,
-            dynamo=False
-        )
-        del nkf_export
-        del near_end_audio
-        del far_end_audio
-        gc.collect()
+            torch.onnx.export(
+                nkf_export,
+                (far_end_audio, near_end_audio),
+                raw_model_path,
+                input_names=['far_end_audio', 'near_end_audio'],
+                output_names=['aec_audio'],
+                do_constant_folding=True,
+                dynamic_axes={
+                    'far_end_audio': {2: 'audio_len'},
+                    'near_end_audio': {2: 'audio_len'},
+                    'aec_audio': {2: 'audio_len'}
+                } if DYNAMIC_AXES else None,
+                opset_version=OPSET,
+                dynamo=False
+            )
+            del nkf_export
+            del near_end_audio
+            del far_end_audio
+            gc.collect()
 
-    rewrite_report = rewrite_initializer_identities(raw_model_path, rewritten_model_path)
-    rewritten_model_path.replace(final_path)
-print(f"Targeted ONNX rewrite: {rewrite_report['deleted_nodes']} Identity aliases removed")
-model_metadata = build_audio_metadata_from_globals(
-    globals(), producer=Path(__file__).name, model_name="NKF_AEC", task="aec", model_family="nkf_aec",
-    max_dynamic_audio_seconds=4, normalize_audio_default=False, input_channels=1, output_channels=1,
-    num_audio_inputs=2, feature_kind="stft_kalman_filter", center_pad=True, pad_mode="constant",
-    extra={"filter_order": FILTER_ORDER, "fc_dim": FC_DIM, "rnn_layers": RNN_LAYERS, "rnn_dim": RNN_DIM},
-)
-stamp_export_metadata(onnx_model_A, model_metadata, OPSET)
-print(f"Metadata saved to: {onnx_model_Metadata}")
-print('\nExport done!')
-_run_inference_demo()
+        rewrite_report = rewrite_initializer_identities(raw_model_path, rewritten_model_path)
+        rewritten_model_path.replace(final_path)
+    print(f"Targeted ONNX rewrite: {rewrite_report['deleted_nodes']} Identity aliases removed")
+    model_metadata = build_audio_metadata_from_globals(
+        globals(), producer=Path(__file__).name, model_name="NKF_AEC", task="aec", model_family="nkf_aec",
+        max_dynamic_audio_seconds=4, normalize_audio_default=False, input_channels=1, output_channels=1,
+        num_audio_inputs=2, feature_kind="stft_kalman_filter", center_pad=True, pad_mode="constant",
+        extra={"filter_order": FILTER_ORDER, "fc_dim": FC_DIM, "rnn_layers": RNN_LAYERS, "rnn_dim": RNN_DIM,
+               "auto_delay_align": AUTO_DELAY_ALIGN, "delay_align": "gcc_phat_segment_tracking",
+               "target_tde_lag": TARGET_TDE_LAG},
+    )
+    stamp_export_metadata(onnx_model_A, model_metadata, OPSET)
+    print(f"Metadata saved to: {onnx_model_Metadata}")
+    print('\nExport done!')
+    _run_inference_demo()
+
+
+if __name__ == '__main__':
+    main()

@@ -13,6 +13,7 @@ for _candidate in Path(__file__).resolve().parents:
             sys.path.insert(0, str(_candidate))
         break
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
+from aec_delay_align import DynamicDelayAlign
 
 
 parent_path          = Path(__file__).resolve().parent                                                     # The folder that contains this script.
@@ -28,6 +29,8 @@ IN_AUDIO_DTYPE       = 'F32'                                                    
 OUT_AUDIO_DTYPE      = 'F32'                                                                      # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 USE_BATCH_FOLD       = False                                                                      # Batch-fold long audio into fixed windows.
 BATCH_WINDOW_SECONDS = 1.5                                                                        # Minimum input length (seconds) that triggers window folding.
+AUTO_DELAY_ALIGN     = True                                                                       # Track and align the near/far bulk delay per segment inside the graph (static profiles only).
+TARGET_TDE_LAG       = 1                                                                          # Frames of the measured delay kept after alignment; 0 aligns the direct path.
 
 # Fixed Deep Echo model and ONNX export parameters.
 OPSET                = 20                                                                         # ONNX opset.
@@ -346,7 +349,7 @@ class NET(torch.nn.Module):
 
 
 class DeepEchoAEC(torch.nn.Module):
-    def __init__(self, iccrn, custom_stft, in_sample_rate, out_sample_rate, use_batch_fold=False, fold_window=0, model_batch_size=1, model_audio_length=0, model_frames=0, input_scale_folded=False):
+    def __init__(self, iccrn, custom_stft, in_sample_rate, out_sample_rate, use_batch_fold=False, fold_window=0, model_batch_size=1, model_audio_length=0, model_frames=0, input_scale_folded=False, auto_delay_align=False, target_tde_lag=0):
         super(DeepEchoAEC, self).__init__()
         self.iccrn = iccrn
         self.use_batch_fold = use_batch_fold          # Fold long near/far inputs into fixed windows batched on dim0
@@ -357,6 +360,14 @@ class DeepEchoAEC(torch.nn.Module):
         self.n_freq = NFFT // 2 + 1
         self.custom_stft = custom_stft
         self.input_scale_folded = input_scale_folded
+        self.auto_delay_align = auto_delay_align
+        if auto_delay_align:
+            if not model_frames:
+                raise ValueError('AUTO_DELAY_ALIGN requires a static STFT frame count (DYNAMIC_AXES=False).')
+            self.delay_align = DynamicDelayAlign(
+                NFFT, HOP_LENGTH, MODEL_SAMPLE_RATE, model_frames,
+                batch=model_batch_size, residual_delay=target_tde_lag,
+            )
         if not input_scale_folded:
             self.inv_int16 = torch.tensor([INV_INT16], dtype=torch.float16 if OUT_AUDIO_DTYPE == 'F16' else torch.float32)
         self.output_pcm_scale = 32767.0
@@ -401,6 +412,10 @@ class DeepEchoAEC(torch.nn.Module):
         # Reorder source-major packed spectra to the checkpoint's complex-major channel order:
         # [near_real, far_real, near_imag, far_imag].
         spec_input = packed_pair.reshape(self.model_batch_size, 2, 2, self.n_freq, frames)
+        if self.auto_delay_align:
+            near_comp, far_comp = spec_input.unbind(dim=1)
+            far_comp = self.delay_align(near_comp, far_comp)
+            spec_input = torch.stack([near_comp, far_comp], dim=1)
         spec_input = spec_input.permute(0, 2, 1, 3, 4).reshape(self.model_batch_size, 4, self.n_freq, frames)
         aec_results = self.iccrn(spec_input)
 
@@ -438,80 +453,87 @@ def _run_inference_demo():
     subprocess.run([sys.executable, str(inference_script), str(export_dir)], check=True)
 
 
-print('Export start ...')
-Path(onnx_model_A).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+def main():
+    print('Export start ...')
+    Path(onnx_model_A).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
 
-with torch.inference_mode():
-    custom_stft = STFT_Process(
-        model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0,
-        window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant", packed_output=True,
-        # Keep the DFT table near [-1, 1] for FP16 precision. DeepEchoAEC applies
-        # 1/32768 explicitly before centering, which also prevents ReduceMean overflow.
-        input_scale=1.0,
-    ).eval()
-    custom_istft = STFT_Process(
-        model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
-        max_frames=MODEL_STFT_FRAMES if not DYNAMIC_AXES else MAX_SIGNAL_LENGTH,
-        window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
-        output_length=MODEL_AUDIO_LENGTH if not DYNAMIC_AXES else 0,
-        static_norm_divisor=not DYNAMIC_AXES,
-    ).eval()
-    iccrn = NET(
-        order=ECHO_ORDER,
-        custom_istft=custom_istft,
-        batch_size=MODEL_BATCH_SIZE,
-        frames=STATIC_STFT_FRAMES,
-    )
-    checkpoint_path = Path(project_path).expanduser().resolve() / 'model.ckpt'
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    except TypeError:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    state_dict = extract_state_dict(checkpoint)
-    iccrn.load_state_dict(state_dict, strict=False)
-    fuse_layer_norm_scales_(iccrn)
-    iccrn = iccrn.float().eval()
+    with torch.inference_mode():
+        custom_stft = STFT_Process(
+            model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH, max_frames=0,
+            window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant", packed_output=True,
+            # Keep the DFT table near [-1, 1] for FP16 precision. DeepEchoAEC applies
+            # 1/32768 explicitly before centering, which also prevents ReduceMean overflow.
+            input_scale=1.0,
+        ).eval()
+        custom_istft = STFT_Process(
+            model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
+            max_frames=MODEL_STFT_FRAMES if not DYNAMIC_AXES else MAX_SIGNAL_LENGTH,
+            window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
+            output_length=MODEL_AUDIO_LENGTH if not DYNAMIC_AXES else 0,
+            static_norm_divisor=not DYNAMIC_AXES,
+        ).eval()
+        iccrn = NET(
+            order=ECHO_ORDER,
+            custom_istft=custom_istft,
+            batch_size=MODEL_BATCH_SIZE,
+            frames=STATIC_STFT_FRAMES,
+        )
+        checkpoint_path = Path(project_path).expanduser().resolve() / 'model.ckpt'
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        state_dict = extract_state_dict(checkpoint)
+        iccrn.load_state_dict(state_dict, strict=False)
+        fuse_layer_norm_scales_(iccrn)
+        iccrn = iccrn.float().eval()
 
-    deep_echo = DeepEchoAEC(
-        iccrn, custom_stft, IN_SAMPLE_RATE, OUT_SAMPLE_RATE, USE_BATCH_FOLD, FOLD_WINDOW_LENGTH,
-        MODEL_BATCH_SIZE, STATIC_AUDIO_LENGTH, STATIC_STFT_FRAMES,
-        input_scale_folded=False,
-    )
-    if "32" in IN_AUDIO_DTYPE:
-        IN_TORCH_DTYPE = torch.float32
-    elif "int" in IN_AUDIO_DTYPE.lower():
-        IN_TORCH_DTYPE = torch.int16
-    else:
-        IN_TORCH_DTYPE = torch.float16
-    near_end_audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
-    far_end_audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
+        deep_echo = DeepEchoAEC(
+            iccrn, custom_stft, IN_SAMPLE_RATE, OUT_SAMPLE_RATE, USE_BATCH_FOLD, FOLD_WINDOW_LENGTH,
+            MODEL_BATCH_SIZE, STATIC_AUDIO_LENGTH, STATIC_STFT_FRAMES,
+            input_scale_folded=False,
+            auto_delay_align=AUTO_DELAY_ALIGN, target_tde_lag=TARGET_TDE_LAG,
+        )
+        if "32" in IN_AUDIO_DTYPE:
+            IN_TORCH_DTYPE = torch.float32
+        elif "int" in IN_AUDIO_DTYPE.lower():
+            IN_TORCH_DTYPE = torch.int16
+        else:
+            IN_TORCH_DTYPE = torch.float16
+        near_end_audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
+        far_end_audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
 
-    torch.onnx.export(
-        deep_echo,
-        (near_end_audio, far_end_audio),
-        onnx_model_A,
-        input_names=['near_end_audio', 'far_end_audio'],
-        output_names=['aec_audio'],
-        dynamic_axes={
-            'near_end_audio': {2: 'near_audio_len'},
-            'far_end_audio': {2: 'far_audio_len'},
-            'aec_audio': {2: 'aec_audio_len'}
-        } if DYNAMIC_AXES else None,
-        opset_version=OPSET,
-        dynamo=False
+        torch.onnx.export(
+            deep_echo,
+            (near_end_audio, far_end_audio),
+            onnx_model_A,
+            input_names=['near_end_audio', 'far_end_audio'],
+            output_names=['aec_audio'],
+            dynamic_axes={
+                'near_end_audio': {2: 'near_audio_len'},
+                'far_end_audio': {2: 'far_audio_len'},
+                'aec_audio': {2: 'aec_audio_len'}
+            } if DYNAMIC_AXES else None,
+            opset_version=OPSET,
+            dynamo=False
+        )
+        del deep_echo
+        del iccrn
+        del near_end_audio
+        del far_end_audio
+        gc.collect()
+    model_metadata = build_audio_metadata_from_globals(
+        globals(), producer=Path(__file__).name, model_name="Deep_Echo_AEC", task="aec", model_family="deep_echo",
+        max_dynamic_audio_seconds=30, normalize_audio_default=False, batch_fold_inference_default=False,
+        input_channels=1, output_channels=1, num_audio_inputs=2, feature_kind="stft", center_pad=True,
+        pad_mode="constant", extra={"echo_order": ECHO_ORDER, "auto_delay_align": AUTO_DELAY_ALIGN,
+                                   "delay_align": "gcc_phat_segment_tracking", "target_tde_lag": TARGET_TDE_LAG},
     )
-    del deep_echo
-    del iccrn
-    del near_end_audio
-    del far_end_audio
-    gc.collect()
-model_metadata = build_audio_metadata_from_globals(
-    globals(), producer=Path(__file__).name, model_name="Deep_Echo_AEC", task="aec", model_family="deep_echo",
-    max_dynamic_audio_seconds=30, normalize_audio_default=False, batch_fold_inference_default=False,
-    input_channels=1, output_channels=1, num_audio_inputs=2, feature_kind="stft", center_pad=True,
-    pad_mode="constant", extra={"echo_order": ECHO_ORDER},
-)
-stamp_export_metadata(onnx_model_A, model_metadata, OPSET)
-print(f"Metadata saved to: {onnx_model_Metadata}")
-print('\nExport done!')
-_run_inference_demo()
+    stamp_export_metadata(onnx_model_A, model_metadata, OPSET)
+    print(f"Metadata saved to: {onnx_model_Metadata}")
+    print('\nExport done!')
+    _run_inference_demo()
+
+
+if __name__ == '__main__':
+    main()

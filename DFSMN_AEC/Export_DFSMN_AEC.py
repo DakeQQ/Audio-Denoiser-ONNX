@@ -1,5 +1,7 @@
 import atexit
 import gc
+import importlib.util
+import math
 import shutil
 import subprocess
 import sys
@@ -21,20 +23,16 @@ from audio_onnx_metadata import (
     metadata_path_for_model,
     stamp_export_metadata,
 )
-from Rewrite_ONNX_Export_Limitations import (
-    rewrite_model,
-    rewrite_nkf_initializer_identities,
-)
 
 
 parent_path         = Path(__file__).resolve().parent                               # The folder that contains this script.
 
 # User settings.
-project_path_A      = str(Path.home() / "Downloads" / "speech_dfsmn_aec_psm_16k")    # The DFSMN AEC download path.
-project_path_B      = str(Path.home() / "Downloads" / "SDAEC-main")                  # The light-AEC project download path. Keywords in this path select the backend.
-                                                                                    # [SDAEC, Deep_Echo, NKF] are supported. https://github.com/ZhaoF-i/SDAEC ; https://github.com/ZhaoF-i/Deep-echo-path-modeling-for-acoustic-echo-cancellation ; https://github.com/jfsean/NKF-AEC
-onnx_model_A        = str(parent_path / "DFSMN_AEC_ONNX" / "DFSMN_AEC.onnx")        # Targeted-rewrite final model.
-DYNAMIC_AXES        = False                           # Set True to export a dynamic audio-length graph when supported.
+project_path_A      = str(Path.home() / "Downloads" / "speech_dfsmn_aec_psm_16k")   # The DFSMN AEC download path.
+project_path_B      = str(parent_path.parent / "RTAEC")                             # The light-AEC project path. Keywords in this path select the backend.
+                                                                                    # [RTAEC, SDAEC, Deep_Echo, NKF] are supported. RTAEC is the in-repo ../RTAEC folder (no checkpoint needed). https://github.com/ZhaoF-i/SDAEC ; https://github.com/ZhaoF-i/Deep-echo-path-modeling-for-acoustic-echo-cancellation ; https://github.com/jfsean/NKF-AEC
+onnx_model_A        = str(parent_path / "DFSMN_AEC_ONNX" / "DFSMN_AEC.onnx")        # Final exported model.
+DYNAMIC_AXES        = False                           # DFSMN_AEC exports a static audio-length graph only.
 IN_SAMPLE_RATE       = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as input.
 OUT_SAMPLE_RATE      = 16000                          # [8000, 16000, 22500, 24000, 44000, 48000]; It accepts various sample rates as output.
 IN_AUDIO_DTYPE       = 'F32'                          # ['F16', 'F32', 'INT16'] dtype of the ONNX model's input audio tensor. Default 'INT16'.
@@ -43,6 +41,7 @@ OUTPUT_VAD_RESULT    = False                          # If true, expose the DFSM
 USE_BATCH_FOLD       = True                           # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
 BATCH_WINDOW_SECONDS = 1.5                            # Minimum input length (seconds) that triggers window folding.
 INPUT_AUDIO_LENGTH   = 32000                          # Maximum input audio length: the length of the audio input signal (in samples) is recommended to be greater than 4096. Higher values yield better quality. It is better to set an integer multiple of the NFFT value.
+AUTO_DELAY_ALIGN     = True                           # Track and align the near/far bulk delay per segment before the light AEC backend (static profiles only).
 
 # VAD post-processing settings.
 FUSION_THRESHOLD    = 0.3                             # Merge adjacent speech segments separated by no more than this many seconds.
@@ -75,41 +74,60 @@ def infer_light_aec_model(project_path: str) -> str:
         return 'NKF'
     if 'sdaec' in project_path_key:
         return 'SDAEC'
+    if 'rtaec' in project_path_key:
+        return 'RTAEC'
     raise ValueError(
         f"Unable to infer LIGHT_AEC_MODEL from project_path_B: {project_path}. "
-        "Expected keywords for 'SDAEC', 'Deep_Echo', or 'NKF'.")
+        "Expected keywords for 'RTAEC', 'SDAEC', 'Deep_Echo', or 'NKF'.")
+
+
+# Each backend is exported by its own sibling script; only its model classes are reused here.
+LIGHT_AEC_SCRIPTS = {
+    'RTAEC': ('RTAEC', 'Export_RTAEC.py'),
+    'SDAEC': ('SDAEC', 'Export_SDAEC.py'),
+    'Deep_Echo': ('Deep_Echo_AEC', 'Export_Deep_Echo.py'),
+    'NKF': ('NKF_AEC', 'Export_NKF_AEC.py'),
+}
+
+
+def load_light_aec_module(light_aec_model: str):
+    folder, script_name = LIGHT_AEC_SCRIPTS[light_aec_model]
+    script_path = parent_path.parent / folder / script_name
+    if not script_path.is_file():
+        raise FileNotFoundError(f'{light_aec_model} exporter not found: {script_path}')
+    if str(script_path.parent) not in sys.path:
+        sys.path.append(str(script_path.parent))   # Backend-local imports, e.g. NKF's Rewrite_ONNX_Initializer_Identities.
+    spec = importlib.util.spec_from_file_location(script_path.stem, script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    # DFSMN_AEC normalizes and resamples before the backend, so it always sees 16 kHz float audio.
+    module.IN_AUDIO_DTYPE = module.OUT_AUDIO_DTYPE = 'F32'
+    module.IN_SAMPLE_RATE = module.OUT_SAMPLE_RATE = MODEL_SAMPLE_RATE
+    if light_aec_model != 'RTAEC':
+        module.project_path = project_path_B
+    if light_aec_model == 'NKF':
+        module.checkpoint_path = project_path_B + '/src/nkf_epoch70.pt'
+    return module
 
 
 LIGHT_AEC_MODEL = infer_light_aec_model(project_path_B)
+light_aec_module = load_light_aec_module(LIGHT_AEC_MODEL)
 
+if DYNAMIC_AXES:
+    raise ValueError('DFSMN_AEC supports static export profiles only (DYNAMIC_AXES=False).')
 if LIGHT_AEC_MODEL == 'NKF':
-    DYNAMIC_AXES       = False
     INPUT_AUDIO_LENGTH = max(32000, INPUT_AUDIO_LENGTH)  # NKF AEC model is recommended >= 32000
+if LIGHT_AEC_MODEL == 'RTAEC':
+    USE_BATCH_FOLD = False                                 # The block-Wiener solver is single-batch.
 
-if LIGHT_AEC_MODEL == 'SDAEC':
-    WINDOW_TYPE_B   = 'hamming'                                                # Type of window function used in the STFT
-    NFFT_B          = 319                                                      # Number of FFT components for the STFT process
-    WINDOW_LENGTH_B = 319                                                      # Length of windowing, edit it carefully.
-    HOP_LENGTH_B    = 160                                                      # Number of samples between successive frames in the STFT
-    ALPHA_K         = 10                                                       # The SDAEC parameter, do not edit the value.
-elif LIGHT_AEC_MODEL == 'Deep_Echo':
-    WINDOW_TYPE_B   = 'hamming'                                                # Type of window function used in the STFT
-    NFFT_B          = 319                                                      # Number of FFT components for the STFT process
-    WINDOW_LENGTH_B = 319                                                      # Length of windowing, edit it carefully.
-    HOP_LENGTH_B    = 160                                                      # Number of samples between successive frames in the STFT
-    ECHO_ORDER      = 10                                                       # Number of Deep_Echo path orders. Do not edit.
-elif LIGHT_AEC_MODEL == 'NKF':
-    checkpoint_path_B = project_path_B + "/src/nkf_epoch70.pt"                 # The pretrained checkpoint path.
-    WINDOW_TYPE_B     = 'hann'                                                 # Type of window function used in the STFT
-    NFFT_B            = 1024                                                   # Number of FFT components for the STFT process
-    WINDOW_LENGTH_B   = 1024                                                   # Length of windowing, edit it carefully.
-    HOP_LENGTH_B      = 256                                                    # Number of samples between successive frames in the STFT
-    FILTER_ORDER      = 4                                                      # Kalman filter order (L), do not edit the value.
-    FC_DIM            = 18                                                     # Fully-connected layer dimension, do not edit the value.
-    RNN_LAYERS        = 1                                                      # Number of GRU layers, do not edit the value.
-    RNN_DIM           = 18                                                     # GRU hidden dimension, do not edit the value.
-else:
-    raise ValueError(f"Unknown LIGHT_AEC_MODEL: {LIGHT_AEC_MODEL}. Choose from 'SDAEC', 'Deep_Echo', 'NKF'.")
+WINDOW_TYPE_B   = light_aec_module.WINDOW_TYPE
+NFFT_B          = light_aec_module.NFFT
+WINDOW_LENGTH_B = light_aec_module.WINDOW_LENGTH
+HOP_LENGTH_B    = light_aec_module.HOP_LENGTH
+TARGET_TDE_LAG  = light_aec_module.TARGET_TDE_LAG
+ALPHA_K         = getattr(light_aec_module, 'ALPHA_K', None)
+ECHO_ORDER      = getattr(light_aec_module, 'ECHO_ORDER', None)
+FILTER_ORDER    = getattr(light_aec_module, 'FILTER_ORDER', None)
 
 
 # Derived export dimensions.
@@ -123,20 +141,13 @@ FOLD_WINDOW_LENGTH   = (
 EXPORT_AUDIO_LENGTH = (
     ((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_WINDOW_LENGTH) * FOLD_WINDOW_LENGTH
 ) if USE_BATCH_FOLD else INPUT_AUDIO_LENGTH  # Static ONNX input length rounded up to whole windows; the tail is zero-padded OUTSIDE the model by the windowing loop.
-if USE_BATCH_FOLD:
-    # In fold mode each backend/mask ISTFT operates per window, so MAX_SIGNAL_LENGTH only needs to cover a single
-    # window's frame count. The smallest backend hop is 160 (SDAEC/Deep_Echo), so W/160 + margin bounds every ISTFT
-    # (SDAEC 150, NKF 94, mask 74 frames for W=24000). The default 128 truncates the per-window backend STFT.
-    MAX_SIGNAL_LENGTH = FOLD_WINDOW_LENGTH // 160 + 10
-
 if USE_BATCH_FOLD and (
-    DYNAMIC_AXES
-    or IN_SAMPLE_RATE != MODEL_SAMPLE_RATE
+    IN_SAMPLE_RATE != MODEL_SAMPLE_RATE
     or OUT_SAMPLE_RATE != MODEL_SAMPLE_RATE
     or INPUT_AUDIO_LENGTH < int(BATCH_WINDOW_SECONDS * IN_SAMPLE_RATE)
 ):
     raise ValueError(
-        'USE_BATCH_FOLD requires a static graph, identical input/model/output sample rates, '
+        'USE_BATCH_FOLD requires identical input/model/output sample rates '
         'and an input at least BATCH_WINDOW_SECONDS long.')
 
 
@@ -145,890 +156,35 @@ def stft_frame_count(audio_length: int, n_fft: int, hop_length: int, center_pad:
     return (padded_length - n_fft) // hop_length + 1
 
 
-def fold_linear_into_pointwise_conv(linear, conv):
-    if conv.kernel_size != (1, 1) or conv.groups != 1:
-        raise ValueError('Linear projection folding requires an ungrouped 1x1 Conv2d.')
-    if linear.bias is None or conv.bias is None:
-        raise ValueError('Linear projection folding requires both affine biases.')
-    if conv.in_channels < linear.out_features:
-        raise ValueError('Conv2d has fewer input channels than the Linear output.')
-
-    with torch.no_grad():
-        conv_weight = conv.weight[:, :, 0, 0].double()
-        projected_weight = conv_weight[:, :linear.out_features]
-        fused_weight = torch.cat((
-            projected_weight @ linear.weight.double(),
-            conv_weight[:, linear.out_features:],
-        ), dim=1).to(dtype=conv.weight.dtype)
-        fused_bias = (
-            conv.bias.double() + projected_weight @ linear.bias.double()
-        ).to(dtype=conv.bias.dtype)
-    return (
-        fused_weight.unsqueeze(-1).unsqueeze(-1).contiguous(),
-        fused_bias.contiguous(),
-    )
-
-
-STATIC_EXPORT = not DYNAMIC_AXES
 MODEL_AUDIO_LENGTH = FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else int(
     round(INPUT_AUDIO_LENGTH * MODEL_SAMPLE_RATE / IN_SAMPLE_RATE))
 MODEL_BATCH = EXPORT_AUDIO_LENGTH // FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else 1
 MASK_FRAMES_A2 = stft_frame_count(MODEL_AUDIO_LENGTH, NFFT_A2, HOP_LENGTH_A, False)
 BACKEND_FRAMES_B = stft_frame_count(MODEL_AUDIO_LENGTH, NFFT_B, HOP_LENGTH_B, True)
-
-if LIGHT_AEC_MODEL == 'SDAEC':
-    def build_ceps_transform_matrices(n_fft):
-        f_bins = n_fft // 2 + 1
-        time_idx = torch.arange(n_fft, dtype=torch.float32).unsqueeze(0)
-        freq_idx = torch.arange(f_bins, dtype=torch.float32).unsqueeze(1)
-        omega = 2 * torch.pi * freq_idx * time_idx / n_fft
-        stft_matrix = torch.cat([torch.cos(omega), -torch.sin(omega)], dim=0).transpose(0, 1).contiguous()
-
-        fourier_basis = torch.fft.fft(torch.eye(n_fft, dtype=torch.float32))
-        fourier_basis_real_imag = torch.vstack([
-            torch.real(fourier_basis[:f_bins]),
-            torch.imag(fourier_basis[:f_bins])
-        ]).float()
-        inverse_matrix = torch.linalg.pinv(fourier_basis_real_imag).transpose(0, 1).contiguous()
-        return stft_matrix, inverse_matrix
-
-
-    class AlphaPredictor(torch.nn.Module):
-        def __init__(self, k):
-            super().__init__()
-            self.linear1 = torch.nn.Linear(2, 1)
-            self.linear2 = torch.nn.Linear(k, 1)
-
-        def forward(self, mix_comp, far_comp, k):
-            pass
-
-
-    class CFB(torch.nn.Module):
-        def __init__(self, in_channels=None, out_channels=None, static_batch=0, static_frames=0):
-            super(CFB, self).__init__()
-            self.conv_gate = torch.nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(1, 1), stride=1, padding=(0, 0), dilation=1, groups=1, bias=True)
-            self.conv_input = torch.nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(1, 1), stride=1, padding=(0, 0), dilation=1, groups=1, bias=True)
-            self.conv = torch.nn.Conv2d(in_channels=out_channels, out_channels=out_channels, kernel_size=(3, 1), stride=1, padding=(1, 0), dilation=1, groups=1, bias=True)
-            self.ceps_unit = CepsUnit(
-                ch=out_channels, static_batch=static_batch, static_frames=static_frames)
-            self.LN0 = LayerNorm(in_channels, f=160)
-            self.LN1 = LayerNorm(out_channels, f=160)
-            self.LN2 = LayerNorm(out_channels, f=160)
-
-        def forward(self, x, stft_matrix, inverse_matrix):
-            g = torch.sigmoid(self.conv_gate(self.LN0(x)))
-            x = self.conv_input(x)
-            gx = g * x
-            y = self.conv(self.LN1(gx))
-            y = y + self.ceps_unit(self.LN2(x - gx), stft_matrix, inverse_matrix)
-            return y
-
-
-    class CepsUnit(torch.nn.Module):
-        def __init__(self, ch, static_batch=0, static_frames=0):
-            super(CepsUnit, self).__init__()
-            self.ch = ch
-            self.static_batch = static_batch
-            self.static_frames = static_frames
-            self.ch_lstm_f = CH_LSTM_F(
-                ch * 2, ch, ch * 2, f=81,
-                static_batch=static_batch, static_frames=static_frames)
-            self.LN = LayerNorm(ch * 2, f=81)
-            self.f = 81
-            self.f2 = 81 * 2
-
-            n_fft = NFFT_B // 2 + 1
-            self.n_fft = n_fft
-            self.hop_len = n_fft
-            win_length = n_fft
-            half_n_fft = n_fft // 2
-            expected_freq_bins = half_n_fft + 1
-            if self.f != expected_freq_bins:
-                raise ValueError(
-                    f'SDAEC CepsUnit expects {self.f} inner STFT bins, but NFFT_B={NFFT_B} produces {expected_freq_bins}.')
-
-        def forward(self, x0, stft_matrix, inverse_matrix):
-            b = self.static_batch if self.static_batch else x0.shape[0]
-            n_time = self.static_frames if self.static_frames else x0.shape[-1]
-            x_rows = x0.permute(0, 1, 3, 2)
-            stft_rows = torch.matmul(x_rows, stft_matrix)
-            stft_pair = stft_rows.reshape(b, self.ch, n_time, 2, self.f).permute(0, 3, 1, 4, 2)
-            stft_pair = stft_pair.reshape(b, self.ch * 2, self.f, n_time)
-            stft_real, stft_imag = stft_pair.split(self.ch, dim=1)
-
-            lstm_output = self.ch_lstm_f(self.LN(stft_pair))
-            processed_real, processed_imag = lstm_output.split(self.ch, dim=1)
-            out_real = processed_real * stft_real - processed_imag * stft_imag
-            out_imag = processed_real * stft_imag + processed_imag * stft_real
-
-            inverse_rows = torch.cat([out_real, out_imag], dim=2)
-            inverse_rows = inverse_rows.permute(0, 1, 3, 2)
-            x_out = torch.matmul(inverse_rows, inverse_matrix)
-            return x_out.transpose(2, 3)
-
-
-    class LayerNorm(torch.nn.Module):
-        def __init__(self, c, f):
-            super(LayerNorm, self).__init__()
-            self.w = torch.nn.Parameter(torch.ones(1, c, f, 1))
-            self.b = torch.nn.Parameter(torch.rand(1, c, f, 1) * 1e-4)
-            reduced = c * f
-            self.normalized_shape = (c, f)
-            self.reduced = reduced
-            self.sum_norm_eps = 1e-6 * float(max(reduced - 1, 1))
-            self.layer_norm_eps = self.sum_norm_eps / float(reduced)
-            self.var_scale_fused = False
-
-        def fuse_var_scale_(self):
-            if self.var_scale_fused:
-                return
-            with torch.no_grad():
-                sample_to_population = (
-                    float(max(self.reduced - 1, 1)) / float(self.reduced)) ** 0.5
-                self.w = torch.nn.Parameter(
-                    (self.w * sample_to_population).reshape(self.normalized_shape).contiguous(),
-                    requires_grad=False)
-                self.b = torch.nn.Parameter(
-                    self.b.reshape(self.normalized_shape).contiguous(),
-                    requires_grad=False)
-            self.var_scale_fused = True
-
-        def forward(self, x):
-            if self.var_scale_fused:
-                x = x.permute(0, 3, 1, 2)
-                x = torch.nn.functional.layer_norm(
-                    x, self.normalized_shape, self.w, self.b, self.layer_norm_eps)
-                return x.permute(0, 2, 3, 1)
-            mean = x.mean((1, 2), keepdim=True)
-            x = x - mean
-            inv_std = torch.rsqrt(x.square().sum((1, 2), keepdim=True) + self.sum_norm_eps)
-            return x * inv_std * self.w + self.b
-
-    class NET(torch.nn.Module):
-        def __init__(self, order=10, channels=20, max_frames=2048, custom_istft=None,
-                     static_batch=0, static_frames=0):
-            super().__init__()
-            self.act = torch.nn.ELU()
-            self.order = order
-            self.custom_istft = custom_istft
-            self.static_batch = static_batch
-            self.static_frames = static_frames
-
-            stft_matrix, inverse_matrix = build_ceps_transform_matrices(NFFT_B // 2 + 1)
-            self.register_buffer('ceps_stft_matrix', stft_matrix)
-            self.register_buffer('ceps_inverse_matrix', inverse_matrix)
-
-            self.in_ch_lstm = CH_LSTM_F(
-                4, channels, channels, static_batch=static_batch, static_frames=static_frames)
-            self.in_conv = torch.nn.Conv2d(in_channels=4 + channels, out_channels=channels, kernel_size=(1, 1))
-            self.cfb_e1 = CFB(channels, channels, static_batch, static_frames)
-            self.cfb_e2 = CFB(channels, channels, static_batch, static_frames)
-            self.cfb_e3 = CFB(channels, channels, static_batch, static_frames)
-            self.cfb_e4 = CFB(channels, channels, static_batch, static_frames)
-            self.cfb_e5 = CFB(channels, channels, static_batch, static_frames)
-            self.ln = LayerNorm(channels, 160)
-            self.ch_lstm = CH_LSTM_T(
-                in_ch=channels, feat_ch=channels * 2, out_ch=channels, num_layers=2,
-                static_batch=static_batch, static_frames=static_frames)
-            self.cfb_d5 = CFB(1 * channels, channels, static_batch, static_frames)
-            self.cfb_d4 = CFB(2 * channels, channels, static_batch, static_frames)
-            self.cfb_d3 = CFB(2 * channels, channels, static_batch, static_frames)
-            self.cfb_d2 = CFB(2 * channels, channels, static_batch, static_frames)
-            self.cfb_d1 = CFB(2 * channels, channels, static_batch, static_frames)
-            self.out_ch_lstm = CH_LSTM_T(
-                2 * channels, channels, channels * 2,
-                static_batch=static_batch, static_frames=static_frames)
-            self.out_conv = torch.nn.Conv2d(in_channels=channels * 3, out_channels=2, kernel_size=(1, 1), padding=(0, 0), bias=True)
-            self.io_projections_fused = False
-
-        def fuse_io_projections_(self):
-            if self.io_projections_fused:
-                return self
-            in_fused_weight, in_fused_bias = fold_linear_into_pointwise_conv(
-                self.in_ch_lstm.linear, self.in_conv)
-            out_fused_weight, out_fused_bias = fold_linear_into_pointwise_conv(
-                self.out_ch_lstm.linear, self.out_conv)
-            self.register_buffer('in_fused_weight', in_fused_weight)
-            self.register_buffer('in_fused_bias', in_fused_bias)
-            self.register_buffer('out_fused_weight', out_fused_weight)
-            self.register_buffer('out_fused_bias', out_fused_bias)
-            self.io_projections_fused = True
-            return self
-
-        def forward(self, x):
-            if self.io_projections_fused:
-                e0 = self.in_ch_lstm.forward_recurrent(x).permute(0, 3, 2, 1)
-                e0 = torch.nn.functional.conv2d(
-                    torch.cat((e0, x), dim=1),
-                    self.in_fused_weight,
-                    self.in_fused_bias,
-                )
-            else:
-                e0 = self.in_ch_lstm(x)
-                e0 = self.in_conv(torch.cat((e0, x), dim=1))
-            e1 = self.cfb_e1(e0, self.ceps_stft_matrix, self.ceps_inverse_matrix)
-            e2 = self.cfb_e2(e1, self.ceps_stft_matrix, self.ceps_inverse_matrix)
-            e3 = self.cfb_e3(e2, self.ceps_stft_matrix, self.ceps_inverse_matrix)
-            e4 = self.cfb_e4(e3, self.ceps_stft_matrix, self.ceps_inverse_matrix)
-            e5 = self.cfb_e5(e4, self.ceps_stft_matrix, self.ceps_inverse_matrix)
-            lstm_out = self.ch_lstm(self.ln(e5))
-            d5 = self.cfb_d5(e5 * lstm_out, self.ceps_stft_matrix, self.ceps_inverse_matrix)
-            d4 = self.cfb_d4(torch.cat([e4, d5], dim=1), self.ceps_stft_matrix, self.ceps_inverse_matrix)
-            d3 = self.cfb_d3(torch.cat([e3, d4], dim=1), self.ceps_stft_matrix, self.ceps_inverse_matrix)
-            d2 = self.cfb_d2(torch.cat([e2, d3], dim=1), self.ceps_stft_matrix, self.ceps_inverse_matrix)
-            d1 = self.cfb_d1(torch.cat([e1, d2], dim=1), self.ceps_stft_matrix, self.ceps_inverse_matrix)
-            decoder_input = torch.cat((e0, d1), dim=1)
-            if self.io_projections_fused:
-                d0 = self.out_ch_lstm.forward_recurrent(decoder_input).permute(0, 3, 1, 2)
-                out = torch.nn.functional.conv2d(
-                    torch.cat((d0, d1), dim=1),
-                    self.out_fused_weight,
-                    self.out_fused_bias,
-                )
-            else:
-                d0 = self.out_ch_lstm(decoder_input)
-                out = self.out_conv(torch.cat((d0, d1), dim=1))
-            b = self.static_batch if self.static_batch else out.shape[0]
-            n_time = self.static_frames if self.static_frames else out.shape[-1]
-            return self.custom_istft(out.reshape(b, 2 * 160, n_time))
-
-
-    class CH_LSTM_T(torch.nn.Module):
-        def __init__(self, in_ch, feat_ch, out_ch, bi=False, num_layers=1, f=160,
-                     static_batch=0, static_frames=0):
-            super().__init__()
-            self.lstm2 = torch.nn.LSTM(in_ch, feat_ch, num_layers=num_layers, batch_first=True, bidirectional=bi)
-            self.bi = 1 if not bi else 2
-            self.linear = torch.nn.Linear(self.bi * feat_ch, out_ch)
-            self.out_ch = out_ch
-            self.f = f
-            self.static_batch = static_batch
-            self.static_frames = static_frames
-
-        def forward_recurrent(self, x):
-            b = self.static_batch if self.static_batch else x.shape[0]
-            n_time = self.static_frames if self.static_frames else x.shape[-1]
-            x = x.permute(0, 2, 3, 1).reshape(b * self.f, n_time, self.lstm2.input_size)
-            x, _ = self.lstm2(x)
-            return x.reshape(b, self.f, n_time, self.linear.in_features)
-
-        def forward(self, x):
-            x = self.linear(self.forward_recurrent(x))
-            return x.permute(0, 3, 1, 2)
-
-
-    class CH_LSTM_F(torch.nn.Module):
-        def __init__(self, in_ch, feat_ch, out_ch, bi=True, num_layers=1, f=160,
-                     static_batch=0, static_frames=0):
-            super().__init__()
-            self.lstm2 = torch.nn.LSTM(in_ch, feat_ch, num_layers=num_layers, batch_first=True, bidirectional=bi)
-            self.linear = torch.nn.Linear(2 * feat_ch, out_ch)
-            self.out_ch = out_ch
-            self.f = f
-            self.static_batch = static_batch
-            self.static_frames = static_frames
-
-        def forward_recurrent(self, x):
-            b = self.static_batch if self.static_batch else x.shape[0]
-            n_time = self.static_frames if self.static_frames else x.shape[-1]
-            x = x.permute(0, 3, 2, 1).reshape(b * n_time, self.f, self.lstm2.input_size)
-            x, _ = self.lstm2(x)
-            return x.reshape(b, n_time, self.f, self.linear.in_features)
-
-        def forward(self, x):
-            x = self.linear(self.forward_recurrent(x))
-            return x.permute(0, 3, 2, 1)
-elif LIGHT_AEC_MODEL == 'Deep_Echo':
-    def maybe_strip_prefix(state_dict, prefix: str):
-        if state_dict and all(key.startswith(prefix) for key in state_dict):
-            return {key[len(prefix):]: value for key, value in state_dict.items()}
-        return state_dict
-
-
-    def extract_state_dict(checkpoint):
-        if isinstance(checkpoint, dict):
-            for key in ('state_dict', 'model_state_dict', 'model', 'network', 'net'):
-                nested = checkpoint.get(key)
-                if isinstance(nested, dict):
-                    checkpoint = nested
-                    break
-
-        if not isinstance(checkpoint, dict):
-            raise TypeError('Unsupported checkpoint format. Expected a state_dict-like mapping.')
-
-        for prefix in ('module.', 'model.', 'network.', 'net.'):
-            checkpoint = maybe_strip_prefix(checkpoint, prefix)
-
-        return checkpoint
-
-
-    class CFB(torch.nn.Module):
-        def __init__(self, in_channels=None, out_channels=None, static_batch=1,
-                     static_frames=0, build_ceps_basis=True, external_lstm_state=False):
-            super(CFB, self).__init__()
-            self.conv_gate = torch.nn.Conv2d(in_channels, out_channels, (1, 1))
-            self.conv_input = torch.nn.Conv2d(in_channels, out_channels, (1, 1))
-            self.conv = torch.nn.Conv2d(out_channels, out_channels, (3, 1), padding=(1, 0))
-            self.ceps_unit = CepsUnit(
-                ch=out_channels,
-                static_batch=static_batch,
-                static_frames=static_frames,
-                build_basis=build_ceps_basis,
-                external_lstm_state=external_lstm_state,
-            )
-            self.LN0 = LayerNorm(in_channels, f=160)
-            self.LN1 = LayerNorm(out_channels, f=160)
-            self.LN2 = LayerNorm(out_channels, f=160)
-
-        def forward(self, x, norm_eps, ceps_norm_eps, stft_kernel, inverse_basis,
-                    initial_state):
-            g = torch.sigmoid(self.conv_gate(self.LN0(x, norm_eps)))
-            x = self.conv_input(x)
-            gx = g * x
-            y = self.conv(self.LN1(gx, norm_eps))
-            y = y + self.ceps_unit(
-                self.LN2(x - gx, norm_eps),
-                ceps_norm_eps,
-                stft_kernel,
-                inverse_basis,
-                initial_state,
-            )
-            return y
-
-
-    class CepsUnit(torch.nn.Module):
-        def __init__(self, ch, static_batch=1, static_frames=0, build_basis=True,
-                     external_lstm_state=False):
-            super(CepsUnit, self).__init__()
-            self.ch = ch
-            self.static_batch = static_batch
-            self.static_frames = static_frames
-            self.ch_lstm_f = CH_LSTM_F(
-                ch * 2,
-                ch,
-                ch * 2,
-                f=81,
-                static_batch=static_batch,
-                static_frames=static_frames,
-                register_state=not external_lstm_state,
-            )
-            # The cepstral DFT can drive sum(x^2) above FLOAT16_MAX even though
-            # the normalized result is small. Quarter-scaling both x and epsilon
-            # is algebraically neutral and keeps this reduction finite in FP16.
-            self.LN = LayerNorm(ch * 2, f=81, sum_scale=0.25)
-            self.f = 81
-            self.f2 = 2 * self.f
-            self.n_fft = NFFT_B // 2 + 1
-            if self.f != self.n_fft // 2 + 1:
-                raise ValueError(
-                    f'Deep_Echo CepsUnit expects {self.f} inner STFT bins, '
-                    f'but NFFT_B={NFFT_B} produces {self.n_fft // 2 + 1}.')
-
-            if build_basis:
-                time_idx = torch.arange(self.n_fft, dtype=torch.float32).unsqueeze(0)
-                freq_idx = torch.arange(self.f, dtype=torch.float32).unsqueeze(1)
-                omega = 2 * torch.pi * freq_idx * time_idx / self.n_fft
-                self.register_buffer(
-                    'stft_kernel',
-                    torch.cat((torch.cos(omega), -torch.sin(omega)), dim=0).unsqueeze(1))
-
-                fourier_basis = torch.fft.fft(torch.eye(self.n_fft, dtype=torch.float32))
-                fourier_basis = torch.vstack((
-                    torch.real(fourier_basis[:self.f]),
-                    torch.imag(fourier_basis[:self.f]),
-                )).float()
-                inverse_basis = torch.linalg.pinv(fourier_basis).T.unsqueeze(1)
-                self.register_buffer('inverse_basis', inverse_basis)
-
-        def forward(self, x0, norm_eps, stft_kernel, inverse_basis, initial_state):
-            batch = self.static_batch if self.static_frames else x0.shape[0]
-            frames = self.static_frames if self.static_frames else x0.shape[-1]
-            x_rows = x0.transpose(2, 3).reshape(-1, 1, self.n_fft)
-            stft_out = torch.nn.functional.conv1d(x_rows, stft_kernel, stride=self.n_fft)
-            stft_pair = stft_out.reshape(
-                batch, self.ch, frames, 2, self.f).permute(0, 3, 1, 4, 2)
-            stft_real, stft_imag = stft_pair.split(1, dim=1)
-
-            lstm_output = self.ch_lstm_f(
-                self.LN(stft_pair.reshape(batch, self.ch * 2, self.f, frames), norm_eps),
-                initial_state,
-            )
-            processed_pair = lstm_output.reshape(batch, 2, self.ch, self.f, frames)
-            processed_real, processed_imag = processed_pair.split(1, dim=1)
-            out_real = processed_real * stft_real - processed_imag * stft_imag
-            out_imag = processed_real * stft_imag + processed_imag * stft_real
-
-            packed = torch.cat((out_real, out_imag), dim=3)
-            packed = packed.permute(0, 1, 2, 4, 3).reshape(-1, self.f2, 1)
-            inv = torch.nn.functional.conv_transpose1d(
-                packed, inverse_basis, stride=self.n_fft)
-            return inv.reshape(batch, self.ch, frames, self.n_fft).transpose(2, 3)
-
-
-    class LayerNorm(torch.nn.Module):
-        def __init__(self, c, f, sum_scale=1.0):
-            super(LayerNorm, self).__init__()
-            self.w = torch.nn.Parameter(torch.ones(1, c, f, 1))
-            self.b = torch.nn.Parameter(torch.rand(1, c, f, 1) * 1e-4)
-            denominator = float(max(c * f - 1, 1))
-            self.register_buffer(
-                'weight_scale', torch.tensor(denominator ** 0.5, dtype=torch.float32))
-            self.norm_eps = 1e-8 * denominator
-            self.sum_scale = float(sum_scale)
-            self.sum_scale_squared = float(sum_scale * sum_scale)
-            self.var_scale_fused = False
-
-        def fuse_var_scale_(self):
-            if self.var_scale_fused:
-                return
-            with torch.no_grad():
-                self.w.mul_(self.weight_scale)
-            self.var_scale_fused = True
-
-        def forward(self, x, norm_eps=None):
-            mean = x.mean((1, 2), keepdim=True)
-            x = x - mean
-            epsilon = self.norm_eps if norm_eps is None else norm_eps
-            if self.sum_scale != 1.0:
-                x = x * self.sum_scale
-                epsilon = epsilon * self.sum_scale_squared
-            inv_std = torch.rsqrt(x.square().sum((1, 2), keepdim=True) + epsilon)
-            return x * inv_std * self.w + self.b
-
-
-    def fuse_layer_norm_scales_(module):
-        for submodule in module.modules():
-            if isinstance(submodule, LayerNorm):
-                submodule.fuse_var_scale_()
-
-
-    class CH_LSTM_T(torch.nn.Module):
-        def __init__(self, in_ch, feat_ch, out_ch, bi=False, num_layers=1, f=160,
-                     static_batch=1, static_frames=0):
-            super(CH_LSTM_T, self).__init__()
-            self.lstm2 = torch.nn.LSTM(
-                in_ch, feat_ch, num_layers=num_layers, batch_first=True,
-                bidirectional=bi)
-            self.bi = 2 if bi else 1
-            self.linear = torch.nn.Linear(self.bi * feat_ch, out_ch)
-            self.out_ch = out_ch
-            self.f = f
-            self.static_batch = static_batch
-            self.static_frames = static_frames
-            self.register_buffer(
-                'initial_state',
-                torch.zeros(num_layers * self.bi, static_batch * f, feat_ch),
-            )
-
-        def forward_recurrent(self, x):
-            frames = self.static_frames if self.static_frames else x.shape[-1]
-            x = x.permute(0, 2, 3, 1).reshape(
-                self.static_batch * self.f, frames, self.lstm2.input_size)
-            x, _ = self.lstm2(x, (self.initial_state, self.initial_state))
-            return x.reshape(
-                self.static_batch, self.f, frames, self.linear.in_features)
-
-        def forward(self, x):
-            x = self.linear(self.forward_recurrent(x))
-            return x.permute(0, 3, 1, 2)
-
-
-    class CH_LSTM_F(torch.nn.Module):
-        def __init__(self, in_ch, feat_ch, out_ch, bi=True, num_layers=1, f=160,
-                     static_batch=1, static_frames=0, register_state=True):
-            super(CH_LSTM_F, self).__init__()
-            self.lstm2 = torch.nn.LSTM(
-                in_ch, feat_ch, num_layers=num_layers, batch_first=True,
-                bidirectional=bi)
-            self.bi = 2 if bi else 1
-            self.linear = torch.nn.Linear(self.bi * feat_ch, out_ch)
-            self.out_ch = out_ch
-            self.f = f
-            self.static_batch = static_batch
-            self.static_frames = static_frames
-            if static_frames and register_state:
-                self.register_buffer(
-                    'initial_state',
-                    torch.zeros(num_layers * self.bi, static_batch * static_frames, feat_ch),
-                )
-
-        def forward_recurrent(self, x, initial_state=None):
-            batch = self.static_batch if self.static_frames else x.shape[0]
-            frames = self.static_frames if self.static_frames else x.shape[-1]
-            x = x.transpose(1, 3).reshape(
-                batch * frames, self.f, self.lstm2.input_size)
-            if initial_state is not None:
-                x, _ = self.lstm2(x, (initial_state, initial_state))
-            elif hasattr(self, 'initial_state'):
-                x, _ = self.lstm2(x, (self.initial_state, self.initial_state))
-            else:
-                x, _ = self.lstm2(x)
-            return x.reshape(batch, frames, self.f, self.linear.in_features)
-
-        def forward(self, x, initial_state=None):
-            x = self.linear(self.forward_recurrent(x, initial_state))
-            return x.transpose(1, 3)
-
-
-    class NET(torch.nn.Module):
-        def __init__(self, order=ECHO_ORDER, channels=20, custom_istft=None,
-                     static_batch=1, static_frames=0):
-            super(NET, self).__init__()
-            self.order = order
-            self.static_batch = static_batch
-            self.static_frames = static_frames
-            self.n_freq = NFFT_B // 2 + 1
-            self.custom_istft = custom_istft
-
-            delay_kernel = torch.eye(order, dtype=torch.float32)
-            delay_kernel = delay_kernel.repeat(2, 1).reshape(2 * order, 1, 1, order)
-            self.register_buffer('delay_bank_kernel', delay_kernel)
-            self.register_buffer(
-                'delay_pad', torch.zeros(static_batch, 2, self.n_freq, order - 1))
-            self.register_buffer(
-                'norm_eps', torch.tensor(1e-8 * (channels * self.n_freq - 1)))
-            self.register_buffer(
-                'ceps_norm_eps', torch.tensor(1e-8 * (2 * channels * 81 - 1)))
-            if static_frames:
-                self.register_buffer(
-                    'bidir_initial_state',
-                    torch.zeros(2, static_batch * static_frames, channels))
-
-            self.in_ch_lstm = CH_LSTM_F(
-                4, channels, channels,
-                static_batch=static_batch, static_frames=static_frames,
-                register_state=False)
-            self.in_conv = torch.nn.Conv2d(4 + channels, channels, (1, 1))
-            self.cfb_e1 = CFB(
-                channels, channels,
-                static_batch=static_batch, static_frames=static_frames,
-                external_lstm_state=True)
-            self.ln = LayerNorm(channels, self.n_freq)
-            self.ch_lstm = CH_LSTM_T(
-                channels, channels * 2, channels, num_layers=2,
-                static_batch=static_batch, static_frames=static_frames)
-            self.cfb_d1 = CFB(
-                channels, channels,
-                static_batch=static_batch, static_frames=static_frames,
-                build_ceps_basis=False, external_lstm_state=True)
-            self.out_ch_lstm = CH_LSTM_T(
-                2 * channels, channels, channels * 2,
-                static_batch=static_batch, static_frames=static_frames)
-            self.out_conv = torch.nn.Conv2d(
-                channels * 3, order * 2, (1, 1), bias=True)
-            self.io_projections_fused = False
-
-        def fuse_io_projections_(self):
-            if self.io_projections_fused:
-                return self
-            in_fused_weight, in_fused_bias = fold_linear_into_pointwise_conv(
-                self.in_ch_lstm.linear, self.in_conv)
-            out_fused_weight, out_fused_bias = fold_linear_into_pointwise_conv(
-                self.out_ch_lstm.linear, self.out_conv)
-            self.register_buffer('in_fused_weight', in_fused_weight)
-            self.register_buffer('in_fused_bias', in_fused_bias)
-            self.register_buffer('out_fused_weight', out_fused_weight)
-            self.register_buffer('out_fused_bias', out_fused_bias)
-            self.io_projections_fused = True
-            return self
-
-        def apply_echo_path(self, far_comp, est_echo_path):
-            frames = self.static_frames if self.static_frames else far_comp.shape[-1]
-            delayed_far = torch.nn.functional.conv2d(
-                torch.cat((self.delay_pad, far_comp), dim=-1),
-                self.delay_bank_kernel,
-                groups=2)
-            delayed_far = delayed_far.reshape(
-                self.static_batch, 2, self.order, self.n_freq, frames)
-            far_real, far_imag = delayed_far.split(1, dim=1)
-            path_real, path_imag = est_echo_path.split(1, dim=1)
-            est_echo_real = far_real * path_real - far_imag * path_imag
-            est_echo_imag = far_real * path_imag + far_imag * path_real
-            return torch.cat((
-                est_echo_real.sum(dim=2),
-                est_echo_imag.sum(dim=2),
-            ), dim=1)
-
-        def forward(self, x):
-            frames = self.static_frames if self.static_frames else x.shape[-1]
-            initial_state = self.bidir_initial_state if hasattr(
-                self, 'bidir_initial_state') else None
-            ceps_basis = self.cfb_e1.ceps_unit
-            mix_comp = x[:, 0::2]
-            far_comp = x[:, 1::2]
-            if self.io_projections_fused:
-                e0 = self.in_ch_lstm.forward_recurrent(
-                    x, initial_state).permute(0, 3, 2, 1)
-                e0 = torch.nn.functional.conv2d(
-                    torch.cat((e0, x), dim=1),
-                    self.in_fused_weight,
-                    self.in_fused_bias,
-                )
-            else:
-                e0 = self.in_ch_lstm(x, initial_state)
-                e0 = self.in_conv(torch.cat((e0, x), dim=1))
-            e1 = self.cfb_e1(
-                e0, self.norm_eps, self.ceps_norm_eps,
-                ceps_basis.stft_kernel, ceps_basis.inverse_basis, initial_state)
-            lstm_out = self.ch_lstm(self.ln(e1, self.norm_eps))
-            d1 = self.cfb_d1(
-                e1 * lstm_out, self.norm_eps, self.ceps_norm_eps,
-                ceps_basis.stft_kernel, ceps_basis.inverse_basis, initial_state)
-            decoder_input = torch.cat((e0, d1), dim=1)
-            if self.io_projections_fused:
-                d0 = self.out_ch_lstm.forward_recurrent(
-                    decoder_input).permute(0, 3, 1, 2)
-                out = torch.nn.functional.conv2d(
-                    torch.cat((d0, d1), dim=1),
-                    self.out_fused_weight,
-                    self.out_fused_bias,
-                )
-            else:
-                d0 = self.out_ch_lstm(decoder_input)
-                out = self.out_conv(torch.cat((d0, d1), dim=1))
-            est_echo_path = out.reshape(
-                self.static_batch, 2, self.order, self.n_freq, frames)
-            enhanced = mix_comp - self.apply_echo_path(far_comp, est_echo_path)
-            return self.custom_istft(
-                enhanced.reshape(self.static_batch, 2 * self.n_freq, frames))
-elif LIGHT_AEC_MODEL == 'NKF':
-    class ComplexGRU_Real(torch.nn.Module):
-        def __init__(self, input_size, hidden_size, num_layers=1, batch_first=True, bias=True):
-            super().__init__()
-            if num_layers != 1:
-                raise ValueError('The NKF checkpoint uses exactly one GRU layer.')
-            self.gru_r = torch.nn.GRU(
-                input_size, hidden_size, num_layers, bias=bias, batch_first=False)
-            self.gru_i = torch.nn.GRU(
-                input_size, hidden_size, num_layers, bias=bias, batch_first=False)
-            self.num_layers = num_layers
-            self.hidden_size = hidden_size
-
-        def forward(self, x_real, x_imag, h_rr, h_ir, h_ri, h_ii):
-            _, h_rr = self.gru_r(x_real, h_rr)
-            _, h_ir = self.gru_r(x_imag, h_ir)
-            _, h_ri = self.gru_i(x_real, h_ri)
-            _, h_ii = self.gru_i(x_imag, h_ii)
-            return h_rr - h_ii, h_ri + h_ir, h_rr, h_ir, h_ri, h_ii
-
-
-    class ComplexDense_Real(torch.nn.Module):
-        def __init__(self, in_channel, out_channel, bias=True):
-            super().__init__()
-            self.linear_real = torch.nn.Linear(in_channel, out_channel, bias=bias)
-            self.linear_imag = torch.nn.Linear(in_channel, out_channel, bias=bias)
-            self.out_channel = out_channel
-
-        def fuse_weights_(self):
-            return
-
-        def forward(self, x_real, x_imag):
-            return self.linear_real(x_real), self.linear_imag(x_imag)
-
-
-    class ComplexPReLU_Real(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.prelu = torch.nn.PReLU()
-            self.negative_slope = 0.0
-            self.use_cached_weight = False
-
-        def cache_weight_(self):
-            self.negative_slope = float(self.prelu.weight.detach().item())
-            self.use_cached_weight = True
-
-        def forward(self, x_real, x_imag):
-            if self.use_cached_weight:
-                return (
-                    torch.nn.functional.leaky_relu(
-                        x_real, negative_slope=self.negative_slope),
-                    torch.nn.functional.leaky_relu(
-                        x_imag, negative_slope=self.negative_slope),
-                )
-            return (
-                torch.nn.functional.prelu(x_real, self.prelu.weight),
-                torch.nn.functional.prelu(x_imag, self.prelu.weight),
-            )
-
-
-    class KGNet_Real(torch.nn.Module):
-        def __init__(self, L, fc_dim, rnn_layers, rnn_dim, model_batch):
-            super().__init__()
-            self.L = L
-            self.rnn_layers = rnn_layers
-            self.rnn_dim = rnn_dim
-            self.n_freq = NFFT_B // 2 + 1
-            self.model_batch = model_batch
-            self.branch_batch = model_batch * self.n_freq
-
-            self.fc_in_dense = ComplexDense_Real(2 * L + 1, fc_dim, bias=True)
-            self.fc_in_act = ComplexPReLU_Real()
-            self.complex_gru = ComplexGRU_Real(fc_dim, rnn_dim, rnn_layers)
-            self.fc_out_dense1 = ComplexDense_Real(rnn_dim, fc_dim, bias=True)
-            self.fc_out_act = ComplexPReLU_Real()
-            self.fc_out_dense2 = ComplexDense_Real(fc_dim, L, bias=True)
-
-        def cache_prelu_weights_(self):
-            self.fc_in_act.cache_weight_()
-            self.fc_out_act.cache_weight_()
-
-        def fuse_dense_weights_(self):
-            self.fc_in_dense.fuse_weights_()
-            self.fc_out_dense1.fuse_weights_()
-            self.fc_out_dense2.fuse_weights_()
-
-        def forward(self, input_real, input_imag, h_rr, h_ir, h_ri, h_ii):
-            x_real, x_imag = self.fc_in_dense(input_real, input_imag)
-            x_real, x_imag = self.fc_in_act(x_real, x_imag)
-            x_real = x_real.reshape(1, self.branch_batch, -1)
-            x_imag = x_imag.reshape(1, self.branch_batch, -1)
-            x_real, x_imag, h_rr, h_ir, h_ri, h_ii = self.complex_gru(
-                x_real, x_imag, h_rr, h_ir, h_ri, h_ii)
-            x_real = x_real.reshape(self.model_batch, self.n_freq, -1)
-            x_imag = x_imag.reshape(self.model_batch, self.n_freq, -1)
-            x_real, x_imag = self.fc_out_dense1(x_real, x_imag)
-            x_real, x_imag = self.fc_out_act(x_real, x_imag)
-            x_real, x_imag = self.fc_out_dense2(x_real, x_imag)
-            return (
-                x_real.reshape(self.model_batch, self.n_freq, self.L),
-                x_imag.reshape(self.model_batch, self.n_freq, self.L),
-                h_rr, h_ir, h_ri, h_ii,
-            )
-
-
-    class NKF_Inner(torch.nn.Module):
-        def __init__(self, L, fc_dim, rnn_layers, rnn_dim, custom_stft,
-                     custom_istft, max_frames, model_batch=1):
-            super().__init__()
-            self.L = L
-            self.rnn_layers = rnn_layers
-            self.rnn_dim = rnn_dim
-            self.custom_stft = custom_stft
-            self.custom_istft = custom_istft
-            self.model_batch = model_batch
-            self.kg_net = KGNet_Real(L, fc_dim, rnn_layers, rnn_dim, model_batch)
-            self.n_freq = NFFT_B // 2 + 1
-            self.max_frames = max_frames
-            self.branch_batch = model_batch * self.n_freq
-
-            self.register_buffer(
-                'h_prior_real_buffer', torch.zeros(model_batch, self.n_freq, L))
-            self.register_buffer(
-                'h_prior_imag_buffer', torch.zeros(model_batch, self.n_freq, L))
-            self.register_buffer(
-                'h_rr_buffer', torch.zeros(rnn_layers, self.branch_batch, rnn_dim))
-            self.register_buffer(
-                'h_ir_buffer', torch.zeros(rnn_layers, self.branch_batch, rnn_dim))
-            self.register_buffer(
-                'h_ri_buffer', torch.zeros(rnn_layers, self.branch_batch, rnn_dim))
-            self.register_buffer(
-                'h_ii_buffer', torch.zeros(rnn_layers, self.branch_batch, rnn_dim))
-            self.register_buffer(
-                'zeros_pad', torch.zeros(model_batch, self.n_freq, L - 1))
-
-        def cache_export_constants_(self):
-            self.kg_net.cache_prelu_weights_()
-            self.kg_net.fuse_dense_weights_()
-
-        def forward(self, audio_pair):
-            pair = self.custom_stft(audio_pair).reshape(
-                2, self.model_batch, 2, self.n_freq, self.max_frames)
-            ref_real = pair[0, :, 0]
-            ref_imag = pair[0, :, 1]
-            mic_real = pair[1, :, 0]
-            mic_imag = pair[1, :, 1]
-
-            h_prior_real = self.h_prior_real_buffer
-            h_prior_imag = self.h_prior_imag_buffer
-            h_rr = self.h_rr_buffer
-            h_ir = self.h_ir_buffer
-            h_ri = self.h_ri_buffer
-            h_ii = self.h_ii_buffer
-
-            ref_real_padded = torch.cat((self.zeros_pad, ref_real), dim=2)
-            ref_imag_padded = torch.cat((self.zeros_pad, ref_imag), dim=2)
-
-            echo_frames_real = []
-            echo_frames_imag = []
-
-            xt_real = ref_real_padded[..., :self.L]
-            xt_imag = ref_imag_padded[..., :self.L]
-            mic_real_t = mic_real[..., [0]]
-            mic_imag_t = mic_imag[..., [0]]
-
-            input_real = torch.cat((xt_real, mic_real_t, h_prior_real), dim=2)
-            input_imag = torch.cat((xt_imag, mic_imag_t, h_prior_imag), dim=2)
-            kg_real, kg_imag, h_rr, h_ir, h_ri, h_ii = self.kg_net(
-                input_real, input_imag, h_rr, h_ir, h_ri, h_ii)
-
-            h_post_real = kg_real * mic_real_t - kg_imag * mic_imag_t
-            h_post_imag = kg_real * mic_imag_t + kg_imag * mic_real_t
-
-            echo_frames_real.append((xt_real * h_post_real - xt_imag * h_post_imag).sum(dim=2, keepdim=True))
-            echo_frames_imag.append((xt_real * h_post_imag + xt_imag * h_post_real).sum(dim=2, keepdim=True))
-
-            for t in range(1, self.max_frames):
-                xt_real = ref_real_padded[..., t:t + self.L]
-                xt_imag = ref_imag_padded[..., t:t + self.L]
-                mic_real_t = mic_real[..., t:t + 1]
-                mic_imag_t = mic_imag[..., t:t + 1]
-
-                dh_real = h_post_real - h_prior_real
-                dh_imag = h_post_imag - h_prior_imag
-                h_prior_real, h_post_real = h_post_real, h_prior_real
-                h_prior_imag, h_post_imag = h_post_imag, h_prior_imag
-
-                e_real = mic_real_t - (xt_real * h_prior_real - xt_imag * h_prior_imag).sum(dim=2, keepdim=True)
-                e_imag = mic_imag_t - (xt_real * h_prior_imag + xt_imag * h_prior_real).sum(dim=2, keepdim=True)
-
-                input_real = torch.cat((xt_real, e_real, dh_real), dim=2)
-                input_imag = torch.cat((xt_imag, e_imag, dh_imag), dim=2)
-                kg_real, kg_imag, h_rr, h_ir, h_ri, h_ii = self.kg_net(
-                    input_real, input_imag, h_rr, h_ir, h_ri, h_ii)
-
-                h_post_real = h_prior_real + kg_real * e_real - kg_imag * e_imag
-                h_post_imag = h_prior_imag + kg_real * e_imag + kg_imag * e_real
-
-                echo_frames_real.append((xt_real * h_post_real - xt_imag * h_post_imag).sum(dim=2, keepdim=True))
-                echo_frames_imag.append((xt_real * h_post_imag + xt_imag * h_post_real).sum(dim=2, keepdim=True))
-
-            echo_hat_real = torch.cat(echo_frames_real, dim=2)
-            echo_hat_imag = torch.cat(echo_frames_imag, dim=2)
-
-            packed_output = torch.cat((
-                mic_real - echo_hat_real,
-                mic_imag - echo_hat_imag,
-            ), dim=1)
-            return self.custom_istft(packed_output)
-
-
-    def load_nkf_weights(export_model, original_state_dict):
-        new_state_dict = {}
-
-        new_state_dict['kg_net.fc_in_dense.linear_real.weight'] = original_state_dict['kg_net.fc_in.0.linear_real.weight']
-        new_state_dict['kg_net.fc_in_dense.linear_real.bias'] = original_state_dict['kg_net.fc_in.0.linear_real.bias']
-        new_state_dict['kg_net.fc_in_dense.linear_imag.weight'] = original_state_dict['kg_net.fc_in.0.linear_imag.weight']
-        new_state_dict['kg_net.fc_in_dense.linear_imag.bias'] = original_state_dict['kg_net.fc_in.0.linear_imag.bias']
-        new_state_dict['kg_net.fc_in_act.prelu.weight'] = original_state_dict['kg_net.fc_in.1.prelu.weight']
-
-        for gru_name in ['gru_r', 'gru_i']:
-            for param in ['weight_ih_l0', 'weight_hh_l0', 'bias_ih_l0', 'bias_hh_l0']:
-                key_src = f'kg_net.complex_gru.{gru_name}.{param}'
-                key_dst = f'kg_net.complex_gru.{gru_name}.{param}'
-                new_state_dict[key_dst] = original_state_dict[key_src]
-
-        new_state_dict['kg_net.fc_out_dense1.linear_real.weight'] = original_state_dict['kg_net.fc_out.0.linear_real.weight']
-        new_state_dict['kg_net.fc_out_dense1.linear_real.bias'] = original_state_dict['kg_net.fc_out.0.linear_real.bias']
-        new_state_dict['kg_net.fc_out_dense1.linear_imag.weight'] = original_state_dict['kg_net.fc_out.0.linear_imag.weight']
-        new_state_dict['kg_net.fc_out_dense1.linear_imag.bias'] = original_state_dict['kg_net.fc_out.0.linear_imag.bias']
-        new_state_dict['kg_net.fc_out_act.prelu.weight'] = original_state_dict['kg_net.fc_out.1.prelu.weight']
-        new_state_dict['kg_net.fc_out_dense2.linear_real.weight'] = original_state_dict['kg_net.fc_out.2.linear_real.weight']
-        new_state_dict['kg_net.fc_out_dense2.linear_real.bias'] = original_state_dict['kg_net.fc_out.2.linear_real.bias']
-        new_state_dict['kg_net.fc_out_dense2.linear_imag.weight'] = original_state_dict['kg_net.fc_out.2.linear_imag.weight']
-        new_state_dict['kg_net.fc_out_dense2.linear_imag.bias'] = original_state_dict['kg_net.fc_out.2.linear_imag.bias']
-
-        export_model.load_state_dict(new_state_dict, strict=False)
-        return export_model
+# Static shape profile that the backend classes read from their module globals.
+light_aec_module.STATIC_MODEL_BATCH = MODEL_BATCH
+light_aec_module.STATIC_SIGNAL_LENGTH = BACKEND_FRAMES_B
+light_aec_module.INPUT_AUDIO_LENGTH = light_aec_module.EXPORT_AUDIO_LENGTH = MODEL_BATCH * MODEL_AUDIO_LENGTH
+
+
+def get_kaldi_mel_banks(num_bins, window_length_padded, sample_freq, low_freq=20.0, high_freq=0.0):
+    """Reproduce torchaudio.compliance.kaldi.get_mel_banks (VTLN off) using pure PyTorch."""
+    num_fft_bins = window_length_padded // 2
+    nyquist = 0.5 * sample_freq
+    if high_freq <= 0.0:
+        high_freq += nyquist
+    fft_bin_width = sample_freq / window_length_padded
+    mel_low_freq = 1127.0 * math.log(1.0 + low_freq / 700.0)
+    mel_high_freq = 1127.0 * math.log(1.0 + high_freq / 700.0)
+    mel_freq_delta = (mel_high_freq - mel_low_freq) / (num_bins + 1)
+    bin_idx = torch.arange(num_bins, dtype=torch.float64).unsqueeze(1)
+    left_mel = mel_low_freq + bin_idx * mel_freq_delta
+    center_mel = mel_low_freq + (bin_idx + 1.0) * mel_freq_delta
+    right_mel = mel_low_freq + (bin_idx + 2.0) * mel_freq_delta
+    mel = (1127.0 * torch.log(1.0 + (fft_bin_width * torch.arange(num_fft_bins, dtype=torch.float64)) / 700.0)).unsqueeze(0)
+    up_slope = (mel - left_mel) / (center_mel - left_mel)
+    down_slope = (right_mel - mel) / (right_mel - center_mel)
+    return torch.clamp(torch.min(up_slope, down_slope), min=0.0)
 
 
 def build_kaldi_fbank_conv(n_fft, win_length, n_mels, sample_rate, preemphasis_coefficient,
@@ -1048,7 +204,6 @@ def build_kaldi_fbank_conv(n_fft, win_length, n_mels, sample_rate, preemphasis_c
         conv_weight: (2 * (n_fft // 2 + 1), 1, win_length) float32 Conv1d weight.
         mel_banks:   (1, n_mels, n_fft // 2 + 1) float32 Mel filterbank.
     """
-    import torchaudio.compliance.kaldi as kaldi
     f_bins = n_fft // 2 + 1
     window = torch.hamming_window(win_length, periodic=False, alpha=0.54, beta=0.46, dtype=torch.float64)
     t = torch.arange(win_length, dtype=torch.float64).unsqueeze(0)
@@ -1065,13 +220,13 @@ def build_kaldi_fbank_conv(n_fft, win_length, n_mels, sample_rate, preemphasis_c
     transformed[:, :-1] -= preemphasis_coefficient * dft_weight[:, 1:]
     transformed -= transformed.mean(dim=1, keepdim=True)
     conv_weight = transformed.unsqueeze(1) * waveform_scale
-    mel_banks, _ = kaldi.get_mel_banks(n_mels, n_fft, float(sample_rate), low_freq, high_freq, 100.0, -500.0, 1.0)
-    mel_banks = torch.nn.functional.pad(mel_banks.to(torch.float64), (0, 1)).unsqueeze(0)
+    mel_banks = get_kaldi_mel_banks(n_mels, n_fft, float(sample_rate), low_freq, high_freq)
+    mel_banks = torch.nn.functional.pad(mel_banks, (0, 1)).unsqueeze(0)
     return conv_weight.float(), mel_banks.float()
 
 
 class DFSMN_AEC(torch.nn.Module):
-    def __init__(self, dfsmn_aec, light_aec, light_aec_type, custom_stft_A2, custom_istft_A2, custom_stft_B, nfft_A, win_length_A, hop_length_A, pre_emphasis, in_sample_rate, out_sample_rate, n_mels, use_batch_fold=False, fold_window=0, alpha_predictor=None, k=None, static_batch=0, static_audio_length=0, backend_frames=0, mask_frames=0, backend_input_scale_folded=False, backend_output_scale_folded=False, output_scale_folded=False, output_vad_result=False):
+    def __init__(self, dfsmn_aec, light_aec, light_aec_type, custom_stft_A2, custom_istft_A2, nfft_A, win_length_A, hop_length_A, pre_emphasis, in_sample_rate, out_sample_rate, n_mels, use_batch_fold=False, fold_window=0, static_batch=0, static_audio_length=0, mask_frames=0, output_vad_result=False):
         super(DFSMN_AEC, self).__init__()
         if light_aec is None:
             raise ValueError('light_aec must be provided.')
@@ -1079,11 +234,7 @@ class DFSMN_AEC(torch.nn.Module):
         self.fold_window = fold_window                # Per-window length (model-rate samples) used when folding
         self.static_batch = static_batch
         self.static_audio_length = static_audio_length
-        self.backend_frames = backend_frames
         self.mask_frames = mask_frames
-        self.backend_input_scale_folded = backend_input_scale_folded
-        self.backend_output_scale_folded = backend_output_scale_folded
-        self.output_scale_folded = output_scale_folded
         self.output_vad_result = output_vad_result
         self.dfsmn_aec = dfsmn_aec.model.to('cpu').float()
         # Inlined UniDeepFsmn causal FSMN memory (replaces modeling_modified/uni_deep_fsmn.py).
@@ -1128,7 +279,6 @@ class DFSMN_AEC(torch.nn.Module):
         self.light_aec_type = light_aec_type
         self.custom_stft_A2 = custom_stft_A2
         self.custom_istft_A2 = custom_istft_A2
-        self.custom_stft_B = custom_stft_B
         self.register_buffer(
             'input_pcm_scale', torch.tensor(INV_INT16, dtype=torch.float32))
         self.register_buffer(
@@ -1150,25 +300,6 @@ class DFSMN_AEC(torch.nn.Module):
         # multiply always runs on the smaller (model-rate) tensor (mirrors the input sandwich above).
         self.output_resample_before_pcm = self.out_sample_rate_scale < 1.0   # out < model -> downsample first
         self.output_resample_after_pcm = self.out_sample_rate_scale > 1.0    # out > model -> upsample after
-
-        if self.light_aec_type == 'SDAEC':
-            if alpha_predictor is None or custom_stft_B is None or k is None:
-                raise ValueError('SDAEC backend requires alpha_predictor, custom_stft_B, and ALPHA_K.')
-            linear2_weight = alpha_predictor.linear2.weight.reshape(1, k)
-            linear1_weight = alpha_predictor.linear1.weight[0]
-            alpha_bias = alpha_predictor.linear2.bias + linear2_weight.sum(dim=1) * alpha_predictor.linear1.bias[0]
-            alpha_mix_weight = linear2_weight * linear1_weight[1]
-            alpha_far_weight = linear2_weight * linear1_weight[0]
-            alpha_kernel = torch.stack([alpha_mix_weight, alpha_far_weight], dim=1)
-            self.register_buffer('alpha_conv_kernel', alpha_kernel)
-            self.register_buffer('alpha_conv_bias', alpha_bias)
-            alpha_batch = static_batch if static_batch else 1
-            self.register_buffer('alpha_power_pad', torch.zeros(alpha_batch, 2, k - 1))
-        elif self.light_aec_type == 'Deep_Echo':
-            if custom_stft_B is None:
-                raise ValueError('Deep_Echo backend requires custom_stft_B.')
-        elif self.light_aec_type != 'NKF':
-            raise ValueError(f'Unsupported light AEC backend: {self.light_aec_type}')
 
         # Keep the fbank convolution in the normalized waveform domain. Its power
         # is restored by the exact 2**30 factor immediately before the FP32 Mel/log
@@ -1197,7 +328,7 @@ class DFSMN_AEC(torch.nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        if "int" in IN_AUDIO_DTYPE.lower() and not self.backend_input_scale_folded:
+        if "int" in IN_AUDIO_DTYPE.lower():
             audio_pair = audio_pair * self.input_pcm_scale  # int16 PCM -> [-1, 1]; float inputs already arrive normalized.
         if self.resample_after_centering:
             audio_pair = torch.nn.functional.interpolate(
@@ -1208,45 +339,12 @@ class DFSMN_AEC(torch.nn.Module):
             )
         return audio_pair
 
-    def _run_sdaec_backend(self, audio_pair, batch):
-        pair_spectrum = self.custom_stft_B(audio_pair)
-        n_time = self.backend_frames if self.backend_frames else pair_spectrum.shape[-1]
-        # audio_pair is (2*batch, 1, W) with the near block first and the far block second; reshape the STFT to
-        # (near_or_far, batch, real_or_imag, freq, time) so each window's near/far branches stay separate.
-        pair_comp = pair_spectrum.reshape(
-            2, batch, 2, NFFT_B // 2 + 1, n_time)
-        mix_comp = pair_comp[0]
-        far_comp = pair_comp[1]
-        frame_power = pair_comp.square().sum(dim=(2, 3)).permute(1, 0, 2)  # (batch, [near, far], time)
-        alpha_pad = self.alpha_power_pad if self.static_batch else self.alpha_power_pad.expand(batch, -1, -1)
-        alpha_input = torch.cat([alpha_pad, frame_power], dim=-1)
-        alpha = torch.nn.functional.conv1d(alpha_input, self.alpha_conv_kernel, bias=self.alpha_conv_bias).unsqueeze(2)
-        far_comp = far_comp * torch.abs(alpha)
-        return self.light_aec(torch.cat([mix_comp, far_comp], dim=1))
-
-    def _run_deep_echo_backend(self, audio_pair, batch):
-        pair_spectrum = self.custom_stft_B(audio_pair)
-        frames = self.backend_frames if self.backend_frames else pair_spectrum.shape[-1]
-        # audio_pair is near-major then far-major. Reorder the packed spectrum to
-        # the checkpoint channel contract [near_real, far_real, near_imag, far_imag].
-        pair_spectrum = pair_spectrum.reshape(
-            2, batch, 2, NFFT_B // 2 + 1, frames)
-        spec_input = pair_spectrum.permute(1, 2, 0, 3, 4).reshape(
-            batch, 4, NFFT_B // 2 + 1, frames)
-        return self.light_aec(spec_input)
-
-    def _run_nkf_backend(self, audio_pair, batch):
-        # NKF consumes raw waveforms ordered as [far, near] and runs its own STFT/ISTFT internally.
-        return self.light_aec(torch.cat([audio_pair[batch:2 * batch], audio_pair[:batch]], dim=0))
-
     def _run_light_aec_backend(self, audio_pair, batch):
-        if self.light_aec_type == 'SDAEC':
-            return self._run_sdaec_backend(audio_pair, batch)
-        if self.light_aec_type == 'Deep_Echo':
-            return self._run_deep_echo_backend(audio_pair, batch)
+        near_audio, far_audio = audio_pair.split(batch, dim=0)
         if self.light_aec_type == 'NKF':
-            return self._run_nkf_backend(audio_pair, batch)
-        raise RuntimeError(f'Unsupported light AEC backend: {self.light_aec_type}')
+            # NKF takes [far, near] and returns its batch-folded windows concatenated along time.
+            return self.light_aec(far_audio, near_audio).reshape(batch, 1, self.static_audio_length)
+        return self.light_aec(near_audio, far_audio)
 
     def _uni_deep_fsmn(self, index, uni_deep_fsmn, x):
         # Inlined UniDeepFsmn.compute1: linear -> ReLU -> (Identity) norm -> project -> causal depthwise FSMN.
@@ -1334,7 +432,7 @@ class DFSMN_AEC(torch.nn.Module):
                 mode='linear',
                 align_corners=False
             )
-        if "int" in OUT_AUDIO_DTYPE.lower() and not self.output_scale_folded:
+        if "int" in OUT_AUDIO_DTYPE.lower():
             audio = audio * self.output_pcm_scale      # [-1, 1] -> int16 PCM; F16/F32 outputs stay normalized.
         if self.output_resample_after_pcm:
             audio = torch.nn.functional.interpolate(
@@ -1384,15 +482,6 @@ temporary_export_paths.update((
     Path(metadata_path_for_model(temporary_model_path)),
 ))
 with torch.inference_mode():
-    backend_packed = LIGHT_AEC_MODEL in ('SDAEC', 'Deep_Echo', 'NKF')
-    # FP16-safe scale policy shared by SDAEC, Deep Echo, and NKF:
-    #   * apply 1/32768 explicitly before the backend;
-    #   * keep STFT/ISTFT tables near unit scale;
-    #   * restore fbank power in one FP32 island;
-    #   * apply the terminal PCM scale in FP32 before Cast(INT16).
-    fold_backend_input_scale = False
-    fold_backend_output_scale = False
-    fold_output_scale = False
     custom_stft_A2 = STFT_Process(
         model_type='stft_B_packed', n_fft=NFFT_A2, hop_len=HOP_LENGTH_A,
         win_length=WINDOW_LENGTH_A, max_frames=0, window_type=WINDOW_TYPE,
@@ -1402,9 +491,11 @@ with torch.inference_mode():
         model_type='istft_B_packed', n_fft=NFFT_A2, hop_len=HOP_LENGTH_A,
         win_length=WINDOW_LENGTH_A, max_frames=MASK_FRAMES_A2,
         window_type=WINDOW_TYPE, center_pad=False, pad_mode='constant',
-        static_frames=MASK_FRAMES_A2 if STATIC_EXPORT else None,
-        output_length=MODEL_AUDIO_LENGTH if STATIC_EXPORT else None,
+        static_frames=MASK_FRAMES_A2,
+        output_length=MODEL_AUDIO_LENGTH,
         output_scale=1.0).eval()
+    # NKF consumes (real, imag) tuples; the other backends use packed spectra.
+    backend_packed = LIGHT_AEC_MODEL != 'NKF'
     custom_stft_B = STFT_Process(
         model_type='stft_B_packed' if backend_packed else 'stft_B',
         n_fft=NFFT_B, hop_len=HOP_LENGTH_B, win_length=WINDOW_LENGTH_B,
@@ -1413,63 +504,61 @@ with torch.inference_mode():
     custom_istft_B = STFT_Process(
         model_type='istft_B_packed' if backend_packed else 'istft_B',
         n_fft=NFFT_B, hop_len=HOP_LENGTH_B, win_length=WINDOW_LENGTH_B,
-        max_frames=BACKEND_FRAMES_B if STATIC_EXPORT else MAX_SIGNAL_LENGTH,
-        window_type=WINDOW_TYPE_B, center_pad=True, pad_mode='constant',
-        static_frames=BACKEND_FRAMES_B if STATIC_EXPORT else None,
-        output_length=MODEL_AUDIO_LENGTH if STATIC_EXPORT else None,
+        max_frames=BACKEND_FRAMES_B, window_type=WINDOW_TYPE_B, center_pad=True, pad_mode='constant',
+        static_frames=BACKEND_FRAMES_B, output_length=MODEL_AUDIO_LENGTH,
         output_scale=1.0).eval()
-    light_aec = None
-    alpha_predictor = None
+    custom_istft_B.forward_packed = custom_istft_B.forward
+    m = light_aec_module
 
     if LIGHT_AEC_MODEL == 'SDAEC':
-        light_aec = NET(
-            max_frames=MAX_SIGNAL_LENGTH,
-            custom_istft=custom_istft_B,
-            static_batch=MODEL_BATCH if STATIC_EXPORT else 0,
-            static_frames=BACKEND_FRAMES_B if STATIC_EXPORT else 0)
-        light_aec.load_state_dict(torch.load(project_path_B + '/Model/ICCRN.ckpt', map_location='cpu'), strict=False)
-        for module in light_aec.modules():
-            if isinstance(module, LayerNorm):
+        iccrn = m.NET(max_frames=BACKEND_FRAMES_B, custom_istft=custom_istft_B)
+        iccrn.load_state_dict(torch.load(project_path_B + '/Model/ICCRN.ckpt', map_location='cpu'), strict=False)
+        for module in iccrn.modules():
+            if isinstance(module, m.LayerNorm):
                 module.fuse_var_scale_()
-            elif isinstance(module, torch.nn.LSTM):
-                module.flatten_parameters()
-        light_aec = light_aec.float().eval().fuse_io_projections_()
-        alpha_predictor = AlphaPredictor(ALPHA_K)
+        iccrn.prepare_for_export_()
+        alpha_predictor = m.AlphaPredictor(m.ALPHA_K)
         alpha_predictor.load_state_dict(torch.load(project_path_B + '/Model/alpha.ckpt', map_location='cpu'), strict=False)
-        alpha_predictor = alpha_predictor.float().eval()
+        light_aec = m.SDAEC(
+            iccrn.float().eval(), alpha_predictor.float().eval(), custom_stft_B, NFFT_B, m.ALPHA_K,
+            BACKEND_FRAMES_B, MODEL_SAMPLE_RATE, MODEL_SAMPLE_RATE,
+            auto_delay_align=AUTO_DELAY_ALIGN, num_tde_lags=m.NUM_TDE_LAGS, target_tde_lag=TARGET_TDE_LAG)
     elif LIGHT_AEC_MODEL == 'Deep_Echo':
-        light_aec = NET(
-            order=ECHO_ORDER,
-            custom_istft=custom_istft_B,
-            static_batch=MODEL_BATCH if STATIC_EXPORT else 1,
-            static_frames=BACKEND_FRAMES_B if STATIC_EXPORT else 0)
+        iccrn = m.NET(
+            order=ECHO_ORDER, custom_istft=custom_istft_B,
+            batch_size=MODEL_BATCH, frames=BACKEND_FRAMES_B)
         checkpoint_path = Path(project_path_B).expanduser().resolve() / 'model.ckpt'
         try:
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         except TypeError:
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        state_dict = extract_state_dict(checkpoint)
-        light_aec.load_state_dict(state_dict, strict=False)
-        fuse_layer_norm_scales_(light_aec)
-        for module in light_aec.modules():
-            if isinstance(module, torch.nn.LSTM):
-                module.flatten_parameters()
-        light_aec = light_aec.float().eval().fuse_io_projections_()
+        iccrn.load_state_dict(m.extract_state_dict(checkpoint), strict=False)
+        m.fuse_layer_norm_scales_(iccrn)
+        light_aec = m.DeepEchoAEC(
+            iccrn.float().eval(), custom_stft_B, MODEL_SAMPLE_RATE, MODEL_SAMPLE_RATE,
+            False, 0, MODEL_BATCH, MODEL_AUDIO_LENGTH, BACKEND_FRAMES_B,
+            input_scale_folded=False, auto_delay_align=AUTO_DELAY_ALIGN, target_tde_lag=TARGET_TDE_LAG)
+    elif LIGHT_AEC_MODEL == 'RTAEC':
+        rtaec_model = m.RTAECModel(
+            custom_istft_B,
+            output_length=MODEL_AUDIO_LENGTH,
+            auto_delay_align=AUTO_DELAY_ALIGN,
+            target_lag=TARGET_TDE_LAG,
+        ).float().eval()
+        light_aec = m.RTAEC(
+            rtaec_model, custom_stft_B, MODEL_SAMPLE_RATE, MODEL_SAMPLE_RATE,
+            False, 0, MODEL_AUDIO_LENGTH, MODEL_AUDIO_LENGTH)
     else:
-        light_aec = NKF_Inner(
-            L=FILTER_ORDER,
-            fc_dim=FC_DIM,
-            rnn_layers=RNN_LAYERS,
-            rnn_dim=RNN_DIM,
-            custom_stft=custom_stft_B,
-            custom_istft=custom_istft_B,
-            max_frames=BACKEND_FRAMES_B,
-            model_batch=MODEL_BATCH
-        ).eval()
-        original_state_dict = torch.load(checkpoint_path_B, map_location='cpu')
-        light_aec = load_nkf_weights(light_aec, original_state_dict)
-        light_aec = light_aec.float().eval()
+        # The batch-fold path also covers a single window, so the window count always rides in dim0.
+        light_aec = m.NKF(
+            L=FILTER_ORDER, fc_dim=m.FC_DIM, rnn_layers=m.RNN_LAYERS, rnn_dim=m.RNN_DIM,
+            custom_stft=custom_stft_B, custom_istft=custom_istft_B, max_frames=BACKEND_FRAMES_B,
+            in_sample_rate=MODEL_SAMPLE_RATE, out_sample_rate=MODEL_SAMPLE_RATE,
+            use_batch_fold=True, fold_window=MODEL_AUDIO_LENGTH,
+            auto_delay_align=AUTO_DELAY_ALIGN, target_tde_lag=TARGET_TDE_LAG)
+        light_aec = m.load_nkf_weights(light_aec, torch.load(m.checkpoint_path, map_location='cpu'))
         light_aec.cache_export_constants_()
+    light_aec = light_aec.float().eval()
 
     dfsmn_pipeline = pipeline(
         Tasks.acoustic_echo_cancellation,
@@ -1484,7 +573,6 @@ with torch.inference_mode():
         light_aec_type=LIGHT_AEC_MODEL,
         custom_stft_A2=custom_stft_A2,
         custom_istft_A2=custom_istft_A2,
-        custom_stft_B=custom_stft_B if LIGHT_AEC_MODEL != 'NKF' else None,
         nfft_A=NFFT_A,
         win_length_A=WINDOW_LENGTH_A,
         hop_length_A=HOP_LENGTH_A,
@@ -1494,15 +582,9 @@ with torch.inference_mode():
         n_mels=N_MELS,
         use_batch_fold=USE_BATCH_FOLD,
         fold_window=FOLD_WINDOW_LENGTH,
-        alpha_predictor=alpha_predictor,
-        k=ALPHA_K if LIGHT_AEC_MODEL == 'SDAEC' else None,
-        static_batch=MODEL_BATCH if STATIC_EXPORT else 0,
-        static_audio_length=MODEL_AUDIO_LENGTH if STATIC_EXPORT else 0,
-        backend_frames=BACKEND_FRAMES_B if STATIC_EXPORT else 0,
-        mask_frames=MASK_FRAMES_A2 if STATIC_EXPORT else 0,
-        backend_input_scale_folded=fold_backend_input_scale,
-        backend_output_scale_folded=fold_backend_output_scale,
-        output_scale_folded=fold_output_scale,
+        static_batch=MODEL_BATCH,
+        static_audio_length=MODEL_AUDIO_LENGTH,
+        mask_frames=MASK_FRAMES_A2,
         output_vad_result=OUTPUT_VAD_RESULT,
     )
     if "32" in IN_AUDIO_DTYPE:
@@ -1521,19 +603,12 @@ with torch.inference_mode():
         input_names=['near_end_audio', 'far_end_audio'],
         output_names=(['aec_audio', 'vad_results'] if OUTPUT_VAD_RESULT else ['aec_audio']),
         do_constant_folding=True,
-        dynamic_axes={
-            'near_end_audio': {2: 'audio_len'},
-            'far_end_audio': {2: 'audio_len'},
-            'aec_audio': {2: 'audio_len'},
-            **({'vad_results': {0: 'signal_len'}} if OUTPUT_VAD_RESULT else {}),
-        } if DYNAMIC_AXES else None,
         opset_version=OPSET,
         dynamo=False
     )
     del dfsmn_aec
     del dfsmn_pipeline
     del light_aec
-    del alpha_predictor
     del near_end_audio
     del far_end_audio
     gc.collect()
@@ -1545,38 +620,22 @@ model_metadata = build_audio_metadata_from_globals(
         "light_aec_model": LIGHT_AEC_MODEL, "n_mels": N_MELS, "nfft_a": NFFT_A, "nfft_a2": NFFT_A2,
         "window_length_a": WINDOW_LENGTH_A, "hop_length_a": HOP_LENGTH_A, "nfft_b": NFFT_B,
         "window_length_b": WINDOW_LENGTH_B, "hop_length_b": HOP_LENGTH_B, "window_type_b": WINDOW_TYPE_B,
-        "preemphasize": PRE_EMPHASIZE, "alpha_k": globals().get("ALPHA_K"),
-        "echo_order": globals().get("ECHO_ORDER"), "filter_order": globals().get("FILTER_ORDER"),
+        "preemphasize": PRE_EMPHASIZE, "alpha_k": ALPHA_K,
+        "echo_order": ECHO_ORDER, "filter_order": FILTER_ORDER,
         "output_vad_result": OUTPUT_VAD_RESULT, "num_outputs": 2 if OUTPUT_VAD_RESULT else 1,
         "output_frame_shift_seconds": HOP_LENGTH_A / MODEL_SAMPLE_RATE,
         "output_frame_shift_samples": HOP_LENGTH_A, "fbank_window_length_samples": WINDOW_LENGTH_A,
         "speaking_score": SPEAKING_SCORE, "silence_score": SILENCE_SCORE,
         "look_ahead_seconds": LOOK_AHEAD, "fusion_threshold_seconds": FUSION_THRESHOLD,
         "min_speech_duration_seconds": MIN_SPEECH_DURATION,
+        "auto_delay_align": AUTO_DELAY_ALIGN, "delay_align": "gcc_phat_segment_tracking",
+        "target_tde_lag": TARGET_TDE_LAG,
     },
 )
 stamp_export_metadata(temporary_model_path, model_metadata, OPSET)
-rewrite_summary = None
-if LIGHT_AEC_MODEL == 'SDAEC' and STATIC_EXPORT:
-    rewrite_summary = rewrite_model(temporary_model_path, onnx_model_A)
-elif LIGHT_AEC_MODEL == 'NKF' and STATIC_EXPORT:
-    rewrite_summary = rewrite_nkf_initializer_identities(
-        temporary_model_path,
-        onnx_model_A,
-        frames=BACKEND_FRAMES_B,
-        model_batch=MODEL_BATCH,
-        n_freq=NFFT_B // 2 + 1,
-        filter_order=FILTER_ORDER,
-        fc_dim=FC_DIM,
-        rnn_dim=RNN_DIM,
-    )
-else:
-    shutil.copyfile(temporary_model_path, onnx_model_A)
+shutil.copyfile(temporary_model_path, onnx_model_A)
 export_metadata_carrier(onnx_model_Metadata, model_metadata, OPSET)
 print(f"Metadata saved to: {onnx_model_Metadata}")
-if rewrite_summary is not None:
-    print(
-        f"Targeted rewrite: {rewrite_summary['raw_nodes']} -> {rewrite_summary['final_nodes']} nodes.")
 print('\nExport done!')
 try:
     _run_inference_demo()

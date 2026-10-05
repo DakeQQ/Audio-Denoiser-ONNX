@@ -1,11 +1,11 @@
 import gc
+import math
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 import torch
 import torch.nn.functional as F
-import torchaudio
 from modelscope.pipelines import pipeline
 from modelscope.utils.constant import Tasks
 from STFT_Process import STFT_Process                                                      # The custom STFT/ISTFT can be exported in ONNX format.
@@ -62,6 +62,26 @@ EXPORT_AUDIO_LENGTH   = (((INPUT_AUDIO_LENGTH + FOLD_WINDOW_LENGTH - 1) // FOLD_
 STATIC_MODEL_BATCH    = EXPORT_AUDIO_LENGTH // FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else 1
 STFT_SIGNAL_LENGTH    = ((FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else MODEL_AUDIO_LENGTH) - NFFT_STFT) // HOP_LENGTH + 1
 MAX_SIGNAL_LENGTH     = 2048 if DYNAMIC_AXES else STFT_SIGNAL_LENGTH
+
+
+def get_kaldi_mel_banks(num_bins, window_length_padded, sample_freq, low_freq=20.0, high_freq=0.0):
+    """Reproduce torchaudio.compliance.kaldi.get_mel_banks (VTLN off) using pure PyTorch."""
+    num_fft_bins = window_length_padded // 2
+    nyquist = 0.5 * sample_freq
+    if high_freq <= 0.0:
+        high_freq += nyquist
+    fft_bin_width = sample_freq / window_length_padded
+    mel_low_freq = 1127.0 * math.log(1.0 + low_freq / 700.0)
+    mel_high_freq = 1127.0 * math.log(1.0 + high_freq / 700.0)
+    mel_freq_delta = (mel_high_freq - mel_low_freq) / (num_bins + 1)
+    bin_idx = torch.arange(num_bins, dtype=torch.float64).unsqueeze(1)
+    left_mel = mel_low_freq + bin_idx * mel_freq_delta
+    center_mel = mel_low_freq + (bin_idx + 1.0) * mel_freq_delta
+    right_mel = mel_low_freq + (bin_idx + 2.0) * mel_freq_delta
+    mel = (1127.0 * torch.log(1.0 + (fft_bin_width * torch.arange(num_fft_bins, dtype=torch.float64)) / 700.0)).unsqueeze(0)
+    up_slope = (mel - left_mel) / (center_mel - left_mel)
+    down_slope = (right_mel - mel) / (right_mel - center_mel)
+    return torch.clamp(torch.min(up_slope, down_slope), min=0.0)
 
 
 class DFSMN(torch.nn.Module):
@@ -127,8 +147,8 @@ class DFSMN(torch.nn.Module):
         self.register_buffer('analysis_conv_weight', torch.cat([fbank_kernel, stft_kernel.float()], dim=0))
 
         # Kaldi triangular mel filterbank (num_mel_bins, padded_window_size//2 + 1), zero-padded right.
-        mel_banks, _ = torchaudio.compliance.kaldi.get_mel_banks(
-            n_mels, KALDI_NFFT, 48000.0, 20.0, 0.0, 100.0, -500.0, 1.0)        # (120, 1024)
+        mel_banks = get_kaldi_mel_banks(
+            n_mels, KALDI_NFFT, 48000.0, 20.0, 0.0)                              # (120, 1024)
         mel_banks = torch.nn.functional.pad(mel_banks, (0, 1), mode='constant', value=0.0)  # (120, 1025)
         self.register_buffer('mel_banks', mel_banks.unsqueeze(0).float())     # (1, 120, 1025)
 

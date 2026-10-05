@@ -1,4 +1,5 @@
 import gc
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ for _candidate in Path(__file__).resolve().parents:
             sys.path.insert(0, str(_candidate))
         break
 from audio_onnx_metadata import build_audio_metadata_from_globals, metadata_path_for_model, stamp_export_metadata
+from aec_delay_align import DynamicDelayAlign
 
 
 # User settings.
@@ -24,6 +26,9 @@ IN_AUDIO_DTYPE        = 'F32'                         # ['F16', 'F32', 'INT16'] 
 OUT_AUDIO_DTYPE       = 'F32'                         # ['F16', 'F32', 'INT16'] dtype of the ONNX model's output audio tensor. Default 'INT16'.
 BATCH_WINDOW_SECONDS  = 1.5                           # Minimum input length (seconds) that triggers window folding.
 USE_BATCH_FOLD        = False                         # If true, batch-fold always enabled (requires DYNAMIC_AXES=False + IN==MODEL==OUT rate + INPUT_AUDIO_LENGTH >= BATCH_WINDOW_SECONDS*IN_SAMPLE_RATE).
+AUTO_DELAY_ALIGN      = True                          # Auto-align bulk latency between near-end and far-end in the STFT domain.
+NUM_TDE_LAGS          = 96                            # Search range in STFT frames (96 frames * 10 ms = 0 to 950 ms).
+TARGET_TDE_LAG        = 1                             # Frames of the measured delay kept after alignment, so the far-end still leads the echo; 0 aligns the direct path.
 
 # Fixed SDAEC model and ONNX export parameters.
 DYNAMIC_AXES          = False
@@ -343,12 +348,18 @@ class CH_LSTM_F(torch.nn.Module):
 
 
 class SDAEC(torch.nn.Module):
-    def __init__(self, iccrn, alpha_predictor, custom_stft, nfft, k, max_len, in_sample_rate, out_sample_rate, use_batch_fold=False, fold_window=0):
+    def __init__(self, iccrn, alpha_predictor, custom_stft, nfft, k, max_len, in_sample_rate, out_sample_rate, use_batch_fold=False, fold_window=0, auto_delay_align=True, num_tde_lags=64, target_tde_lag=0):
         super(SDAEC, self).__init__()
         self.iccrn = iccrn
         self.use_batch_fold = use_batch_fold          # Fold long near/far inputs into fixed windows batched on dim0
         self.fold_window = fold_window                # Per-window length (model-rate samples) used when folding
         self.custom_stft = custom_stft
+        self.auto_delay_align = auto_delay_align
+        if self.auto_delay_align:
+            self.bulk_delay_align = DynamicDelayAlign(
+                nfft, HOP_LENGTH, MODEL_SAMPLE_RATE, STATIC_SIGNAL_LENGTH,
+                batch=STATIC_MODEL_BATCH, residual_delay=target_tde_lag, num_lags=num_tde_lags,
+            )
         self.input_pcm_scale_folded = "int" in IN_AUDIO_DTYPE.lower() and custom_stft.input_scale != 1.0
         self.output_pcm_scale_folded = (
             "int" in OUT_AUDIO_DTYPE.lower()
@@ -407,11 +418,16 @@ class SDAEC(torch.nn.Module):
             2 * batch, 2, NFFT // 2 + 1, -1
         )
         frames = STATIC_SIGNAL_LENGTH if STATIC_SIGNAL_LENGTH is not None else pair_comp.shape[-1]
-        frame_power = pair_comp.square().sum(dim=(1, 2)).view(2, batch, frames).transpose(0, 1)
         if STATIC_MODEL_BATCH is not None:
             mix_comp, far_comp = pair_comp.split(STATIC_MODEL_BATCH, dim=0)
         else:
             mix_comp, far_comp = pair_comp.chunk(2, dim=0)
+
+        if self.auto_delay_align:
+            far_comp = self.bulk_delay_align(mix_comp, far_comp)
+
+        pair_aligned = torch.cat([mix_comp, far_comp], dim=0)
+        frame_power = pair_aligned.square().sum(dim=(1, 2)).view(2, batch, frames).transpose(0, 1)
         alpha_pad = self.alpha_power_pad if batch == 1 else self.alpha_power_pad.expand(batch, -1, -1)
         alpha_input = torch.cat([alpha_pad, frame_power], dim=-1)
         alpha = torch.nn.functional.conv1d(alpha_input, self.alpha_conv_kernel, bias=self.alpha_conv_bias).unsqueeze(2)
@@ -452,73 +468,84 @@ def _run_inference_demo():
     subprocess.run([sys.executable, str(inference_script), str(export_dir)], check=True)
 
 
-print('Export start ...')
-Path(onnx_model_A).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-with torch.inference_mode():
-    custom_stft = STFT_Process(
-        model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
-        max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
-        # Keep PCM scaling as an explicit FP32 safety island. Folding 1/32768 into
-        # the DFT kernel leaves ~3e-5 weights that are poorly represented in FP16.
-        input_scale=1.0,
-        packed_output=True,
-    ).eval()
-    custom_istft = STFT_Process(
-        model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
-        max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
-        static_norm=not DYNAMIC_AXES,
-        # Do not fold 32767 into COLA normalization: edge reciprocals exceed five
-        # million and are clipped by FP16 conversion. Scale the waveform afterward.
-        output_scale=1.0,
-        output_length=FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else int(round(EXPORT_AUDIO_LENGTH * MODEL_SAMPLE_RATE / IN_SAMPLE_RATE)),
-    ).eval()
-    iccrn = NET(max_frames=MAX_SIGNAL_LENGTH, custom_istft=custom_istft)
-    iccrn.load_state_dict(torch.load(project_path + '/Model/ICCRN.ckpt', map_location='cpu'), strict=False)
-    for module in iccrn.modules():
-        if isinstance(module, LayerNorm):
-            module.fuse_var_scale_()
-    iccrn.prepare_for_export_()
-    iccrn = iccrn.float().eval()
-    alpha_predictor = AlphaPredictor(ALPHA_K)
-    alpha_predictor.load_state_dict(torch.load(project_path + '/Model/alpha.ckpt', map_location='cpu'), strict=False)
-    alpha_predictor = alpha_predictor.float().eval()
+def main():
+    print('Export start ...')
+    Path(onnx_model_A).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    with torch.inference_mode():
+        custom_stft = STFT_Process(
+            model_type='stft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
+            max_frames=0, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
+            # Keep PCM scaling as an explicit FP32 safety island. Folding 1/32768 into
+            # the DFT kernel leaves ~3e-5 weights that are poorly represented in FP16.
+            input_scale=1.0,
+            packed_output=True,
+        ).eval()
+        custom_istft = STFT_Process(
+            model_type='istft_B', n_fft=NFFT, hop_len=HOP_LENGTH, win_length=WINDOW_LENGTH,
+            max_frames=MAX_SIGNAL_LENGTH, window_type=WINDOW_TYPE, center_pad=True, pad_mode="constant",
+            static_norm=not DYNAMIC_AXES,
+            # Do not fold 32767 into COLA normalization: edge reciprocals exceed five
+            # million and are clipped by FP16 conversion. Scale the waveform afterward.
+            output_scale=1.0,
+            output_length=FOLD_WINDOW_LENGTH if USE_BATCH_FOLD else int(round(EXPORT_AUDIO_LENGTH * MODEL_SAMPLE_RATE / IN_SAMPLE_RATE)),
+        ).eval()
+        iccrn = NET(max_frames=MAX_SIGNAL_LENGTH, custom_istft=custom_istft)
+        iccrn.load_state_dict(torch.load(project_path + '/Model/ICCRN.ckpt', map_location='cpu'), strict=False)
+        for module in iccrn.modules():
+            if isinstance(module, LayerNorm):
+                module.fuse_var_scale_()
+        iccrn.prepare_for_export_()
+        iccrn = iccrn.float().eval()
+        alpha_predictor = AlphaPredictor(ALPHA_K)
+        alpha_predictor.load_state_dict(torch.load(project_path + '/Model/alpha.ckpt', map_location='cpu'), strict=False)
+        alpha_predictor = alpha_predictor.float().eval()
 
-    sdaec = SDAEC(iccrn, alpha_predictor, custom_stft, NFFT, ALPHA_K, MAX_SIGNAL_LENGTH, IN_SAMPLE_RATE, OUT_SAMPLE_RATE, USE_BATCH_FOLD, FOLD_WINDOW_LENGTH)
-    if "32" in IN_AUDIO_DTYPE:
-        IN_TORCH_DTYPE = torch.float32
-    elif "int" in IN_AUDIO_DTYPE.lower():
-        IN_TORCH_DTYPE = torch.int16
-    else:
-        IN_TORCH_DTYPE = torch.float16
-    near_end_audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
-    far_end_audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
+        sdaec = SDAEC(
+            iccrn, alpha_predictor, custom_stft, NFFT, ALPHA_K, MAX_SIGNAL_LENGTH,
+            IN_SAMPLE_RATE, OUT_SAMPLE_RATE, USE_BATCH_FOLD, FOLD_WINDOW_LENGTH,
+            auto_delay_align=AUTO_DELAY_ALIGN, num_tde_lags=NUM_TDE_LAGS, target_tde_lag=TARGET_TDE_LAG,
+        )
+        if "32" in IN_AUDIO_DTYPE:
+            IN_TORCH_DTYPE = torch.float32
+        elif "int" in IN_AUDIO_DTYPE.lower():
+            IN_TORCH_DTYPE = torch.int16
+        else:
+            IN_TORCH_DTYPE = torch.float16
+        near_end_audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
+        far_end_audio = torch.ones((1, 1, EXPORT_AUDIO_LENGTH), dtype=IN_TORCH_DTYPE)
 
-    torch.onnx.export(
-        sdaec,
-        (near_end_audio, far_end_audio),
-        onnx_model_A,
-        input_names=['near_end_audio', 'far_end_audio'],
-        output_names=['aec_audio'],
-        dynamic_axes={
-            'near_end_audio': {2: 'audio_len'},
-            'far_end_audio': {2: 'audio_len'},
-            'aec_audio': {2: 'audio_len'}
-        } if DYNAMIC_AXES else None,
-        opset_version=OPSET,
-        dynamo=False
+        torch.onnx.export(
+            sdaec,
+            (near_end_audio, far_end_audio),
+            onnx_model_A,
+            input_names=['near_end_audio', 'far_end_audio'],
+            output_names=['aec_audio'],
+            dynamic_axes={
+                'near_end_audio': {2: 'audio_len'},
+                'far_end_audio': {2: 'audio_len'},
+                'aec_audio': {2: 'audio_len'}
+            } if DYNAMIC_AXES else None,
+            opset_version=OPSET,
+            dynamo=False
+        )
+        del sdaec
+        del iccrn
+        del alpha_predictor
+        del near_end_audio
+        del far_end_audio
+        gc.collect()
+    model_metadata = build_audio_metadata_from_globals(
+        globals(), producer=Path(__file__).name, model_name="SDAEC", task="aec", model_family="sdaec",
+        max_dynamic_audio_seconds=30, normalize_audio_default=False, input_channels=1, output_channels=1,
+        num_audio_inputs=2, feature_kind="stft_alpha_predictor", center_pad=True, pad_mode="constant",
+        extra={"alpha_k": ALPHA_K, "auto_delay_align": AUTO_DELAY_ALIGN, "delay_align": "gcc_phat_segment_tracking",
+               "num_tde_lags": NUM_TDE_LAGS, "target_tde_lag": TARGET_TDE_LAG},
     )
-    del sdaec
-    del iccrn
-    del alpha_predictor
-    del near_end_audio
-    del far_end_audio
-    gc.collect()
-model_metadata = build_audio_metadata_from_globals(
-    globals(), producer=Path(__file__).name, model_name="SDAEC", task="aec", model_family="sdaec",
-    max_dynamic_audio_seconds=30, normalize_audio_default=False, input_channels=1, output_channels=1,
-    num_audio_inputs=2, feature_kind="stft_alpha_predictor", center_pad=True, pad_mode="constant", extra={"alpha_k": ALPHA_K},
-)
-stamp_export_metadata(onnx_model_A, model_metadata, OPSET)
-print(f"Metadata saved to: {onnx_model_Metadata}")
-print('\nExport done!')
-_run_inference_demo()
+    stamp_export_metadata(onnx_model_A, model_metadata, OPSET)
+    print(f"Metadata saved to: {onnx_model_Metadata}")
+    print('\nExport done!')
+    _run_inference_demo()
+
+
+if __name__ == '__main__':
+    main()

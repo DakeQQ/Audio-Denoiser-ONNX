@@ -81,7 +81,7 @@ def _fp16_sensitive_nodes(src_path: str) -> list[str]:
     nodes = list(graph.node)
     metadata = {item.key: item.value for item in model.metadata_props}
     backend = metadata.get("light_aec_model", "")
-    if backend not in {"SDAEC", "Deep_Echo", "NKF"}:
+    if backend not in {"SDAEC", "Deep_Echo", "NKF", "RTAEC"}:
         raise RuntimeError(
             f"Unsupported or missing DFSMN_AEC light_aec_model metadata: {backend!r}"
         )
@@ -255,8 +255,8 @@ def _fp16_sensitive_nodes(src_path: str) -> list[str]:
     # overflow if the backend policy is narrowed later.
     if backend == "Deep_Echo":
         ceps_prefixes = (
-            "/light_aec/cfb_e1/ceps_unit/LN/",
-            "/light_aec/cfb_d1/ceps_unit/LN/",
+            "/light_aec/iccrn/cfb_e1/ceps_unit/LN/",
+            "/light_aec/iccrn/cfb_d1/ceps_unit/LN/",
         )
         for prefix in ceps_prefixes:
             prefixed = [node for node in nodes if node.name.startswith(prefix)]

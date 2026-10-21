@@ -34,6 +34,7 @@ USE_BATCH_FOLD        = False                         # If true, fold input-rate
 
 # Fixed RTAEC model and ONNX export parameters.
 DYNAMIC_AXES          = False
+CHUNK_OVERLAP_RATIO   = 0.25                          # Default runtime overlap_ratio input (metadata only; the graph takes it as input).
 OPSET                 = 20
 MODEL_SAMPLE_RATE     = 16000
 WINDOW_TYPE           = 'hann'
@@ -850,6 +851,50 @@ class RTAEC(nn.Module):
         return audio.to(torch.float16)
 
 
+class RTAECOverlap(nn.Module):
+    """RTAEC with the block overlap inside the graph.
+
+    The window is cross-faded (sin^2) with the tail of the previous window output, then only the first
+    stride samples are returned; the full faded window is returned too and fed back as `prev_output`.
+    First call: prev_output = 0 and overlap_ratio = 0 (no cross-fade, whole window returned).
+    """
+    def __init__(self, rtaec, input_length, output_length, input_hop):
+        super().__init__()
+        self.rtaec = rtaec
+        self.input_length = input_length
+        self.output_length = output_length
+        self.input_hop = input_hop
+        self.out_scale = output_length / input_length
+        self.register_buffer('index', torch.arange(output_length, dtype=torch.int64))
+        self.register_buffer('phase', torch.arange(output_length, dtype=torch.float32) + 0.5)
+
+    def stride(self, overlap_ratio):
+        """Output-rate stride S (same rule as Inference chunk_geometry, R:302-319)."""
+        L, h = self.input_length, self.input_hop
+        aligned = torch.ceil(torch.round(L * (1.0 - overlap_ratio)) / h) * h
+        stride_in = torch.clamp(aligned, min=h, max=L - h)
+        stride_in = torch.where(overlap_ratio > 0, stride_in, torch.full_like(stride_in, L))
+        return torch.round(stride_in * self.out_scale).to(torch.int64)
+
+    def forward(self, near_end_audio, far_end_audio, prev_output, overlap_ratio, prev_offset):
+        # prev_offset: output samples by which the previous window started earlier (S in block mode, hop when sliding).
+        audio = self.rtaec(near_end_audio, far_end_audio).float()
+        L = self.output_length
+        stride = self.stride(overlap_ratio)
+        overlap = L - stride
+        head = (self.index < overlap) & (self.index + prev_offset < L)
+        weight = torch.sin((0.5 * np.pi) * self.phase / overlap.clamp(min=1).to(torch.float32)) ** 2
+        weight = torch.where(head, weight, torch.ones_like(weight))
+        previous = torch.index_select(prev_output.float(), 2, torch.clamp(self.index + prev_offset, max=L - 1))
+        window = audio * weight + previous * (1.0 - weight)
+        new_audio = window[:, :, :stride.reshape(())]
+        if "int" in OUT_AUDIO_DTYPE.lower():
+            new_audio = new_audio.clamp(min=-32768.0, max=32767.0).to(torch.int16)
+        elif "16" in OUT_AUDIO_DTYPE:
+            new_audio = new_audio.to(torch.float16)
+        return new_audio, window
+
+
 def _static_shape(value_info):
     shape = value_info.type.tensor_type.shape
     dims = []
@@ -1185,15 +1230,24 @@ def _validate_aec_behavior(pipeline, input_dtype, output_dtype):
     return metrics
 
 
+INPUT_NAMES = ['near_end_audio', 'far_end_audio', 'prev_output', 'overlap_ratio', 'prev_offset']
+OUTPUT_NAMES = ['aec_audio', 'aec_window']
+
+
+def _overlap_inputs(prev_output, ratio, offset):
+    return (prev_output, torch.tensor([ratio], dtype=torch.float32), torch.tensor([offset], dtype=torch.int64))
+
+
 def _export_to_memory(model, near_end_audio, far_end_audio):
     buffer = io.BytesIO()
+    prev = torch.zeros((1, 1, OUTPUT_AUDIO_LENGTH), dtype=torch.float32)
     torch.onnx.export(
         model,
-        (near_end_audio, far_end_audio),
+        (near_end_audio, far_end_audio, *_overlap_inputs(prev, CHUNK_OVERLAP_RATIO, 1)),
         buffer,
-        input_names=['near_end_audio', 'far_end_audio'],
-        output_names=['aec_audio'],
-        dynamic_axes=None,
+        input_names=INPUT_NAMES,
+        output_names=OUTPUT_NAMES,
+        dynamic_axes={'aec_audio': {2: 'new_len'}},
         opset_version=OPSET,
         do_constant_folding=True,
         dynamo=False,
@@ -1202,31 +1256,28 @@ def _export_to_memory(model, near_end_audio, far_end_audio):
 
 
 def _validate_graph_contract(model, input_dtype, output_dtype):
-    expected_inputs = ["near_end_audio", "far_end_audio"]
-    expected_outputs = ["aec_audio"]
-    if [value.name for value in model.graph.input] != expected_inputs:
+    if [value.name for value in model.graph.input] != INPUT_NAMES:
         raise RuntimeError("RTAEC input names/order changed during export")
-    if [value.name for value in model.graph.output] != expected_outputs:
+    if [value.name for value in model.graph.output] != OUTPUT_NAMES:
         raise RuntimeError("RTAEC output names/order changed during export")
-    expected_input_shape = (1, 1, EXPORT_AUDIO_LENGTH)
-    expected_output_shape = (1, 1, OUTPUT_AUDIO_LENGTH)
-    for value in model.graph.input:
-        if _static_shape(value) != expected_input_shape:
+    for value in model.graph.input[:2]:
+        if _static_shape(value) != (1, 1, EXPORT_AUDIO_LENGTH):
             raise RuntimeError(f"Unexpected RTAEC input shape for {value.name}: {_static_shape(value)}")
         if value.type.tensor_type.elem_type != _torch_dtype_to_onnx(input_dtype):
             raise RuntimeError(f"Unexpected RTAEC input dtype for {value.name}")
-    output = model.graph.output[0]
-    if _static_shape(output) != expected_output_shape:
-        raise RuntimeError(f"Unexpected RTAEC output shape: {_static_shape(output)}")
-    if output.type.tensor_type.elem_type != _torch_dtype_to_onnx(output_dtype):
+    if _static_shape(model.graph.input[2]) != (1, 1, OUTPUT_AUDIO_LENGTH):
+        raise RuntimeError("Unexpected prev_output shape")
+    if _static_shape(model.graph.output[1]) != (1, 1, OUTPUT_AUDIO_LENGTH):
+        raise RuntimeError("Unexpected aec_window shape")
+    if _static_shape(model.graph.output[0]) is not None:
+        raise RuntimeError("aec_audio length must be dynamic (depends on overlap_ratio)")
+    if model.graph.output[0].type.tensor_type.elem_type != _torch_dtype_to_onnx(output_dtype):
         raise RuntimeError("Unexpected RTAEC output dtype")
 
 
 def _validate_exported_model(model, pipeline, near_end_audio, far_end_audio, input_dtype, output_dtype):
     onnx.checker.check_model(model)
     _validate_graph_contract(model, input_dtype, output_dtype)
-    with torch.inference_mode():
-        torch_output = pipeline(near_end_audio, far_end_audio).detach().cpu().numpy()
     session_options = ort.SessionOptions()
     session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     session = ort.InferenceSession(
@@ -1234,13 +1285,24 @@ def _validate_exported_model(model, pipeline, near_end_audio, far_end_audio, inp
         sess_options=session_options,
         providers=["CPUExecutionProvider"],
     )
-    ort_output = session.run(
-        ["aec_audio"],
-        {
-            "near_end_audio": near_end_audio.cpu().numpy(),
-            "far_end_audio": far_end_audio.cpu().numpy(),
-        },
-    )[0]
+    generator = torch.Generator(device="cpu").manual_seed(7)
+    prev = torch.randn((1, 1, OUTPUT_AUDIO_LENGTH), generator=generator)
+    hop = int(round(HOP_LENGTH * IN_SAMPLE_RATE / MODEL_SAMPLE_RATE))
+    torch_outputs, ort_outputs = [], []
+    for ratio, offset in ((0.0, 0), (CHUNK_OVERLAP_RATIO, 0), (CHUNK_OVERLAP_RATIO, hop)):
+        extra = _overlap_inputs(prev, ratio, offset)
+        with torch.inference_mode():
+            new_audio, window = pipeline(near_end_audio, far_end_audio, *extra)
+        got = session.run(OUTPUT_NAMES, dict(zip(INPUT_NAMES, (
+            near_end_audio.cpu().numpy(), far_end_audio.cpu().numpy(), *(t.numpy() for t in extra)))))
+        if got[0].shape != tuple(new_audio.shape) or got[1].shape != tuple(window.shape):
+            raise RuntimeError(f"ONNX/PyTorch shape mismatch at ratio={ratio}: {got[0].shape} vs {tuple(new_audio.shape)}")
+        torch_outputs += [new_audio.numpy(), window.numpy()]
+        ort_outputs += got
+    if torch_outputs[0].shape[-1] != OUTPUT_AUDIO_LENGTH:
+        raise RuntimeError("overlap_ratio=0 must return the whole window")
+    torch_output = np.concatenate([o.reshape(-1) for o in torch_outputs])
+    ort_output = np.concatenate([o.reshape(-1) for o in ort_outputs])
     if np.issubdtype(torch_output.dtype, np.integer):
         if not np.array_equal(torch_output, ort_output):
             raise RuntimeError("Integer ONNX output is not exactly equal to PyTorch output")
@@ -1364,10 +1426,12 @@ def main():
         behavior_metrics = _validate_aec_behavior(rtaec, input_torch_dtype, output_torch_dtype)
         near_end_audio = _validation_audio(input_torch_dtype, EXPORT_AUDIO_LENGTH, seed=1729)
         far_end_audio = _validation_audio(input_torch_dtype, EXPORT_AUDIO_LENGTH, seed=1730)
-        raw_model = _export_to_memory(rtaec, near_end_audio, far_end_audio)
+        input_hop = max(1, int(round(HOP_LENGTH * IN_SAMPLE_RATE / MODEL_SAMPLE_RATE)))
+        rtaec_overlap = RTAECOverlap(rtaec, EXPORT_AUDIO_LENGTH, OUTPUT_AUDIO_LENGTH, input_hop).eval()
+        raw_model = _export_to_memory(rtaec_overlap, near_end_audio, far_end_audio)
         _validate_exported_model(
             raw_model,
-            rtaec,
+            rtaec_overlap,
             near_end_audio,
             far_end_audio,
             input_torch_dtype,
@@ -1379,6 +1443,11 @@ def main():
         max_dynamic_audio_seconds=30, normalize_audio_default=False, input_channels=1, output_channels=1,
         num_audio_inputs=2, feature_kind="stft_block_wiener", center_pad=True, pad_mode="constant", extra={
             "processing_mode": "offline_block",
+            "overlap_in_graph": True,
+            "prev_tensor": "output",
+            "overlap_ratio_default": CHUNK_OVERLAP_RATIO,
+            "overlap_align_hop": input_hop,
+            "output_window_length": OUTPUT_AUDIO_LENGTH,
             "causal": False,
             "stateful": False,
             "required_input_samples": EXPORT_AUDIO_LENGTH,

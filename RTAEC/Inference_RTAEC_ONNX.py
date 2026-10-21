@@ -286,162 +286,81 @@ far_nd_audio_len = far_end_audio.shape[-1]
 min_len = min(near_end_audio_len, far_nd_audio_len)
 near_end_audio = near_end_audio[..., :min_len]
 far_end_audio = far_end_audio[..., :min_len]
-shape_value_in = in_name_A[0].shape[-1]
-shape_value_out = out_name_A[0].shape[-1]
-if not isinstance(shape_value_in, int):
-    INPUT_AUDIO_LENGTH = max(MAX_DYNAMIC_AUDIO_SECONDS * IN_SAMPLE_RATE, min_len)  # Default to slice in 30 seconds.
-    if BATCH_FOLD_INFERENCE and INPUT_AUDIO_LENGTH / IN_SAMPLE_RATE > BATCH_WINDOW_SECONDS:
-        INPUT_AUDIO_LENGTH = align_to_multiple(INPUT_AUDIO_LENGTH, FOLD_INPUT_LENGTH)
-else:
-    INPUT_AUDIO_LENGTH = shape_value_in
-fold_active = BATCH_FOLD_INFERENCE and isinstance(INPUT_AUDIO_LENGTH, int) and INPUT_AUDIO_LENGTH >= FOLD_INPUT_LENGTH
-if fold_active:
-    print(f"Batch Fold Window: {FOLD_WINDOW_LENGTH} model samples; ONNX Input Slice: {INPUT_AUDIO_LENGTH} input samples")
+INPUT_AUDIO_LENGTH = in_name_A[0].shape[-1]
+OUTPUT_WINDOW_LENGTH = out_name_A[1].shape[-1]  # aec_window: the full faded window, fed back as prev_output
+if not isinstance(INPUT_AUDIO_LENGTH, int) or not isinstance(OUTPUT_WINDOW_LENGTH, int):
+    raise ValueError("The in-graph overlap RTAEC needs a static window length.")
 
-
-def chunk_geometry(audio_len):
-    if audio_len > INPUT_AUDIO_LENGTH:
-        input_hop_length = max(
-            1,
-            int(round(HOP_LENGTH * IN_SAMPLE_RATE / MODEL_SAMPLE_RATE)),
-        )
-        input_stride = align_to_multiple(
-            int(round(INPUT_AUDIO_LENGTH * (1.0 - CHUNK_OVERLAP_RATIO))),
-            input_hop_length,
-        )
-        input_stride = min(
-            max(input_hop_length, input_stride),
-            INPUT_AUDIO_LENGTH - input_hop_length,
-        )
-        num_windows = int(np.ceil((audio_len - INPUT_AUDIO_LENGTH) / input_stride)) + 1
-    else:
-        input_stride = INPUT_AUDIO_LENGTH
-        num_windows = 1
-
-    aligned_input_length = (num_windows - 1) * input_stride + INPUT_AUDIO_LENGTH
-    output_window_length = (
-        shape_value_out
-        if isinstance(shape_value_out, int)
-        else max(1, int(round(INPUT_AUDIO_LENGTH * INPUT_TO_OUTPUT_SCALE)))
-    )
-    output_stride = max(
-        1,
-        int(round(input_stride * INPUT_TO_OUTPUT_SCALE)),
-    )
-    output_overlap = max(0, output_window_length - output_stride)
-    aligned_output_length = (num_windows - 1) * output_stride + output_window_length
-    return (
-        num_windows,
-        aligned_input_length,
-        input_stride,
-        output_window_length,
-        output_stride,
-        output_overlap,
-        aligned_output_length,
-    )
+input_hop_length = max(1, int(round(HOP_LENGTH * IN_SAMPLE_RATE / MODEL_SAMPLE_RATE)))
+input_stride = INPUT_AUDIO_LENGTH
+if min_len > INPUT_AUDIO_LENGTH and CHUNK_OVERLAP_RATIO > 0:
+    input_stride = align_to_multiple(int(round(INPUT_AUDIO_LENGTH * (1.0 - CHUNK_OVERLAP_RATIO))), input_hop_length)
+    input_stride = min(max(input_hop_length, input_stride), INPUT_AUDIO_LENGTH - input_hop_length)
+num_windows = 1 if min_len <= INPUT_AUDIO_LENGTH else int(np.ceil((min_len - INPUT_AUDIO_LENGTH) / input_stride)) + 1
+output_stride = int(round(input_stride * INPUT_TO_OUTPUT_SCALE))
+aligned_input_length = (num_windows - 1) * input_stride + INPUT_AUDIO_LENGTH
+aligned_output_length = (num_windows - 1) * output_stride + OUTPUT_WINDOW_LENGTH
+original_input_length = min_len
+min_len = int(round(original_input_length * OUT_SAMPLE_RATE / IN_SAMPLE_RATE))
 
 
 def pad_audio(audio, aligned_length):
     pad_amount = aligned_length - audio.shape[-1]
     if pad_amount <= 0:
         return audio
-    pad_block = np.zeros((*audio.shape[:-1], pad_amount), dtype=audio.dtype)
-    return np.concatenate((audio, pad_block), axis=-1)
+    return np.pad(audio, [(0, 0)] * (audio.ndim - 1) + [(0, pad_amount)])
 
 
-original_input_length = min_len
-(
-    num_windows,
-    aligned_input_length,
-    input_stride,
-    output_window_length,
-    output_stride,
-    output_overlap,
-    aligned_output_length,
-) = chunk_geometry(original_input_length)
 near_end_audio = pad_audio(near_end_audio, aligned_input_length)
 far_end_audio = pad_audio(far_end_audio, aligned_input_length)
 
-min_len = int(round(original_input_length * OUT_SAMPLE_RATE / IN_SAMPLE_RATE))
-
-input_buffer_0 = _ortvalue_from_meta(
-    in_name_A[0],
-    near_end_audio[..., :INPUT_AUDIO_LENGTH].shape,
-)
-input_buffer_1 = _ortvalue_from_meta(
-    in_name_A[1],
-    far_end_audio[..., :INPUT_AUDIO_LENGTH].shape,
-)
-binding_A = ort_session_A.io_binding()
-binding_A.bind_ortvalue_input(in_name_A0, input_buffer_0)
-binding_A.bind_ortvalue_input(in_name_A1, input_buffer_1)
-binding_A.bind_output(out_name_A0, device_type, DEVICE_ID)
+# All graph tensors are preallocated NumPy buffers bound once; the output timeline itself is the
+# destination of `aec_audio`, so no per-window copy or Python cross-fade happens.
+out_dtype = numpy_dtype_from_onnx_meta(out_name_A[0])
+window_dtype = numpy_dtype_from_onnx_meta(out_name_A[1])
+near_buf = np.zeros((1, 1, INPUT_AUDIO_LENGTH), dtype=numpy_dtype_from_onnx_meta(in_name_A[0]))
+far_buf = np.zeros_like(near_buf, dtype=numpy_dtype_from_onnx_meta(in_name_A[1]))
+windows = (np.zeros((1, 1, OUTPUT_WINDOW_LENGTH), window_dtype), np.zeros((1, 1, OUTPUT_WINDOW_LENGTH), window_dtype))
+out_timeline = np.zeros((1, 1, aligned_output_length), dtype=out_dtype)
+ratio_first, ratio_next = np.zeros(1, np.float32), np.full(1, CHUNK_OVERLAP_RATIO, np.float32)
+offset_first, offset_next = np.zeros(1, np.int64), np.full(1, output_stride, np.int64)
 
 
-def process_segment(_slice_start, _slice_end, _near_end_audio, _far_end_audio):
-    _update_ortvalue(input_buffer_0, _near_end_audio[:, :, _slice_start: _slice_end])
-    _update_ortvalue(input_buffer_1, _far_end_audio[:, :, _slice_start: _slice_end])
-    _run_iobinding(ort_session_A, binding_A)
-    output = binding_A.get_outputs()[0]
-    return np.array(output.numpy(), copy=True)
+def make_binding(index, ratio, offset, out_view):
+    binding = ort_session_A.io_binding()
+    for name, array in ((in_name_A[0].name, near_buf), (in_name_A[1].name, far_buf),
+                        (in_name_A[2].name, windows[1 - index]), (in_name_A[3].name, ratio),
+                        (in_name_A[4].name, offset)):
+        binding.bind_ortvalue_input(name, onnxruntime.OrtValue.ortvalue_from_numpy(array))
+    binding.bind_ortvalue_output(out_name_A[0].name, onnxruntime.OrtValue.ortvalue_from_numpy(out_view))
+    binding.bind_ortvalue_output(out_name_A[1].name, onnxruntime.OrtValue.ortvalue_from_numpy(windows[index]))
+    return binding
 
 
-# Start to run RTAEC
-print("\nRunning the RTAEC by ONNX Runtime.")
-use_ola = output_overlap > 0
-if use_ola:
-    fade_phase = (np.arange(output_overlap, dtype=np.float32) + 0.5) / output_overlap
-    fade_in = np.sin(0.5 * np.pi * fade_phase) ** 2
-    fade_out = fade_in[::-1].copy()
-    out_buffer = np.empty(aligned_output_length, dtype=np.float32)
-
-saved_chunks = []
+print("\nRunning the RTAEC by ONNX Runtime (overlap inside the graph).")
 start_time = time.time()
-for chunk_index in range(num_windows):
-    slice_start = chunk_index * input_stride
-    slice_end = slice_start + INPUT_AUDIO_LENGTH
-    out_chunk = process_segment(slice_start, slice_end, near_end_audio, far_end_audio)
-    pct = 100.0 * min(slice_start, original_input_length) / original_input_length
-    print(f"Complete: {pct:.3f}%")
-    if use_ola:
-        chunk_audio = out_chunk.reshape(-1).astype(np.float32, copy=False)
-        if chunk_audio.size != output_window_length:
-            raise RuntimeError(
-                f"Unexpected RTAEC output length: {chunk_audio.size}, expected {output_window_length}"
-            )
-        output_start = chunk_index * output_stride
-        output_end = output_start + output_window_length
-        if chunk_index == 0:
-            out_buffer[output_start:output_end] = chunk_audio
-        else:
-            overlap_end = output_start + output_overlap
-            out_buffer[output_start:overlap_end] = (
-                out_buffer[output_start:overlap_end] * fade_out
-                + chunk_audio[:output_overlap] * fade_in
-            )
-            out_buffer[overlap_end:output_end] = chunk_audio[output_overlap:]
+for k in range(num_windows):
+    slice_start = k * input_stride
+    np.copyto(near_buf, near_end_audio[:, :, slice_start:slice_start + INPUT_AUDIO_LENGTH])
+    np.copyto(far_buf, far_end_audio[:, :, slice_start:slice_start + INPUT_AUDIO_LENGTH])
+    out_start = k * output_stride
+    if k == 0:  # first window: zero prev_output, ratio 0 -> the whole window is new
+        binding = make_binding(0, ratio_first, offset_first, out_timeline[:, :, :OUTPUT_WINDOW_LENGTH])
     else:
-        saved_chunks.append(out_chunk)
-
-if use_ola:
-    denoised_wav = out_buffer[:min_len]
-else:
-    denoised_wav = np.concatenate(saved_chunks, axis=-1).reshape(-1)[:min_len]
+        binding = make_binding(k % 2, ratio_next, offset_next, out_timeline[:, :, out_start:out_start + output_stride])
+    ort_session_A.run_with_iobinding(binding, run_options=run_options)
+    if k > 0 and k == num_windows - 1:  # EOF: the faded tail has no successor window
+        np.copyto(out_timeline[:, :, out_start + output_stride:], windows[k % 2][:, :, output_stride:])
+    print(f"Complete: {100.0 * min(slice_start, original_input_length) / original_input_length:.3f}%")
+denoised_wav = out_timeline.reshape(-1)[:min_len].astype(np.float32)
 end_time = time.time()
-print(f"Complete: 100.00%")
+print("Complete: 100.00%")
 
-# Save the denoised wav.
 elapsed = end_time - start_time
-audio_duration = min_len / OUT_SAMPLE_RATE
-rtf = elapsed / audio_duration
-if output_dtype_np == np.float16:
-    denoised_wav = denoised_wav.astype(np.float32)
+rtf = elapsed / (min_len / OUT_SAMPLE_RATE)
 if output_dtype_np == np.int16:
-    if denoised_wav.dtype != np.int16:
-        denoised_wav = np.rint(denoised_wav).clip(-32768.0, 32767.0).astype(np.int16)
-    save_subtype = 'PCM_16'
-else:
-    denoised_wav = np.clip(denoised_wav, -1.0, 1.0)
-    save_subtype = 'PCM_16'
-sf.write(save_aec_output, denoised_wav, OUT_SAMPLE_RATE, subtype=save_subtype)
+    denoised_wav = denoised_wav * INV_INT16
+sf.write(save_aec_output, np.clip(denoised_wav, -1.0, 1.0), OUT_SAMPLE_RATE, subtype='PCM_16')
 print(f"\nAEC Process Complete.\n\nSaving to: {save_aec_output}.\n\nReal-Time Factor (RTF): {rtf:.4f}")
+
+
